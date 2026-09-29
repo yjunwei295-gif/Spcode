@@ -2,9 +2,9 @@
 
 开源桌面 **AI 编程助手**（Electron）。能接在线模型、下载并跑本地 GGUF、按任务组合多模型，并支持图片等多模态。
 
-当前版本 `0.1.0`，主要面向 **Windows**。
+当前版本 `1.0.0`，主要面向 **Windows**。
 
-仓库：[github.com/yjunwei295-gif/SimpleCode](https://github.com/yjunwei295-gif/SimpleCode)
+仓库：[github.com/yjunwei295-gif/Spcode](https://github.com/yjunwei295-gif/Spcode)
 
 ---
 
@@ -38,8 +38,8 @@
 ## 安装与启动
 
 ```bash
-git clone https://github.com/yjunwei295-gif/SimpleCode.git
-cd SimpleCode
+git clone https://github.com/yjunwei295-gif/Spcode.git
+cd Spcode
 npm install
 npm start
 ```
