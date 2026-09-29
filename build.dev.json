@@ -1,0 +1,59 @@
+{
+  "appId": "com.simplecode.app",
+  "productName": "SimpleCode",
+  "copyright": "Copyright © SimpleCode",
+  "asar": false,
+  "directories": {
+    "output": "dev-build"
+  },
+  "files": [
+    "electron/**/*",
+    "renderer/**/*",
+    "package.json",
+    "icons.png",
+    "icons.ico"
+  ],
+  "extraResources": [
+    {
+      "from": "skills",
+      "to": "app-root/skills"
+    },
+    {
+      "from": "resources/ocr/tessdata",
+      "to": "app-root/ocr/tessdata"
+    },
+    {
+      "from": "rules",
+      "to": "app-root/rules"
+    },
+    {
+      "from": "models",
+      "to": "models",
+      "filter": [
+        "**/*",
+        "!**/*.gguf",
+        "!**/*.GGUF",
+        "!**/*.safetensors",
+        "!**/*.ckpt",
+        "!**/*.pt",
+        "!**/*.pth",
+        "!**/*.bin",
+        "!**/*.onnx",
+        "!**/*.part",
+        "!**/*.sc-meta.json"
+      ]
+    }
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "dir",
+        "arch": [
+          "x64"
+        ]
+      }
+    ],
+    "icon": "build/icon.png",
+    "signAndEditExecutable": false
+  }
+}

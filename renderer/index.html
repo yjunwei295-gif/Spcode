@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' http: https:;" />
+  <title>SimpleCode</title>
+  <link rel="icon" href="../icons.png" type="image/png" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="bg-pcb" id="bg-pcb" aria-hidden="true"></div>
+  <div class="bg-waves" id="bg-waves" aria-hidden="true"></div>
+  <div id="app">
+    <header class="titlebar">
+      <div class="title-drag"></div>
+      <nav class="menubar">
+        <div class="menu">
+          <button class="menu-btn" data-menu="file"><span data-i18n="file">文件</span></button>
+          <div class="menu-drop" id="menu-file">
+            <button data-act="new-window"><span data-i18n="newWindow">新窗口</span><span>Ctrl+Shift+N</span></button>
+            <button data-act="open-project"><span data-i18n="openProject">打开项目</span><span>Ctrl+O</span></button>
+            <div class="menu-sub">
+              <button class="sub-toggle"><span data-i18n="recents">最近打开</span><span>›</span></button>
+              <div class="menu-drop nested" id="menu-recent"></div>
+            </div>
+            <div class="sep"></div>
+            <button data-act="toggle-autosave" id="btn-autosave"><span data-i18n="autoSave">自动保存</span><span class="check">✓</span></button>
+            <button data-act="settings"><span data-i18n="settings">设置</span></button>
+            <button type="button" id="btn-vision-settings"><span data-i18n="modelCombo">模型组合</span></button>
+            <button data-act="manage-skills"><span data-i18n="manageSkills">管理技能</span></button>
+            <button data-act="edit-persona"><span data-i18n="editPersona">编辑人设</span></button>
+            <button data-act="manage-rules"><span data-i18n="manageRules">管理规则</span></button>
+            <div class="sep"></div>
+            <button data-act="exit"><span data-i18n="exit">退出</span></button>
+          </div>
+        </div>
+        <div class="menu">
+          <button class="menu-btn" data-menu="view"><span data-i18n="view">查看</span></button>
+          <div class="menu-drop" id="menu-view">
+            <button data-act="theme-light"><span data-i18n="themeLight">浅色</span></button>
+            <button data-act="theme-dark"><span data-i18n="themeDark">深色</span></button>
+            <button data-act="theme-system"><span data-i18n="themeSystem">跟随系统</span></button>
+          </div>
+        </div>
+        <div class="menu">
+          <button class="menu-btn" data-menu="help"><span data-i18n="help">帮助</span></button>
+          <div class="menu-drop" id="menu-help">
+            <button data-act="about"><span data-i18n="about">关于 SimpleCode</span></button>
+          </div>
+        </div>
+      </nav>
+      <div class="title-center">
+        <span class="title-app-name" id="title-app-name">SimpleCode</span>
+        <div class="quota-bar" id="quota-bar" hidden>
+          <span class="quota-text" id="quota-text"></span>
+        </div>
+      </div>
+      <div class="title-right">
+        <div class="lang-switch" id="lang-switch" title="Language">
+          <button type="button" data-locale="zh">中文</button>
+          <button type="button" data-locale="en">EN</button>
+        </div>
+        <div class="win-btns">
+          <button id="btn-min" data-i18n-title="minimize" title="最小化">─</button>
+          <button id="btn-max" data-i18n-title="maximize" title="最大化">□</button>
+          <button id="btn-close" class="close" data-i18n-title="closeWin" title="关闭">×</button>
+        </div>
+      </div>
+    </header>
+
+    <section id="view-welcome" class="view welcome">
+      <div class="welcome-inner">
+        <div class="logo">SIMPLE</div>
+        <div class="logo-sub">AI CODING STUDIO</div>
+        <div class="hero-actions">
+          <button class="hero-card" id="btn-open">
+            <span class="hero-ico"><svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2.5h6.5A2.5 2.5 0 0 1 21 10v7.5a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5z"/></svg></span>
+            <span data-i18n="openProject">打开项目</span>
+          </button>
+          <button class="hero-card" id="btn-clone">
+            <span class="hero-ico"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="8" r="2.2"/><path d="M6 8.2v7.6M18 10.2c0 4-6 3.5-10.4 6.4"/></svg></span>
+            <span data-i18n="cloneRepo">克隆仓库</span>
+          </button>
+          <button class="hero-card" id="btn-ssh">
+            <span class="hero-ico"><svg viewBox="0 0 24 24"><rect x="3" y="4.5" width="18" height="15" rx="3"/><path d="M7 10l3 2.5L7 15M12.5 15.5H17"/></svg></span>
+            <span data-i18n="sshConnect">SSH 连接</span>
+          </button>
+        </div>
+        <div class="recent-card">
+          <div class="recent-head">
+            <span data-i18n="recentProjects">最近项目</span>
+            <button class="link" id="btn-view-all"><span data-i18n="viewAll">查看全部</span></button>
+          </div>
+          <div class="recent-list" id="recent-list"></div>
+        </div>
+      </div>
+      <div class="welcome-foot" data-i18n="welcomeFoot">在新窗口中并行运行多个助手</div>
+    </section>
+
+    <section id="view-chat" class="view chat hidden">
+      <div class="chat-head">
+        <div class="tabs" id="tabs"></div>
+        <div class="tab-tools">
+          <button id="btn-files" data-i18n-title="files" title="文件目录">📁</button>
+          <button id="btn-new-tab" data-i18n-title="newChat" title="新建对话">+</button>
+          <button id="btn-history" data-i18n-title="history" title="历史">⏱</button>
+          <button id="btn-more" data-i18n-title="more" title="更多">⋯</button>
+          <button id="btn-sidebar" data-i18n-title="sidebar" title="侧栏">☰</button>
+        </div>
+      </div>
+      <div class="chat-body">
+        <aside class="file-tree" id="file-tree">
+          <div class="file-tree-head">
+            <span id="tree-root-name" data-i18n="project">项目</span>
+            <button type="button" id="btn-add-folder" data-i18n-title="addFolder" title="添加文件夹">+</button>
+          </div>
+          <div class="tree-body" id="tree-body"></div>
+          <div class="clip-panel" id="clip-panel">
+            <div class="clip-head">
+              <span data-i18n="clipboardPanel">剪贴板</span>
+              <button type="button" id="btn-clip-clear" data-i18n-title="clipboardClear" title="清空历史">×</button>
+            </div>
+            <div class="clip-list" id="clip-list"></div>
+          </div>
+        </aside>
+        <aside class="sidebar hidden" id="sidebar">
+          <div class="side-sec">
+            <h4 class="side-h4-row">
+              <span data-i18n="snapshots">快照</span>
+              <label class="snap-max-wrap" title="" data-i18n-title="snapMaxHint">
+                <span data-i18n="snapMax">上限</span>
+                <input type="number" id="snap-max" min="1" max="500" step="1" value="20" />
+              </label>
+            </h4>
+            <div id="snap-list" class="side-list"></div>
+          </div>
+          <div class="side-sec">
+            <h4><span data-i18n="skills">技能</span> <button class="link" id="btn-new-skill" data-i18n="newItem">新建</button></h4>
+            <div id="skill-list" class="side-list"></div>
+          </div>
+          <div class="side-sec">
+            <h4 data-i18n="milestones">里程碑</h4>
+            <div id="milestone-list" class="side-list"></div>
+          </div>
+          <div class="side-sec">
+            <h4><span data-i18n="globalMemory">全局记忆</span>
+              <button class="link" id="btn-edit-profile" data-i18n="userProfile">用户画像</button>
+              <button class="link" id="btn-new-global-pref" data-i18n="addGlobalPref">添加全局偏好</button>
+            </h4>
+            <div id="global-pref-list" class="side-list"></div>
+          </div>
+          <div class="side-sec">
+            <h4><span data-i18n="memory">长期记忆</span>
+              <button class="link" id="btn-new-memory" data-i18n="newItem">新建</button>
+              <button class="link danger" id="btn-clear-memory" data-i18n="memoryClear">清空</button>
+            </h4>
+            <div id="memory-list" class="side-list"></div>
+          </div>
+          <div class="side-sec">
+            <h4><span data-i18n="persona">人设</span> <button class="link" id="btn-edit-persona" data-i18n="edit">编辑</button></h4>
+            <div id="persona-list" class="side-list"></div>
+          </div>
+          <div class="side-sec">
+            <h4><span data-i18n="rules">规则</span> <button class="link" id="btn-new-rule" data-i18n="newItem">新建</button></h4>
+            <div id="rule-list" class="side-list"></div>
+          </div>
+        </aside>
+        <div class="chat-main">
+          <div class="chat-stage">
+          <div class="messages" id="messages"></div>
+          <aside id="download-panel" class="download-drawer hidden" aria-label="download list">
+            <button type="button" id="download-drawer-tab" class="download-drawer-tab" data-i18n-title="downloadList" title="下载列表">
+              <span class="download-tab-label" data-i18n="downloadTab">下载</span>
+              <span id="download-count" class="download-count hidden">0</span>
+            </button>
+            <div class="download-drawer-sheet">
+              <header class="download-panel-head">
+                <span class="download-panel-title" data-i18n="downloadList">下载列表</span>
+                <button type="button" id="download-clear-done" class="download-link hidden" data-i18n="clearDone">清除已完成</button>
+                <button type="button" id="download-panel-fold" class="download-fold" data-i18n-title="foldPanel" title="收起">›</button>
+              </header>
+              <div class="download-panel-body" id="download-list"></div>
+            </div>
+          </aside>
+          </div>
+          <div class="composer-wrap" id="composer-wrap">
+            <div class="composer" id="composer">
+              <div class="chips" id="chips"></div>
+              <div class="queue hidden" id="queue"></div>
+              <textarea id="input" rows="3" data-i18n-placeholder="inputPlaceholder" placeholder="规划、构建，输入 / 使用技能，输入 @ 引用上下文..."></textarea>
+              <div class="composer-bar">
+                <div class="select-wrap model-roster-wrap">
+                  <button class="pill ghost" id="btn-model"><span data-i18n="model">模型</span></button>
+                  <div class="menu-drop up" id="model-menu"></div>
+                </div>
+                <div class="left">
+                  <div class="select-wrap">
+                    <button class="pill" id="btn-agent">∞ Agent</button>
+                  </div>
+                  <label class="rounds-wrap" id="rounds-wrap" data-i18n-title="agentRoundsTitle" title="规划、大脑、代码各算各的轮数，互不扣减。开始改代码后不再吃这份轮数">
+                    <span data-i18n="agentRounds">轮数</span>
+                    <input id="input-rounds" type="number" min="1" max="64" value="16" />
+                  </label>
+                  <button type="button" class="pill ghost" id="btn-unlimited" data-i18n="unlimitedRounds" data-i18n-title="unlimitedRoundsTitle" title="打开后不再受轮数限制，直到模型自己收尾或你点停止" aria-pressed="false">全解放</button>
+                  <button type="button" class="pill ghost" id="btn-alive" data-i18n="desktopAlive" data-i18n-title="desktopAliveTitle" title="AGI（测试版）：打开后出现虚拟光标，没任务时慢一点跟着你的鼠标；下命令后它自己操作屏幕" aria-pressed="false">AGI</button>
+                </div>
+                <div class="right">
+                  <button class="icon-btn" id="btn-attach" data-i18n-title="attach" title="上传或 Ctrl+V 粘贴图片、文件、视频、文档">🖇</button>
+                  <button class="pill ghost" id="btn-enqueue" data-i18n="enqueue" data-i18n-title="enqueueTitle" title="把当前输入加入待发队列">排队</button>
+                  <button class="send" id="btn-send" data-i18n="send">发送</button>
+                </div>
+              </div>
+              <div class="slash-menu hidden" id="slash-menu"></div>
+              <div class="slash-menu hidden" id="at-menu"></div>
+            </div>
+          </div>
+        </div>
+        <aside class="code-preview hidden" id="code-preview">
+          <div class="preview-head">
+            <span class="preview-path" id="preview-path" data-i18n="noFile">未选择文件</span>
+            <div class="preview-actions">
+              <button type="button" id="btn-preview-at" data-i18n="addContext">加入上下文</button>
+              <button type="button" id="btn-preview-close" data-i18n-title="closePreview" title="关闭预览">×</button>
+            </div>
+          </div>
+          <div class="preview-body" id="preview-body"></div>
+        </aside>
+      </div>
+    </section>
+
+    <footer class="statusbar">
+      <span id="status-ws" data-i18n="noWorkspace">未选择工作目录</span>
+      <span class="grow"></span>
+      <button type="button" id="status-downloads" class="status-dl-btn hidden" title="">
+        <span class="status-dl-ico">⬇</span>
+        <span id="status-dl-n">0</span>
+      </button>
+      <span id="status-model"></span>
+      <span id="status-theme"></span>
+    </footer>
+  </div>
+
+  <div class="modal hidden" id="modal">
+    <div class="modal-card" id="modal-card"></div>
+  </div>
+
+  <div class="lightbox hidden" id="lightbox">
+    <img id="lightbox-img" alt="预览" />
+    <div class="lightbox-hint" data-i18n="lightboxHint">滚轮缩放 · 拖动移动 · Esc 或点空白关闭</div>
+  </div>
+
+  <div class="ctx-menu hidden" id="ctx-menu">
+    <button type="button" data-ctx="reveal" data-i18n="showInFolder">在文件夹中显示</button>
+  </div>
+
+  <script type="module" src="./project-map.js"></script>
+  <script type="module" src="./app.js"></script>
+  <script type="module" src="./vision-settings.js"></script>
+</body>
+</html>

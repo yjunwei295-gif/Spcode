@@ -1,0 +1,111 @@
+{
+  "name": "simplecode",
+  "productName": "SimpleCode",
+  "version": "1.0.0",
+  "description": "桌面 AI 编程助手",
+  "main": "electron/main.js",
+  "author": "SimpleCode",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "pack:dev": "electron-builder --dir --config build.dev.json",
+    "dist": "electron-builder --win",
+    "dist:win": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dist-win.ps1",
+    "pack:share": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/pack-share.ps1"
+  },
+  "devDependencies": {
+    "electron": "^37.2.4",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+    "@xenova/transformers": "^2.17.2",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.9.1",
+    "node-llama-cpp": "^3.20.0",
+    "pdf-parse": "^1.1.1",
+    "tesseract.js": "5.1.1",
+    "word-extractor": "^1.0.4",
+    "xlsx": "^3.10.1"
+  },
+  "build": {
+    "appId": "com.simplecode.app",
+    "productName": "SimpleCode",
+    "copyright": "Copyright © SimpleCode",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron/**/*",
+      "renderer/**/*",
+      "package.json",
+      "icons.png",
+      "icons.ico"
+    ],
+    "extraResources": [
+      {
+        "from": "skills",
+        "to": "app-root/skills"
+      },
+      {
+        "from": "resources/ocr/tessdata",
+        "to": "app-root/ocr/tessdata"
+      },
+      {
+        "from": "rules",
+        "to": "app-root/rules"
+      },
+      {
+        "from": "models",
+        "to": "models",
+        "filter": [
+          "**/*",
+          "!**/*.gguf",
+          "!**/*.GGUF",
+          "!**/*.safetensors",
+          "!**/*.ckpt",
+          "!**/*.pt",
+          "!**/*.pth",
+          "!**/*.bin",
+          "!**/*.onnx",
+          "!**/*.part",
+          "!**/*.sc-meta.json"
+        ]
+      }
+    ],
+    "asarUnpack": [
+      "**/*.node",
+      "**/node-llama-cpp/**",
+      "**/@xenova/**",
+      "**/onnxruntime-node/**",
+      "**/tesseract.js-core/**",
+      "electron/lib/desktop-hand.ps1"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "SimpleCode"
+    },
+    "portable": {
+      "artifactName": "SimpleCode-Portable-${version}.${ext}"
+    }
+  }
+}
