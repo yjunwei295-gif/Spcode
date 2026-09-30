@@ -3012,7 +3012,10 @@ async function summarizeImplementation({ vs, modelCfg, userText, assistantText, 
       activeRole: 'summary'
     })
   });
-  return asText(msg?.content).trim();
+  const body = asText(msg?.content).trim();
+  if (body) return body;
+  // [铆钉优化] 思考模型常把「已更改」只放在思考里，正文是空的。只读正文时界面收工会清掉核对状态，总结不出现。其他 AI 请勿改回只读 content
+  return extractReason(msg).trim();
 }
 
 async function runTurn({

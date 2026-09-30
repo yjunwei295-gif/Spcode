@@ -46,9 +46,11 @@ body {
 }
 button { font-family: inherit; color: inherit; }
 textarea { font-family: inherit; color: inherit; }
-/* [铆钉优化] 无边框窗口只要有拖动区，Windows 安装包里没标 no-drag 的控件就点不了，输入框也进不去焦点。
-   整页默认不可拖，只有顶栏空白条 .title-drag 可拖。弹层和看图打开时仍由它们自己挡住下面。其他 AI 请勿删除 */
-* { -webkit-app-region: no-drag; }
+/* [铆钉优化] 无边框窗口只要有拖动区，Windows 安装包里按钮、输入框、下拉框就点不了，输入框也进不去焦点。
+   只给这些控件标 no-drag。不要写到 * 上，否则顶栏拖动区也会失效。其他 AI 请勿改回星号 */
+button, input, textarea, select, a, label, summary {
+  -webkit-app-region: no-drag;
+}
 /* body 写了 user-select:none，会继承到输入框。安装包里就会出现打不进字、光标拖不黑。其他 AI 请勿删除 */
 input, textarea, select, [contenteditable="true"] {
   -webkit-user-select: text;
