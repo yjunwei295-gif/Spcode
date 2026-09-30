@@ -555,9 +555,6 @@ function toolsFor(kind, workerRoles, allowDispatch) {
   const all = toolsSpec();
   if (kind === 'worker') return all.filter((t) => WORKER_TOOL_NAMES.has(t.function?.name));
   if (desktopOn() && kind === 'brain') {
-    if (workerRoles && workerRoles.includes('code') && !allowDispatch) {
-      return all.filter((t) => !HAND_OFF_TOOLS.has(t.function?.name));
-    }
     return all;
   }
   if (kind === 'brain' && workerRoles && workerRoles.length) {
@@ -1373,8 +1370,8 @@ function buildSystemPrompt({
       : `\n本条消息里带有原图（image_url）。请直接根据画面回答，禁止说自己看不到图或没有看图通道。\n`;
   }
   const agiOn = desktopOn();
-  const agiSelfEn = '\nAGI is on. Understand the request yourself and fill in what was left unsaid, then do it. Anything a person can do at this computer, you can do: see the screen, use the mouse and keyboard, edit files, and run git. Do not hand gaps back, and do not say you cannot. This turn you must call screen_read first. Looking at the screen does not wait for start. After that, use ui_act or the mouse and keyboard. Do not call call_worker. If the user has not said start / 开始 / 动手 / 干吧 this turn, do not edit files or run commands. Restate the completed goal, scope, constraints, and acceptance, then end with: 确认无误后回复「开始」，我再动手. Do not ask the user to fill the gaps. After the user says start, call edit_file, write_file, or run_command yourself.\n';
-  const agiSelfZh = '\nAGI 已打开。自己看懂问题，没说完的需求自己补全，再自己做。人在这台电脑前能干的，你也要能干：看屏幕、键鼠、改文件、Git。禁止把缺口交回用户，禁止说不会。这一轮必须先调用 screen_read，不能跳过。看屏幕不等「开始」。看完再用 ui_act 或键鼠。禁止调用 call_worker，禁止派给代码或规划。用户还没说「开始 / 动手 / 干吧 / start」时，禁止改文件、禁止执行命令。复述的是你补全后的目标、范围、约束、验收，结尾必须写：确认无误后回复「开始」，我再动手。然后停住。不要拿问题反问。用户已经说了「开始」之后，立刻自己调用 edit_file、write_file 或 run_command，禁止再复述，禁止再派单。Git 推送、拉取、查看状态用 run_command，按你补全后的做法执行。\n';
+  const agiSelfEn = '\nAGI is on. The user only accepts the result. You finish everything else yourself: understand the request, fill the gaps, read the screen, use the mouse and keyboard, edit files, run git, and run project commands. Do not wait for start, do not restate and stop, and do not hand work back. Your permissions are high. This turn is unlimited. Call screen_read first, then ui_act or the mouse and keyboard, then edit_file, write_file, or run_command as needed. Do not call call_worker. When it is done, tell the user what to check.\n';
+  const agiSelfZh = '\nAGI 已打开。用户只管验收，其他所有事情都由你自己做完：看懂问题、补全需求、看屏幕、键鼠、改文件、Git、在项目里执行命令。不要等「开始」，不要复述完就停，不要把活交回用户。你的权限现在很高，基本上能干所有事情。这一轮全解放，不受思考轮次限制。必须先调用 screen_read，看完再用 ui_act 或键鼠，需要改文件或跑命令就自己调用 edit_file、write_file、run_command。禁止 call_worker，禁止派单。做完后只告诉用户验收什么。\n';
   const handoff = agiOn
     ? (enPrompt ? agiSelfEn : agiSelfZh)
     : (brainHandsOff
@@ -1398,10 +1395,10 @@ function buildSystemPrompt({
       : `\n用户只和你说话，规划模块不能先读需求。用户还没说开始时，禁止调用 call_worker。必须先向用户复述目标、范围、约束、验收，结尾写：确认无误后回复「开始」，我再动手。用户已经说了开始之后，立刻调用 call_worker，role 填 code，不要先插规划。若已经派过规划，规划结果只用来指挥代码，不符合就改清再派，禁止把没做完的方案回复给用户。\n`)
     : '';
   const actRuleEn = agiOn
-    ? 'AGI is on. Understand the request and fill in what was left unsaid. Do what a person at this computer can do: screen, mouse, keyboard, files, and git. Do not hand gaps back and do not say you cannot. This turn must start with screen_read. Looking does not wait for start. If the user has not said start, do not edit files or run commands; restate the completed goal, scope, constraints, and acceptance, and ask them to reply 开始. After start, do the work yourself. Do not call call_worker.'
+    ? 'AGI is on. The user only accepts the result. You finish everything else yourself and do not wait for start. Permissions are high and this turn is unlimited. Call screen_read first, then do the files, commands, and desktop actions yourself. Do not call call_worker. When finished, tell the user what to check.'
     : 'If the user has not said start this turn, a restatement that asks them to reply 开始 is a complete reply. Do not emit a tool call just to start work. After the user says start, or when the turn is only a lookup, a reply that needs a lookup or an edit must include a tool call. A plan with no tool call does not run. A one-line note may sit in the same reply as the tool call.';
   const actRuleZh = agiOn
-    ? 'AGI 开着时，自己看懂问题并补全没说完的需求，人能干的屏幕、键鼠、改文件、Git 你也要能干。禁止把缺口交回用户，禁止说不会。这一轮必须先调用 screen_read。看屏幕不等「开始」。用户还没说开始时，禁止改文件、禁止执行命令；复述补全后的目标、范围、约束、验收，并请用户回复「开始」。用户已经说了开始之后，自己调用 edit_file、write_file、run_command、ui_act 或键鼠做完，禁止 call_worker。'
+    ? 'AGI 开着时，用户只管验收，其他事情你全部自己做完，不要等「开始」，不要复述完就停。权限很高，这一轮全解放。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。禁止 call_worker。做完只告诉用户验收什么。'
     : '用户还没说开始时，禁止派代码。提问、讲现象、报 bug 由大脑自己查完再回答。要改文件但还没说开始时，复述并请用户回复「开始」就是完整回复。用户已经说了开始之后，派代码必须调用 call_worker。可以在同一次回复里附一句说明，但不能只有说明。';
   // [铆钉优化] 能调用工具的模型由大脑自己调用 generate_media 生图；zbaing 本地引擎不会调用工具，仍按开口前自动生成的结果回答。其他 AI 请勿改回「无需调用工具」
   const genFailNote = enPrompt
@@ -2028,9 +2025,9 @@ function askAnswerIsStart(answer) {
 }
 
 const START_WORK_NUDGE = '用户本轮已经说了开始。这是强制开工。禁止复述、禁止讨论、禁止再搜索。立刻调用 call_worker，role 填 code。task 用已经掌握的文件路径、方法、行号、现状、目标、不要改的范围写全。';
-const AGI_SELF_NUDGE = '用户本轮已经说了开始。AGI 开着，禁止 call_worker。先看过屏幕之后，自己调用 edit_file、write_file、run_command、ui_act 或键鼠。不要只写说明。';
-const AGI_MUST_LOOK = 'AGI 开着。本轮必须先调用 screen_read 看屏幕，不能跳过，禁止说不会用 AGI。看屏幕不等「开始」。看完再用 ui_act 或键鼠。没说完的需求你自己补全。改文件和执行命令仍等「开始」，由你自己做，禁止派单。';
-const AGI_FILL = '需求没说全就由你补全，按人坐在这台电脑前会做的方式看懂并做完。禁止说不会，禁止把缺口交回用户。屏幕、键鼠、改文件、Git 都要能做。改文件和执行命令没说「开始」时，复述你补全后的目标、范围、约束、验收，不要拿问题反问。';
+const AGI_SELF_NUDGE = 'AGI 开着。用户只管验收，不要等「开始」，不要只写说明。先看过屏幕之后，自己调用 edit_file、write_file、run_command、ui_act 或键鼠把事情做完。禁止 call_worker。';
+const AGI_MUST_LOOK = 'AGI 开着。用户只管验收。本轮必须先调用 screen_read，不能跳过，禁止说不会用 AGI。看完就自己把改文件、命令和键鼠做完，不要等「开始」，禁止派单。';
+const AGI_FILL = '用户只管验收，其他事情你自己做完。需求没说全就补全，然后直接改文件、跑命令或操作键鼠。禁止说不会，禁止把缺口交回用户，禁止等「开始」，禁止复述完就停。';
 const WAIT_START_NUDGE = '用户本轮没有说开始。禁止派代码，禁止改文件，禁止再调用 call_worker。用几句话复述目标、范围、约束、验收，结尾必须写：确认无误后回复「开始」，我再动手。然后停住。';
 
 /** 用户已经说了开始之后，回复里不许再向他要一次开始。 */
@@ -2365,12 +2362,12 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
   const orderedByText = startOrdered != null ? !!startOrdered : userOrderedStart(orderText);
   let orderedStart = (brainWithCode || agiBrain) && (orderedByText || !!(snap && snap.askStarted));
   const brainRoles = ['planning', 'code'].filter((r) => workers && workers[r]);
-  let activeTools = (!agiBrain && brainWithCode && orderedStart)
+  let activeTools = agiBrain
     ? toolsFor('brain', brainRoles, true)
-    : (agiBrain && orderedStart ? toolsFor('brain', brainRoles, true) : toolSpec);
+    : ((brainWithCode && orderedStart) ? toolsFor('brain', brainRoles, true) : toolSpec);
   let lastPhase = roleTag === 'code' ? 'code' : 'brain';
-  // 全解放：不吃用户轮数，也不吃安全上限，直到模型收尾或用户停止
-  const unlimited = !!unlimitedRounds && !(hardRounds > 0);
+  // 全解放：不吃用户轮数，也不吃安全上限，直到模型收尾或用户停止。AGI 开着时大脑默认全解放
+  const unlimited = (!!unlimitedRounds || agiBrain) && !(hardRounds > 0);
   // 用户回答里带的截图原图，等这一轮工具结果都放回对话后再作为一条用户消息追加
   const askImageParts = [];
   const roundCap = hardRounds > 0 ? hardRounds : (unlimited ? Number.POSITIVE_INFINITY : SAFETY_MAX_ROUNDS);
@@ -2531,14 +2528,14 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
         onEvent({ type: 'status', text: 'AGI 开着，先看屏幕…' });
         continue;
       }
-      const handsBack = /不会用|不会做|做不到|无法(操作|完成|使用)|请你(补充|说明|告诉|决定)|需求不(全|清楚|完整|明确)|你想怎么|我不(知道|清楚|会)/.test(asText(msg.content));
+      const handsBack = /不会用|不会做|做不到|无法(操作|完成|使用)|请你(补充|说明|告诉|决定)|需求不(全|清楚|完整|明确)|你想怎么|我不(知道|清楚|会)|确认无误后回复|请回复.{0,8}开始|我再动手|等你说开始/.test(asText(msg.content));
       if (agiBrain && handsBack && agiFillCount < 2 && round < SAFETY_MAX_ROUNDS - 1) {
         agiFillCount += 1;
         messages.push({ role: 'user', content: AGI_FILL });
         onEvent({ type: 'status', text: 'AGI 自己补全需求…' });
         continue;
       }
-      const beforeStart = !orderedStart && (roleTag || 'brain') === 'brain' && !implementing;
+      const beforeStart = !agiBrain && !orderedStart && (roleTag || 'brain') === 'brain' && !implementing;
       if (beforeStart && asText(msg.content).trim() && !msg.truncated) {
         const asked = /确认无误后回复|回复.{0,8}开始/.test(asText(msg.content));
         const questionOnly = userAskedQuestion(orderText);
@@ -2597,14 +2594,14 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
         messages.push({ role: 'user', content: START_WORK_NUDGE });
         continue;
       }
-      if (agiBrain && orderedStart && !toolsAlready && softRetry < 4 && round < SAFETY_MAX_ROUNDS - 1) {
+      if (agiBrain && !toolsAlready && softRetry < 4 && round < SAFETY_MAX_ROUNDS - 1) {
         softRetry += 1;
         forceTool = true;
         messages.push({ role: 'user', content: AGI_SELF_NUDGE });
         onEvent({ type: 'status', text: 'AGI 已开，由大脑自己做…' });
         continue;
       }
-      if (!orderedStart && !userAskedQuestion(orderText) && !forcedDispatch && !handedOff && (roleTag || 'brain') === 'brain' && !implementing && !waitStartNudged && round < SAFETY_MAX_ROUNDS - 1) {
+      if (!agiBrain && !orderedStart && !userAskedQuestion(orderText) && !forcedDispatch && !handedOff && (roleTag || 'brain') === 'brain' && !implementing && !waitStartNudged && round < SAFETY_MAX_ROUNDS - 1) {
         waitStartNudged = true;
         messages.push({ role: 'user', content: WAIT_START_NUDGE });
         onEvent({ type: 'status', text: '还没开工，先复述并等你说开始…' });
@@ -2731,12 +2728,10 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
             result = String(out || '').trim().slice(0, 2000) || '实现模型没有返回说明。';
             result += '\n\n【交给大脑判断】文件还没按需求写入时，禁止把这段告诉用户。用你已经读到的绝对路径和内容把改法写进新 task，立刻再派代码，直到写入。写入且符合需求后，才向用户说是你做成的。中途部下写错的，完成说明里点名。';
           }
-        } else if (!orderedStart && (roleTag || 'brain') === 'brain' && !(depth || 0) && HAND_OFF_TOOLS.has(name)) {
-          result = agiBrain
-            ? '用户本轮没有说开始。禁止改文件、禁止执行命令。把你补全后的目标、范围、约束、验收复述出来，结尾写：确认无误后回复「开始」，我再动手。不要把缺口交回用户。'
-            : '用户本轮没有说开始。禁止改文件。请复述目标、范围、约束、验收，结尾写：确认无误后回复「开始」，我再动手。';
+        } else if (!agiBrain && !orderedStart && (roleTag || 'brain') === 'brain' && !(depth || 0) && HAND_OFF_TOOLS.has(name)) {
+          result = '用户本轮没有说开始。禁止改文件。请复述目标、范围、约束、验收，结尾写：确认无误后回复「开始」，我再动手。';
         } else if (name === 'ask_user' && agiBrain) {
-          result = 'AGI 开着。自己看懂问题，没说完的自己补全，再自己做。禁止用 ask_user 把缺口交回用户。屏幕、键鼠、改文件、Git 都由你做。改文件和执行命令还没说「开始」时，复述补全后的目标、范围、约束、验收。';
+          result = 'AGI 开着。用户只管验收，其他事情你自己做完。禁止用 ask_user 把活交回用户，不要等「开始」。';
         } else if (!agiBrain && workers && workers.code && HAND_OFF_TOOLS.has(name) && !(depth || 0)) {
           result = '大脑不能直接改文件。请改用 call_worker，role 填 code。task 要写全路径、方法与行号、现状、目标行为、不要改的范围。';
         } else {
@@ -3430,13 +3425,9 @@ async function runTurn({
     const luna = /luna/i.test(`${modelCfg?.model || ''} ${modelCfg?.name || ''}`);
     const agiNow = desktopOn();
     const lunaLine = !luna ? '' : (agiNow
-      ? (turnStart
-        ? (replyLang.promptInEnglish(lang)
-          ? '\n\nLuna: the user said start this turn. AGI is on. Call screen_read first. Do not call call_worker. Then edit files, run commands, or use the mouse and keyboard yourself. Text alone does not edit files.\n'
-          : '\n\nLuna：用户这轮说了开始。AGI 开着，必须先调用 screen_read，禁止 call_worker。看完再自己改文件、跑命令或操作键鼠。只有文字不会改文件。\n')
-        : (replyLang.promptInEnglish(lang)
-          ? '\n\nLuna: the user did not say start. AGI is on. You must call screen_read first. Do not edit files, do not run commands, and do not call call_worker. After the screen, restate file or command work and wait for 开始.\n'
-          : '\n\nLuna：用户这轮没有说开始。AGI 开着，必须先调用 screen_read。禁止改文件，禁止 run_command，禁止 call_worker。看完屏幕后，要改或要执行就复述并等「开始」。\n'))
+      ? (replyLang.promptInEnglish(lang)
+        ? '\n\nLuna: AGI is on. The user only accepts the result. Do not wait for start. Call screen_read first, then finish the files, commands, and desktop actions yourself. Do not call call_worker.\n'
+        : '\n\nLuna：AGI 开着。用户只管验收。不要等「开始」。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。禁止 call_worker。\n')
       : (turnStart
       ? (replyLang.promptInEnglish(lang)
         ? '\n\nLuna: the user said start this turn. Dispatch code with call_worker, role code. Text alone does not edit files.\n'
@@ -3446,13 +3437,9 @@ async function runTurn({
         : '\n\nLuna：用户这轮没有说开始。只由大脑回答。可以 read_file、search_text、list_dir 查原因。禁止 call_worker，禁止派给代码模块。\n')));
     // [铆钉优化] 没说开始时写文件和派单工具是故意收起的，大脑必须知道原因，
     // 否则会对用户说「没有可用的文件写入工具」。其他 AI 请勿删除
-    const gateLine = (turnStart || (!codeWorker && !agiNow)) ? '' : (agiNow
-      ? (replyLang.promptInEnglish(lang)
-        ? '\n\nStart gate: AGI is on. File writes and shell commands are held until the user says start. Screen and mouse tools stay available. Do not call call_worker. Never say you lack a write tool. If they want a file change or a command, restate it and end with: Reply "start" once confirmed and I will do it.\n'
-        : '\n\n开工门槛：AGI 已打开。这一轮必须先调用 screen_read，看屏幕不等「开始」。改文件和执行命令的工具先收着，等用户说「开始」。禁止派单，禁止说不会用 AGI，禁止说没有写入工具。要改文件或执行命令时，复述后写：确认无误后回复「开始」，我再动手。\n')
-      : (replyLang.promptInEnglish(lang)
+    const gateLine = (agiNow || turnStart || !codeWorker) ? '' : (replyLang.promptInEnglish(lang)
       ? '\n\nStart gate: the user has not said "start" this turn, so file-writing and call_worker are intentionally unavailable. This is normal, not a missing tool. Never tell the user you lack a write tool or cannot edit files. If they want a change, restate what you will change (files, methods, goal) and end with: Reply "start" once confirmed and I will do it.\n'
-      : '\n\n开工门槛：用户这轮还没说「开始」，所以写文件和派单工具是按规则暂时收起的，这是正常的，不是缺工具。禁止对用户说「没有写入工具」「不能改文件」「无法写入」。用户想改东西时，复述要改的文件、方法和目标，结尾写：确认无误后回复「开始」，我再动手。\n'));
+      : '\n\n开工门槛：用户这轮还没说「开始」，所以写文件和派单工具是按规则暂时收起的，这是正常的，不是缺工具。禁止对用户说「没有写入工具」「不能改文件」「无法写入」。用户想改东西时，复述要改的文件、方法和目标，结尾写：确认无误后回复「开始」，我再动手。\n');
     return [
     {
       role: 'system',

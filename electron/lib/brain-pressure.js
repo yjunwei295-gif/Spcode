@@ -102,8 +102,8 @@ function noteUser(workspace, text) {
 function promptBlock(workspace, english, selfOperate) {
   if (selfOperate) {
     return english
-      ? '\nAGI is on. Understand the request and fill in what was left unsaid, then do it yourself. Do what a person at this computer can do. Do not hand gaps back and do not say you cannot. This turn must call screen_read first. Do not call call_worker.\n'
-      : '\nAGI 已打开。自己看懂问题，没说完的自己补全，再自己做。人能干的屏幕、键鼠、改文件、Git，你也要能干。禁止把缺口交回用户，禁止说不会。这一轮必须先调用 screen_read。禁止 call_worker，禁止派单。\n';
+      ? '\nAGI is on. The user only accepts the result. You finish everything else yourself and do not wait for start. This turn is unlimited. Call screen_read first. Do not call call_worker.\n'
+      : '\nAGI 已打开。用户只管验收，其他所有事情你自己做完，不要等「开始」。这一轮全解放。必须先调用 screen_read。禁止 call_worker，禁止派单。\n';
   }
   const band = strictness(read(workspace));
   if (english) {
