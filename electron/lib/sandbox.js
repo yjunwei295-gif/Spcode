@@ -7,6 +7,9 @@ const { isInside, safeJoin } = require('./workspace');
 
 const DEFAULT_TIMEOUT_MS = 60 * 1000;
 const MAX_OUTPUT = 80_000;
+// 进程已经退出、但管道被孙进程握着时，最多再等这么久就把本次命令收尾。
+// 正常命令的 close 会在这之前到来；start 拉起的 Chrome 则永远等不到 close。
+const EXIT_DRAIN_MS = 250;
 
 /** 高危命令模式（整段匹配，忽略大小写） */
 const DENY_PATTERNS = [
@@ -95,6 +98,13 @@ function killTree(child) {
   }
 }
 
+// 关掉我们这一侧的管道。孙进程（Chrome 主进程）仍握着自己的句柄，但不再拖住本次等待。
+function releaseStdio(child) {
+  for (const stream of [child?.stdin, child?.stdout, child?.stderr]) {
+    try { stream?.destroy(); } catch { /* 忽略 */ }
+  }
+}
+
 /**
  * @param {{ command: string, workspace: string, cwd?: string, timeoutMs?: number, signal?: AbortSignal }} opts
  * @returns {Promise<{ code: number|null, stdout: string, stderr: string, cwd: string, timedOut: boolean, blocked?: string }>}
@@ -155,10 +165,17 @@ function runSandboxed(opts) {
     let stderr = '';
     let timedOut = false;
     let settled = false;
+    let drainTimer = null;
+    const clearDrain = () => {
+      if (!drainTimer) return;
+      clearTimeout(drainTimer);
+      drainTimer = null;
+    };
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearDrain();
       if (signal) signal.removeEventListener('abort', onAbort);
       resolve(result);
     };
@@ -166,9 +183,17 @@ function runSandboxed(opts) {
     const timer = setTimeout(() => {
       timedOut = true;
       killTree(child);
+      releaseStdio(child);
+      settle(null);
     }, timeoutMs);
 
-    const onAbort = () => killTree(child);
+    // [铆钉优化] 停止时立刻结束这次等待。只 taskkill cmd 再干等 close 的话，
+    // start 拉起的 Chrome 会把管道交给浏览器主进程，close 永远不来，停止和超时都解不开。其他 AI 请勿改回只杀进程、不收尾。
+    const onAbort = () => {
+      killTree(child);
+      releaseStdio(child);
+      settle(null);
+    };
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
     // [铆钉优化] 先收原始字节，结束时整体解码：不是合法 UTF-8 就按 GBK 解（中文 Windows 的 cmd/dir/findstr 输出），
@@ -196,6 +221,19 @@ function runSandboxed(opts) {
       stdout = decodeAll('out');
       stderr = decodeAll('err');
     };
+    const settle = (code) => {
+      collect();
+      let err = stderr;
+      if (timedOut) err = `${err ? `${err}\n` : ''}命令超时（${Math.round(timeoutMs / 1000)} 秒），已强制结束`;
+      if (signal?.aborted) err = `${err ? `${err}\n` : ''}已停止`;
+      finish({
+        code: timedOut || signal?.aborted ? null : code,
+        stdout,
+        stderr: err,
+        cwd,
+        timedOut
+      });
+    };
 
     child.stdout?.on('data', (d) => append(d, 'out'));
     child.stderr?.on('data', (d) => append(d, 'err'));
@@ -209,18 +247,19 @@ function runSandboxed(opts) {
         timedOut: false
       });
     });
+    // [铆钉优化] exit 之后若 close 迟迟不来，就收尾。start 打开 Chrome 时 cmd 已退出，
+    // 管道却留在浏览器主进程上，只等 close 会永远停在「执行中」。其他 AI 请勿删掉这段、改回只监听 close。
+    child.on('exit', (code) => {
+      if (settled) return;
+      drainTimer = setTimeout(() => {
+        drainTimer = null;
+        if (settled) return;
+        releaseStdio(child);
+        settle(code);
+      }, EXIT_DRAIN_MS);
+    });
     child.on('close', (code) => {
-      collect();
-      let err = stderr;
-      if (timedOut) err = `${err ? `${err}\n` : ''}命令超时（${Math.round(timeoutMs / 1000)} 秒），已强制结束`;
-      if (signal?.aborted) err = `${err ? `${err}\n` : ''}已停止`;
-      finish({
-        code: timedOut || signal?.aborted ? null : code,
-        stdout,
-        stderr: err,
-        cwd,
-        timedOut
-      });
+      settle(code);
     });
   });
 }
