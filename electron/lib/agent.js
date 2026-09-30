@@ -2948,6 +2948,77 @@ function implementationDiffText(workspace, snap, changes) {
   return parts.join('\n\n');
 }
 
+// 从本轮工具调用和结果中整理动作轨迹，供 AGI 收工汇报使用
+function turnActionText(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const results = [];
+  for (let i = 0; i < list.length; i++) {
+    const message = list[i];
+    if (message && message.role === 'tool') {
+      const resultLines = String(message.content).split('\n');
+      let result = resultLines.length ? resultLines[0] : '';
+      if (result.length > 120) result = result.slice(0, 120);
+      results.push({ id: message.tool_call_id, text: result });
+    }
+  }
+  const lines = [];
+  for (let i = 0; i < list.length; i++) {
+    const message = list[i];
+    if (!message || message.role !== 'assistant' || !Array.isArray(message.tool_calls)) continue;
+    for (let j = 0; j < message.tool_calls.length; j++) {
+      const call = message.tool_calls[j];
+      if (!call) continue;
+      const fn = call.function || {};
+      const name = String(fn.name || '工具');
+      let args = {};
+      try {
+        if (typeof fn.arguments === 'string') args = JSON.parse(fn.arguments || '{}');
+        else if (fn.arguments) args = fn.arguments;
+      } catch (err) {
+        args = {};
+      }
+      let detail = '';
+      if (name === 'screen_look' || name === 'screen_read' || name === 'window_focus' || name === 'screen_wait') {
+        detail = '';
+      } else if (name === 'ui_act') {
+        const action = String(args.action || args.name || '');
+        let target = '';
+        if (args.id !== undefined) target = ` [${args.id}]`;
+        else if (args.number !== undefined) target = ` [${args.number}]`;
+        let coordinates = '';
+        if (args.x !== undefined || args.y !== undefined) coordinates = ` (${args.x}, ${args.y})`;
+        detail = ` ${action}${target}${coordinates}`;
+      } else if (name === 'keyboard_type') {
+        detail = ` ${String(args.text || '')}`;
+      } else if (name === 'keyboard_key') {
+        detail = ` ${String(args.key || args.keys || args.name || '')}`;
+      } else if (name === 'mouse_click') {
+        detail = ` (${args.x}, ${args.y})`;
+      } else if (name === 'mouse_drag') {
+        if (args.points !== undefined) detail = ` ${JSON.stringify(args.points)}`;
+        else detail = ` (${args.x1}, ${args.y1}) -> (${args.x2}, ${args.y2})`;
+      } else if (name === 'write_file' || name === 'edit_file') {
+        detail = ` ${String(args.path || '')}`;
+      } else if (name === 'run_command') {
+        detail = ` ${String(args.command || '')}`;
+      }
+      let result = '';
+      for (let k = 0; k < results.length; k++) {
+        if (results[k].id === call.id) {
+          result = results[k].text;
+          break;
+        }
+      }
+      let line = `- ${name}${detail}`;
+      if (result) line += `  ${result}`;
+      lines.push(line);
+    }
+  }
+  let text = lines.join('\n');
+  if (text.length > 4000) text = text.slice(0, 4000);
+  return text;
+}
+
 // [铆钉优化] 用户这轮只说「开始 / 好 / 改吧」时，真正的需求在前面：带上最近一条实质需求和大脑复述的方案，
 // 否则总结模块拿「开始」两个字去核对，「一致」永远是「无」。其他 AI 请勿删除
 function requirementText(userText, history) {
@@ -2971,7 +3042,7 @@ function requirementText(userText, history) {
 }
 
 // 实现改过文件之后调用总结槽。只出核对结论，附在正文后面，不盖掉大脑的说明
-async function summarizeImplementation({ vs, modelCfg, userText, assistantText, workspace, snap, changes, onEvent, signal }) {
+async function summarizeImplementation({ vs, modelCfg, userText, assistantText, workspace, snap, changes, onEvent, signal, messages, agiReport = false }) {
   const cfg = compact.pickSummaryCfg(vs, modelCfg);
   if (!cfg) return '';
   const label = cfg.model || cfg.name || '总结';
@@ -2982,20 +3053,27 @@ async function summarizeImplementation({ vs, modelCfg, userText, assistantText, 
     activeRole: 'summary'
   });
   const diff = implementationDiffText(workspace, snap, changes);
-  const prompt = [
-    '你是总结模块。你不和用户对接，「开始」不约束你。实现已经结束，你只核对，不改文件，不给新的实现方案。',
-    // [铆钉优化] 用户要求总结只保留「已更改」一段，去掉未更改/一致/不一致。其他 AI 请勿加回
-    '根据下面的代码差异，用中文只输出一段「已更改：」，列出这次代码差异里实际改到的内容，一条一行，写清改了哪个文件的什么功能。没有改动就只写「已更改：无」。',
-    '不要输出「未更改」「一致」「不一致」或其他段落，不要评价是否符合需求。',
-    '不准把收工说明当成已经改完的证据，以代码差异为准。',
-    ...(workspace && typecheck.isUnity(workspace)
-      ? ['这是 Unity 工程。不要要求跑测试或进播放模式。']
-      : []),
-    '',
-    `【用户需求】\n${String(userText || '').slice(0, 4000)}`,
-    `【改动说明】\n${String(assistantText || '').slice(0, 2000)}`,
-    `【代码差异】\n${diff || '（没有读到差异）'}`
-  ].join('\n\n');
+  const prompt = agiReport
+    ? [
+      '你是总结模块。你不和用户对接，「开始」不约束你。桌面操作已经结束，只汇报本轮实际做过的事。',
+      '只输出一段，一条一行写本轮实际做了什么，包括看了哪些屏幕、点了什么、跑了什么命令、改了哪些文件；若本轮没有任何实际操作就写「本轮只是回答，没有动手」。只依据动作轨迹和改动说明汇报，不要输出其他段落或评价。',
+      `【本轮动作轨迹】\n${turnActionText(messages) || '（本轮没有工具调用）'}`,
+      `【改动说明】\n${String(assistantText || '').slice(0, 2000)}`
+    ].join('\n\n')
+    : [
+      '你是总结模块。你不和用户对接，「开始」不约束你。实现已经结束，你只核对，不改文件，不给新的实现方案。',
+      // [铆钉优化] 用户要求总结只保留「已更改」一段，去掉未更改/一致/不一致。其他 AI 请勿加回
+      '根据下面的代码差异，用中文只输出一段「已更改：」，列出这次代码差异里实际改到的内容，一条一行，写清改了哪个文件的什么功能。没有改动就只写「已更改：无」。',
+      '不要输出「未更改」「一致」「不一致」或其他段落，不要评价是否符合需求。',
+      '不准把收工说明当成已经改完的证据，以代码差异为准。',
+      ...(workspace && typecheck.isUnity(workspace)
+        ? ['这是 Unity 工程。不要要求跑测试或进播放模式。']
+        : []),
+      '',
+      `【用户需求】\n${String(userText || '').slice(0, 4000)}`,
+      `【改动说明】\n${String(assistantText || '').slice(0, 2000)}`,
+      `【代码差异】\n${diff || '（没有读到差异）'}`
+    ].join('\n\n');
   const msg = await completeWithFallback({
     modelCfg: cfg,
     messages: [
@@ -3577,10 +3655,12 @@ async function runTurn({
   }
   // [铆钉优化] 这轮只多了 generated/ 下的生成结果（图片、视频、文档）时不叫总结：没有代码差异可核对，汇报由大脑回复。其他 AI 请勿删
   const codeChanges = changes.filter((c) => !/^generated\//i.test(String(c.path || '').replace(/\\/g, '/')));
-  if (codeChanges.length && !signal?.aborted) {
+  if ((codeChanges.length || desktopOn()) && !signal?.aborted) {
     try {
       const verdict = await summarizeImplementation({
-        vs, modelCfg, userText: requirementText(userText, history), assistantText: finalText, workspace, snap, changes: codeChanges, onEvent, signal
+        vs, modelCfg, userText: requirementText(userText, history), assistantText: finalText,
+        workspace, snap, changes: codeChanges, onEvent, signal, messages,
+        agiReport: !codeChanges.length
       });
       if (verdict) {
         finalText = [finalText, `【总结】\n${verdict}`].filter(Boolean).join('\n\n');
