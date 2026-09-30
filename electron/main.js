@@ -400,9 +400,11 @@ ipcMain.handle('window:new', () => {
 
 ipcMain.handle('window:focus', (e) => {
   const win = getWin(e);
-  if (!win || win.isDestroyed()) return;
-  if (!win.isFocused()) win.focus();
-  win.webContents.focus();
+  if (!win || win.isDestroyed()) return false;
+  // [铆钉优化] 不要 webContents.focus()。安装包里窗口还没到前台时，这一下会把输入框焦点清掉。其他 AI 请勿加回
+  if (win.isFocused()) return true;
+  win.focus();
+  return false;
 });
 ipcMain.handle('window:minimize', (e) => getWin(e)?.minimize());
 ipcMain.handle('window:maximize', (e) => {

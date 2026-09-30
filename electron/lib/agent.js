@@ -62,6 +62,17 @@ function desktopOn() {
   try { return require('./desktop-hand').isAlive(); } catch { return false; }
 }
 
+// AGI 开着时，打开软件和网页走键鼠。cmd 的 start、PowerShell 的 Start-Process、直接跑 chrome.exe 会把沙盒拖死。
+// npm start 不是启动外部程序，不拦。
+function shellLaunchesApp(command) {
+  const cmd = String(command || '');
+  if (/chrome\.exe/i.test(cmd)) return true;
+  if (/\bStart-Process\b/i.test(cmd)) return true;
+  if (/(^|[|&;`]|\/[ck]\s+)\s*start\b/i.test(cmd)) return true;
+  if (/\bstart\s+""/i.test(cmd)) return true;
+  return false;
+}
+
 function toolsSpec() {
   const all = allToolsSpec();
   return desktopOn() ? all : all.filter((t) => !DESKTOP_TOOLS.has(t.function?.name));
@@ -311,7 +322,7 @@ function allToolsSpec() {
       function: {
         name: 'run_command',
         description: process.platform === 'win32'
-          ? '在项目命令沙盒中执行命令（cwd 限制在工作区内，拦截高危命令，有超时）。Windows 下由 cmd.exe 执行：不支持 bash 语法（<<EOF、find -type、单引号字符串），PowerShell 语句要写成 powershell -NoProfile -Command "..."。只用于跑测试、构建、git 状态；改文件一律用 edit_file / write_file，禁止用 python/node/powershell 脚本改文件，也不要用它搜代码（用 search_text）或列目录（用 list_dir）。'
+          ? '在项目命令沙盒中执行命令（cwd 限制在工作区内，拦截高危命令，有超时）。Windows 下由 cmd.exe 执行：不支持 bash 语法（<<EOF、find -type、单引号字符串），PowerShell 语句要写成 powershell -NoProfile -Command "..."。只用于跑测试、构建、git 状态；改文件一律用 edit_file / write_file，禁止用 python/node/powershell 脚本改文件，也不要用它搜代码（用 search_text）或列目录（用 list_dir）。AGI 开着时，禁止用本工具执行 start、Start-Process 或启动 chrome.exe 来打开软件和网页，改用键鼠。'
           : '在项目命令沙盒中执行 shell 命令（cwd 限制在工作区内，拦截高危命令，有超时）。只用于跑测试、构建、git 状态；改文件一律用 edit_file / write_file，禁止用脚本改文件，搜代码用 search_text。',
         parameters: {
           type: 'object',
@@ -1096,6 +1107,9 @@ async function execTool(workspace, snap, name, args, onEvent, extra, signal, lan
     if (typecheck.isUnity(workspace) && typecheck.isUnityBlockedCommand(command)) {
       return '这是 Unity 工程，这条命令没有执行：这里不能跑测试、不能启动 Unity，也不能用 git。请只对照代码和需求是否一致。运行效果由用户在编辑器里看，不要再尝试这类命令。';
     }
+    if (desktopOn() && shellLaunchesApp(command)) {
+      return '这条命令没有执行。AGI 已打开，打开软件和网页请用键鼠：先 screen_read，再用 keyboard_key（如 Win+R）、keyboard_type、mouse_click 或 ui_act。不要用 run_command 执行 start、Start-Process，也不要直接启动 chrome.exe。';
+    }
     const timeoutMs = Math.max(3, Number(s.commandSandbox?.timeoutSec) || 60) * 1000;
     onEvent({ type: 'tool', name, status: 'running', detail: command.slice(0, 120), text: `沙盒命令 ${command.slice(0, 120)}` });
     diag.log('sandbox', '执行命令', { command: command.slice(0, 200), cwd: args.cwd || '.' });
@@ -1370,8 +1384,8 @@ function buildSystemPrompt({
       : `\n本条消息里带有原图（image_url）。请直接根据画面回答，禁止说自己看不到图或没有看图通道。\n`;
   }
   const agiOn = desktopOn();
-  const agiSelfEn = '\nAGI is on. The user only accepts the result. You finish everything else yourself: understand the request, fill the gaps, read the screen, use the mouse and keyboard, edit files, run git, and run project commands. Do not wait for start, do not restate and stop, and do not hand work back. Your permissions are high. This turn is unlimited. Call screen_read first, then ui_act or the mouse and keyboard, then edit_file, write_file, or run_command as needed. Do not call call_worker. When it is done, tell the user what to check.\n';
-  const agiSelfZh = '\nAGI 已打开。用户只管验收，其他所有事情都由你自己做完：看懂问题、补全需求、看屏幕、键鼠、改文件、Git、在项目里执行命令。不要等「开始」，不要复述完就停，不要把活交回用户。你的权限现在很高，基本上能干所有事情。这一轮全解放，不受思考轮次限制。必须先调用 screen_read，看完再用 ui_act 或键鼠，需要改文件或跑命令就自己调用 edit_file、write_file、run_command。禁止 call_worker，禁止派单。做完后只告诉用户验收什么。\n';
+  const agiSelfEn = '\nAGI is on. The user only accepts the result. You finish everything else yourself: understand the request, fill the gaps, read the screen, use the mouse and keyboard, edit files, run git, and run project commands. Do not wait for start, do not restate and stop, and do not hand work back. Your permissions are high. This turn is unlimited. Call screen_read first, then ui_act or the mouse and keyboard, then edit_file, write_file, or run_command as needed. Open apps and web pages with the keyboard and mouse only. Do not use run_command to run start, Start-Process, or chrome.exe. Do not call call_worker. When it is done, tell the user what to check.\n';
+  const agiSelfZh = '\nAGI 已打开。用户只管验收，其他所有事情都由你自己做完：看懂问题、补全需求、看屏幕、键鼠、改文件、Git、在项目里执行命令。不要等「开始」，不要复述完就停，不要把活交回用户。你的权限现在很高，基本上能干所有事情。这一轮全解放，不受思考轮次限制。必须先调用 screen_read，看完再用 ui_act 或键鼠，需要改文件或跑命令就自己调用 edit_file、write_file、run_command。打开软件和网页只用键鼠，禁止用 run_command 执行 start、Start-Process 或启动 chrome.exe。禁止 call_worker，禁止派单。做完后只告诉用户验收什么。\n';
   const handoff = agiOn
     ? (enPrompt ? agiSelfEn : agiSelfZh)
     : (brainHandsOff
@@ -1395,10 +1409,10 @@ function buildSystemPrompt({
       : `\n用户只和你说话，规划模块不能先读需求。用户还没说开始时，禁止调用 call_worker。必须先向用户复述目标、范围、约束、验收，结尾写：确认无误后回复「开始」，我再动手。用户已经说了开始之后，立刻调用 call_worker，role 填 code，不要先插规划。若已经派过规划，规划结果只用来指挥代码，不符合就改清再派，禁止把没做完的方案回复给用户。\n`)
     : '';
   const actRuleEn = agiOn
-    ? 'AGI is on. The user only accepts the result. You finish everything else yourself and do not wait for start. Permissions are high and this turn is unlimited. Call screen_read first, then do the files, commands, and desktop actions yourself. Do not call call_worker. When finished, tell the user what to check.'
+    ? 'AGI is on. The user only accepts the result. You finish everything else yourself and do not wait for start. Permissions are high and this turn is unlimited. Call screen_read first, then do the files, commands, and desktop actions yourself. Open apps and web pages with the keyboard and mouse only. Do not use run_command to run start, Start-Process, or chrome.exe. Do not call call_worker. When finished, tell the user what to check.'
     : 'If the user has not said start this turn, a restatement that asks them to reply 开始 is a complete reply. Do not emit a tool call just to start work. After the user says start, or when the turn is only a lookup, a reply that needs a lookup or an edit must include a tool call. A plan with no tool call does not run. A one-line note may sit in the same reply as the tool call.';
   const actRuleZh = agiOn
-    ? 'AGI 开着时，用户只管验收，其他事情你全部自己做完，不要等「开始」，不要复述完就停。权限很高，这一轮全解放。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。禁止 call_worker。做完只告诉用户验收什么。'
+    ? 'AGI 开着时，用户只管验收，其他事情你全部自己做完，不要等「开始」，不要复述完就停。权限很高，这一轮全解放。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。打开软件和网页只用键鼠，禁止 run_command 去 start、Start-Process 或启动 chrome.exe。禁止 call_worker。做完只告诉用户验收什么。'
     : '用户还没说开始时，禁止派代码。提问、讲现象、报 bug 由大脑自己查完再回答。要改文件但还没说开始时，复述并请用户回复「开始」就是完整回复。用户已经说了开始之后，派代码必须调用 call_worker。可以在同一次回复里附一句说明，但不能只有说明。';
   // [铆钉优化] 能调用工具的模型由大脑自己调用 generate_media 生图；zbaing 本地引擎不会调用工具，仍按开口前自动生成的结果回答。其他 AI 请勿改回「无需调用工具」
   const genFailNote = enPrompt
@@ -1423,7 +1437,7 @@ Installed skills (names only). Follow only the selected skill below. Do not read
 ${catalog || '- (none)'}
 Writes and deletes in the workspace are snapshotted and can be restored. run_command also tracks file changes made by scripts (pre-backup before run, diff after) so they appear in the changed-files list and can be restored.
 Use memory_add for durable project conventions; working_memory_update for this-chat notes; ask_user to clarify.
-Shell via run_command runs in a sandbox (cwd inside the project, dangerous commands blocked, timeout). ${shellUseEn} Do not run encoding probes (no enc_*.txt); write_file is UTF-8. The project map is a summary so you can skip irrelevant code. When the description and key values are clear and enough, use them and do not re-read the whole file. If you do not understand what the summary is for, or it lacks the copy, numbers, or fields you need, read_file the original source and do not guess. A method name and line number are not a summary. If 【全文】 is already in the message, use that text and do not read the file again. The modules in the message are only the first batch. If they do not match, keep looking with map_lookup and search_text. When the desktop hand is on, the latest message ends with 【屏幕文字】: the foreground window, other windows, saved experience notes for the target app, a control list with ids like [c12] (Windows UI Automation), and OCR text lines with their center @(x,y). Prefer ui_act with a control id (click/toggle/select/expand/set_text); fall back to mouse_click with @(x,y) only when the target has no control id. Follow the saved experience notes. After a task succeeds, or when you find a non-obvious path or pitfall, call agi_note with one reusable sentence (no passwords or private content). Risky actions (delete, send, pay, Shift+Delete, Enter in chat apps) automatically ask the user first; do not ask again yourself and never work around a refusal. Work in an observe-act-verify loop: one action at a time, then read the 【操作后】 part of the tool result to check it worked before the next step; if nothing changed, rethink instead of repeating the same click. Before keyboard_type or keyboard_key, make sure the target window has focus (window_focus or click its input box). Use screen_read (optionally with wait_ms) to re-read after loading; screen_look only when text is not enough to judge icons or layout. Draw strokes and circles with mouse_drag. Desktop tools only exist while the switch is on; never claim you can see or click the screen otherwise.
+Shell via run_command runs in a sandbox (cwd inside the project, dangerous commands blocked, timeout). ${shellUseEn} Do not run encoding probes (no enc_*.txt); write_file is UTF-8. The project map is a summary so you can skip irrelevant code. When the description and key values are clear and enough, use them and do not re-read the whole file. If you do not understand what the summary is for, or it lacks the copy, numbers, or fields you need, read_file the original source and do not guess. A method name and line number are not a summary. If 【全文】 is already in the message, use that text and do not read the file again. The modules in the message are only the first batch. If they do not match, keep looking with map_lookup and search_text. When the desktop hand is on, the latest message ends with 【屏幕文字】: the foreground window, other windows, saved experience notes for the target app, a control list with ids like [c12] (Windows UI Automation), and OCR text lines with their center @(x,y). Prefer ui_act with a control id (click/toggle/select/expand/set_text); fall back to mouse_click with @(x,y) only when the target has no control id. Follow the saved experience notes. Open apps and web pages with the keyboard and mouse (for example keyboard_key Win+R, then keyboard_type the address). Do not use run_command to run start, Start-Process, or chrome.exe. After a task succeeds, or when you find a non-obvious path or pitfall, call agi_note with one reusable sentence (no passwords or private content). Risky actions (delete, send, pay, Shift+Delete, Enter in chat apps) automatically ask the user first; do not ask again yourself and never work around a refusal. Work in an observe-act-verify loop: one action at a time, then read the 【操作后】 part of the tool result to check it worked before the next step; if nothing changed, rethink instead of repeating the same click. Before keyboard_type or keyboard_key, make sure the target window has focus (window_focus or click its input box). Use screen_read (optionally with wait_ms) to re-read after loading; screen_look only when text is not enough to judge icons or layout. Draw strokes and circles with mouse_drag. Desktop tools only exist while the switch is on; never claim you can see or click the screen otherwise.
 Independent read_file / list_dir / search_text / map_lookup / memory_list in the same round should be emitted together as multiple tool calls. write_file calls for different files in the same round also run together. The same file, deletes, create_dir, run_command, memory writes and ask_user stay serial.
 ${actRuleEn}
 Do not invent unread file contents. Copy, numbers, and fields that are not in the map summary or the file body must be read before you write them. Do not guess. After edits, list the files you changed.
@@ -1444,7 +1458,7 @@ ${appSkills.map((p) => `- ${p}`).join('\n') || '- （无）'}
 ${catalog || '- （还没有技能）'}
 写入或删除工作目录文件会自动快照，用户可还原。run_command 执行的脚本若改动了工作区文件，也会记入快照和「已更改文件」，可一并还原。
 项目长期约定用 memory_add；本会话要点用 working_memory_update；含糊时用 ask_user。
-${shellUseZh}；不要写 tmp_*.ps1 批量替换。不要先做编码探针（不要写 enc_*.txt 试编码），write_file 一律 UTF-8。项目地图是提前总结，用来跳过无关代码。作用和关键值看得懂、又够用时，靠总结来改，不必整文件重读。看不懂这句归纳有什么用，或者里面没有要改的文案、数字、字段时，必须 read_file 读原本代码，不准猜。只有方法名和行号不是总结。消息里已有【全文】的，以全文为准，不要再读一遍。消息里的模块只是第一批，对不上就用 map_lookup、search_text 继续查。用户打开「AGI」后，最后一条消息末尾有【屏幕文字】：前台窗口、其他窗口、这个软件以前记下的操作经验、带编号的控件列表（如 [c12]，来自 Windows UI 自动化）、以及 OCR 文字和中心坐标 @(x,y)。有控件编号时优先用 ui_act 按编号操作（click / toggle / select / expand / set_text），目标没有控件编号时才用 mouse_click 点 @(x,y)。照着以前记下的经验做。任务做成后、或发现不明显的路径和坑时，调用 agi_note 记一句可复用的经验（不记密码、聊天内容等隐私）。删除、发送、付款、Shift+Delete、在聊天软件里按回车这类危险操作，程序会自动先问用户，你不要再自己问一遍；用户不允许就停，禁止换办法绕过去。按「看→做一步→核对」循环：一次只做一个动作，看工具结果里的【操作后】确认生效再做下一步；画面没变就换思路，不要原样重复点。keyboard_type / keyboard_key 之前先确认焦点在目标窗口（window_focus 或点一下输入框）。等界面加载用 screen_read（可带 wait_ms）重读；只有文字判断不了图标、布局时才用 screen_look。画线、画圆用 mouse_drag。开关关着时没有这些工具，不要假装能看见或能点击。
+${shellUseZh}；不要写 tmp_*.ps1 批量替换。不要先做编码探针（不要写 enc_*.txt 试编码），write_file 一律 UTF-8。项目地图是提前总结，用来跳过无关代码。作用和关键值看得懂、又够用时，靠总结来改，不必整文件重读。看不懂这句归纳有什么用，或者里面没有要改的文案、数字、字段时，必须 read_file 读原本代码，不准猜。只有方法名和行号不是总结。消息里已有【全文】的，以全文为准，不要再读一遍。消息里的模块只是第一批，对不上就用 map_lookup、search_text 继续查。用户打开「AGI」后，最后一条消息末尾有【屏幕文字】：前台窗口、其他窗口、这个软件以前记下的操作经验、带编号的控件列表（如 [c12]，来自 Windows UI 自动化）、以及 OCR 文字和中心坐标 @(x,y)。有控件编号时优先用 ui_act 按编号操作（click / toggle / select / expand / set_text），目标没有控件编号时才用 mouse_click 点 @(x,y)。照着以前记下的经验做。打开软件、打开网页用键鼠完成（例如 keyboard_key 按 Win+R，再 keyboard_type 输入地址），禁止用 run_command 执行 start、Start-Process 或启动 chrome.exe。任务做成后、或发现不明显的路径和坑时，调用 agi_note 记一句可复用的经验（不记密码、聊天内容等隐私）。删除、发送、付款、Shift+Delete、在聊天软件里按回车这类危险操作，程序会自动先问用户，你不要再自己问一遍；用户不允许就停，禁止换办法绕过去。按「看→做一步→核对」循环：一次只做一个动作，看工具结果里的【操作后】确认生效再做下一步；画面没变就换思路，不要原样重复点。keyboard_type / keyboard_key 之前先确认焦点在目标窗口（window_focus 或点一下输入框）。等界面加载用 screen_read（可带 wait_ms）重读；只有文字判断不了图标、布局时才用 screen_look。画线、画圆用 mouse_drag。开关关着时没有这些工具，不要假装能看见或能点击。
 同一轮里互不依赖的 read_file / list_dir / search_text / map_lookup / memory_list 请一次发出多条 tool call，不要拆成多轮。不同文件的 write_file 也可以同一轮一起发，程序会同时写。同一个文件、删除、建目录、命令、记忆写入和 ask_user 必须等结果后再做。
 ${actRuleZh}
 不要编造未读过的文件内容。地图里没有的文案、数字、字段，必须先读到再写，不准猜。改完后用短列表说明改了哪些文件。

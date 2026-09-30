@@ -393,6 +393,10 @@ function releaseFocus(root) {
   try { document.activeElement.blur(); } catch { /* 控件已卸下 */ }
   return true;
 }
+function focusField(el) {
+  if (!el) return;
+  try { el.focus({ preventScroll: true }); } catch { try { el.focus(); } catch { /* 输入框尚未挂上 */ } }
+}
 function focusComposer() {
   const input = $('input');
   const chatOpen = $('view-chat') && !$('view-chat').classList.contains('hidden');
@@ -400,10 +404,11 @@ function focusComposer() {
   const modalOpen = modal && !modal.classList.contains('hidden') && modal.classList.contains('is-open');
   const lb = $('lightbox');
   const lbOpen = lb && !lb.classList.contains('hidden') && lb.classList.contains('is-open');
-  if (chatOpen && input && !modalOpen && !lbOpen) {
-    try { input.focus({ preventScroll: true }); } catch { try { input.focus(); } catch { /* 输入框尚未挂上 */ } }
-  }
-  api.focusWindow?.();
+  const target = (chatOpen && input && !modalOpen && !lbOpen) ? input : null;
+  if (target) focusField(target);
+  // 窗口被安装程序拉起时还没拿到键盘。激活之后再把焦点放回输入框。
+  const pending = api.focusWindow?.();
+  if (target && pending && typeof pending.then === 'function') pending.then(() => focusField(target));
 }
 window.__releaseFocus = releaseFocus;
 window.__focusComposer = focusComposer;
@@ -5815,7 +5820,14 @@ function bind() {
     }
   });
   const composer = $('composer');
-  composer.addEventListener('pointerdown', () => { api.focusWindow?.(); });
+  composer.addEventListener('pointerdown', (e) => {
+    const field = e.target.closest?.('textarea, input');
+    if (!field) return;
+    const pending = api.focusWindow?.();
+    if (pending && typeof pending.then === 'function') {
+      pending.then(() => { if (document.activeElement !== field) focusField(field); });
+    }
+  });
   composer.addEventListener('dragover', (e) => {
     e.preventDefault();
     composer.classList.add('drop-on');

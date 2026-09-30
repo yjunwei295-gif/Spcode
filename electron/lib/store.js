@@ -21,17 +21,6 @@ const ZBAING_SLOT = {
   enabled: true
 };
 
-const DEFAULT_OPENAI_PROVIDER = {
-  id: 'prov-openai',
-  name: 'OpenAI',
-  protocol: 'openai',
-  baseUrl: 'https://api.openai.com/v1',
-  apiKey: '',
-  timeout: 120,
-  maxRetries: 3,
-  retryInterval: 5
-};
-
 const DEFAULTS = {
   theme: 'system',
   locale: 'zh',
@@ -48,19 +37,9 @@ const DEFAULTS = {
   commandSandbox: { enabled: true, timeoutSec: 60 },
   maxAgentRounds: 16,
   desktopAlive: false,
-  providers: [{ ...DEFAULT_OPENAI_PROVIDER }],
+  providers: [],
   models: [
-    { ...LOCAL_SLOT },
-    { ...ZBAING_SLOT },
-    {
-      id: 'model-gpt-4.1',
-      name: 'gpt-4.1',
-      model: 'gpt-4.1',
-      type: 'api',
-      providerId: 'prov-openai',
-      vision: true,
-      enabled: true
-    }
+    { ...LOCAL_SLOT }
   ],
   recents: [],
   sshProfiles: [],
@@ -177,26 +156,21 @@ function ensureLocalSlot(models) {
 
 function ensureZbaingSlot(models) {
   const kept = models || [];
-  let zb = kept.find((m) => m?.id === 'zbaingAi' || m?.type === 'zbaingAi');
-  if (!zb) {
-    zb = { ...ZBAING_SLOT, zbaingRoot: defaultZbaingRoot() };
-    const localIdx = kept.findIndex((m) => m?.id === 'local-gguf' || m?.type === 'local');
-    if (localIdx >= 0) kept.splice(localIdx + 1, 0, zb);
-    else kept.unshift(zb);
-  } else {
-    zb.id = 'zbaingAi';
-    zb.type = 'zbaingAi';
-    zb.name = zb.name || ZBAING_SLOT.name;
-    zb.enabled = zb.enabled !== false;
-    if (!zb.zbaingRoot) zb.zbaingRoot = defaultZbaingRoot();
-    delete zb.providerId;
-    delete zb.model;
-    delete zb.baseUrl;
-    delete zb.apiKey;
-    delete zb.protocol;
-    delete zb.modelPath;
-    delete zb.vision;
-  }
+  const zb = kept.find((m) => m?.id === 'zbaingAi' || m?.type === 'zbaingAi');
+  // 没有配过就不补。默认清单里不带 zbaingAi。
+  if (!zb) return kept;
+  zb.id = 'zbaingAi';
+  zb.type = 'zbaingAi';
+  zb.name = zb.name || ZBAING_SLOT.name;
+  zb.enabled = zb.enabled !== false;
+  if (!zb.zbaingRoot) zb.zbaingRoot = defaultZbaingRoot();
+  delete zb.providerId;
+  delete zb.model;
+  delete zb.baseUrl;
+  delete zb.apiKey;
+  delete zb.protocol;
+  delete zb.modelPath;
+  delete zb.vision;
   return kept;
 }
 
@@ -262,8 +236,6 @@ function migrateProvidersAndModels(data) {
     if (m.type === 'zbaingAi' || m.id === 'zbaingAi') return true;
     return !!(m.providerId && m.model);
   });
-
-  if (!providers.length) providers = [{ ...DEFAULT_OPENAI_PROVIDER }];
 
   return { providers, models };
 }
