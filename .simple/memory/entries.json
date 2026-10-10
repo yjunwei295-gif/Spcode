@@ -1,0 +1,1837 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "mem-mv0s5rnt-r6k6is",
+      "createdAt": "2026-10-09T09:46:00.907Z",
+      "updatedAt": "2026-10-09T09:46:00.907Z",
+      "kind": "invariant",
+      "summary": "发现未点名但应修改的地方时，必须先调用 ask_user 说明发现、想改内容和原因并等待同意，先改后报告不算许可。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "ask_user",
+        "授权",
+        "越权"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0s5rnt-yxssbf",
+      "createdAt": "2026-10-09T09:46:00.907Z",
+      "updatedAt": "2026-10-09T09:46:00.907Z",
+      "kind": "decision",
+      "summary": "为在信息缺口时先取得用户确认，防御性编程要求不能只停下报告，必须先调用 ask_user 询问并等待答复再动手。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "信息缺口",
+        "ask_user",
+        "防御性编程"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0s5rnt-3p41eg",
+      "createdAt": "2026-10-09T09:46:00.907Z",
+      "updatedAt": "2026-10-09T09:46:00.907Z",
+      "kind": "decision",
+      "summary": "为确保越权约束优先于其他提示词，该规则需放在中英文提示词最前面并以最高优先级压过其他条目。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "最高优先级",
+        "提示词顺序"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0s5rnt-5xglkt",
+      "createdAt": "2026-10-09T09:46:00.907Z",
+      "updatedAt": "2026-10-09T09:46:00.907Z",
+      "kind": "decision",
+      "summary": "按用户要求 AGI 自主，AGI 相关段落及硬拦保持原样，不纳入上述约束或改动范围。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "AGI",
+        "硬拦",
+        "范围"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0s5rnt-xwqrh0",
+      "createdAt": "2026-10-09T09:46:00.906Z",
+      "updatedAt": "2026-10-09T09:46:00.906Z",
+      "kind": "invariant",
+      "summary": "为避免越权改动，agent 提示词与实现端必须只改用户/派单点名的文件和内容，未点名的功能、字段、文案、行为一律不得自行改动。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "改动范围",
+        "提示词",
+        "实现端"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0k6qv8-gxykmt",
+      "createdAt": "2026-10-09T06:02:49.607Z",
+      "updatedAt": "2026-10-09T06:02:49.607Z",
+      "kind": "invariant",
+      "summary": "为保持主题一致，新增 UI 样式必须复用既有主题变量和暗色主题变量，不硬编码颜色与圆角。",
+      "paths": [
+        "renderer/styles.css",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "theme",
+        "css"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0k6qv8-5uo3k7",
+      "createdAt": "2026-10-09T06:02:49.607Z",
+      "updatedAt": "2026-10-09T06:02:49.607Z",
+      "kind": "invariant",
+      "summary": "为保证小窗开始请求的 note 不丢，preload 的 start/onFloatStart、main 的 floatbar:do-start 载荷和 renderer 回调必须贯通传递 note。",
+      "paths": [
+        "electron/preload.js",
+        "electron/main.js",
+        "renderer/app.js",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "note",
+        "bridge",
+        "floatbar"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0k6qv8-wek9fz",
+      "createdAt": "2026-10-09T06:02:49.606Z",
+      "updatedAt": "2026-10-09T06:02:49.606Z",
+      "kind": "decision",
+      "summary": "为避免收放动画砸手并保持底边稳定，紧凑态收放采用约 180ms 逐帧缓动、底边全程不动且只有最后一帧才通知页面收成两条消息。",
+      "paths": [
+        "electron/lib/float-bar.js"
+      ],
+      "tags": [
+        "compact",
+        "animation",
+        "float-bar"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0k6qv8-2e9pd8",
+      "createdAt": "2026-10-09T06:02:49.606Z",
+      "updatedAt": "2026-10-09T06:02:49.606Z",
+      "kind": "invariant",
+      "summary": "为保证向后兼容，开始请求新增 note 后必须原样透传，note 为空时行为与旧路径逐字一致，并保持钉底边口径、value 透传和单颗「开始」老路径不变。",
+      "paths": [
+        "electron/lib/float-bar.js",
+        "electron/preload.js",
+        "electron/main.js",
+        "renderer/app.js"
+      ],
+      "tags": [
+        "note",
+        "start",
+        "compatibility"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0k6qv8-00agf1",
+      "createdAt": "2026-10-09T06:02:49.606Z",
+      "updatedAt": "2026-10-09T06:02:49.606Z",
+      "kind": "decision",
+      "summary": "为让用户可留补充说明且不丢字，主窗内容存 m.startDraft、勾选或流式刷新不丢字且只填说明不勾也能点；小窗状态 startNote 在切会话时清空并作为第三参提交。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "start-note",
+        "state"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0k6qv8-a6xvfr",
+      "createdAt": "2026-10-09T06:02:49.606Z",
+      "updatedAt": "2026-10-09T06:02:49.606Z",
+      "kind": "invariant",
+      "summary": "为兼容无 note 的旧格式，提交开始消息时只有 note 非空才拼成「…／补充：…／开始」。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "tags": [
+        "start-note",
+        "format"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0k6qv8-nanhet",
+      "createdAt": "2026-10-09T06:02:49.605Z",
+      "updatedAt": "2026-10-09T06:02:49.605Z",
+      "kind": "invariant",
+      "summary": "为保持主窗与小窗图标一致，小窗建窗必须挂仓库根目录同一份 icons.png。",
+      "paths": [
+        "electron/lib/float-bar.js"
+      ],
+      "tags": [
+        "icon",
+        "float-bar"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv0gtebz-h93ye8",
+      "createdAt": "2026-10-09T04:28:27.983Z",
+      "updatedAt": "2026-10-09T04:28:27.983Z",
+      "kind": "pin",
+      "summary": "禁止 AI 防御性编程：只实现用户明确要求或派单写明的内容，不擅自加兜底、回退、兼容、默认值、启发式、额外开关/参数/抽象层或吞异常保护；需求/派单有缺口先停下报告，不脑补；注释禁止写“其他 AI 请勿删除”等自我加锁警告。命令后不得全量删除未变化的工作区基准备份，须保留供后续命令复用；cleanupLegacyBackups 的旧快照清理逻辑保留。",
+      "paths": [
+        "electron/lib/agent.js",
+        "electron/lib/snapshot.js"
+      ],
+      "tags": [
+        "agent提示词",
+        "防御性编程",
+        "快照备份",
+        "勿破坏"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziy3n9-jmiemf",
+      "createdAt": "2026-10-08T12:40:20.475Z",
+      "updatedAt": "2026-10-08T12:40:20.475Z",
+      "kind": "decision",
+      "summary": "sheet_to_wps 的 open 模式落盘默认在桌面，文件名固定为 表格-<时间戳>.xlsx，便于找到且避免覆盖。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "sheet_to_wps",
+        "xlsx",
+        "文件名",
+        "桌面"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziy3n9-kf16ri",
+      "createdAt": "2026-10-08T12:40:20.475Z",
+      "updatedAt": "2026-10-08T12:40:20.475Z",
+      "kind": "invariant",
+      "summary": "改动 sheet_to_wps 时不得影响危险确认链路、screen_*/ui_act/keyboard_*/mouse_*、sheet_read_image 和 sheet_write 原行为，以及 desktop-hand/main/preload/float-bar。",
+      "paths": [
+        "electron/lib/agent.js",
+        "electron/lib/sheet-core.js"
+      ],
+      "tags": [
+        "边界",
+        "既有行为",
+        "安全"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziy3n9-miirb2",
+      "createdAt": "2026-10-08T12:40:20.474Z",
+      "updatedAt": "2026-10-08T12:40:20.474Z",
+      "kind": "decision",
+      "summary": "sheet_to_wps 默认使用 mode='open' 生成 xlsx 再交 WPS 打开，因为只有 xlsx 能保留合并单元格；paste 模式用 TSV 无法表达合并单元格，需手动合。",
+      "paths": [
+        "electron/lib/agent.js",
+        "electron/lib/sheet-core.js"
+      ],
+      "tags": [
+        "sheet_to_wps",
+        "mode",
+        "合并单元格",
+        "xlsx",
+        "tsv"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziy3n9-bl4jp9",
+      "createdAt": "2026-10-08T12:40:20.473Z",
+      "updatedAt": "2026-10-08T12:40:20.473Z",
+      "kind": "decision",
+      "summary": "为避免顶层引入 electron 造成加载或打包问题，agent.js 需要的 electron 能力用延迟 require 获取，不在模块顶层引入。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "electron",
+        "require",
+        "openWithSystem"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziy3n9-a55932",
+      "createdAt": "2026-10-08T12:40:20.472Z",
+      "updatedAt": "2026-10-08T12:40:20.472Z",
+      "kind": "decision",
+      "summary": "sheet_to_wps 属于桌面工具，必须注册进 DESKTOP_TOOLS 并遵循 AGI 开关，AGI 关闭时不提供给模型。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "sheet_to_wps",
+        "DESKTOP_TOOLS",
+        "AGI"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziy3n9-zf7xlw",
+      "createdAt": "2026-10-08T12:40:20.471Z",
+      "updatedAt": "2026-10-08T12:40:20.471Z",
+      "kind": "invariant",
+      "summary": "因为 TSV 用制表符和换行分隔行列，specToTsv 输出时必须把单元格内的 Tab/换行替换为空格，避免破坏表格结构。",
+      "paths": [
+        "electron/lib/sheet-core.js"
+      ],
+      "tags": [
+        "tsv",
+        "specToTsv",
+        "转义"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziu8ak-yik85d",
+      "createdAt": "2026-10-08T12:37:19.870Z",
+      "updatedAt": "2026-10-08T12:37:19.870Z",
+      "kind": "invariant",
+      "summary": "新增 sheet 工具不得改变 guardDesktop 危险确认、控件编号机制、screen_read/screen_look/clipboard_look 原行为、desktop-hand.js 与 IPC 结构。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "desktop",
+        "guard",
+        "compatibility"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziu8ak-zf3buc",
+      "createdAt": "2026-10-08T12:37:19.870Z",
+      "updatedAt": "2026-10-08T12:37:19.870Z",
+      "kind": "decision",
+      "summary": "为避免模块加载期硬依赖，sheet-core 对 store 和 assembly 采用按需加载，加载失败时回退为空模型路径配置。",
+      "paths": [
+        "electron/lib/sheet-core.js"
+      ],
+      "tags": [
+        "lazy-load",
+        "store",
+        "assembly"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziu8ak-ovks0g",
+      "createdAt": "2026-10-08T12:37:19.869Z",
+      "updatedAt": "2026-10-08T12:37:19.869Z",
+      "kind": "invariant",
+      "summary": "为避免坐标转换不一致，合并单元格在内部统一规范化为 {r1,c1,r2,c2}，写入 xlsx 与合并区域校验都必须基于该规范化坐标。",
+      "paths": [
+        "electron/lib/sheet-core.js"
+      ],
+      "tags": [
+        "sheet",
+        "merge",
+        "xlsx"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziu8ak-1kcr54",
+      "createdAt": "2026-10-08T12:37:19.869Z",
+      "updatedAt": "2026-10-08T12:37:19.869Z",
+      "kind": "decision",
+      "summary": "sheet_read_image 与 sheet_write 作为桌面工具仅在 AGI 开启时暴露给模型，AGI 关闭时照旧不可用。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "agi",
+        "desktop-tools",
+        "sheet"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muziu8aj-feo4wg",
+      "createdAt": "2026-10-08T12:37:19.868Z",
+      "updatedAt": "2026-10-08T12:37:19.868Z",
+      "kind": "decision",
+      "summary": "为保证解析可控且不猜测补全，sheet-core 的 parseSheetImage 必须硬约束模型只返回固定 JSON（rows/cols/merges/cells），解析失败直接抛出含模型原文的错误。",
+      "paths": [
+        "electron/lib/sheet-core.js"
+      ],
+      "tags": [
+        "sheet",
+        "parse",
+        "json"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzb5t70-1g8dbj",
+      "createdAt": "2026-10-08T09:02:23.246Z",
+      "updatedAt": "2026-10-08T09:02:23.246Z",
+      "kind": "decision",
+      "summary": "主界面开始区有选项时按 m.startPicked 渲染 .on 与行尾 start-go-submit，repaintStartGo 只重画该条按钮区，避免整体重绘影响其他 UI。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "tags": [
+        "start-go",
+        "重绘",
+        "开始区"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzb5t70-fbujsv",
+      "createdAt": "2026-10-08T09:02:23.246Z",
+      "updatedAt": "2026-10-08T09:02:23.246Z",
+      "kind": "decision",
+      "summary": "startGoTurn 接收数组时需拼成“就按下面这几项一起做：1) … 2) … 开始”，onFloatStart 对数组直传、单项包成 [value]，以统一多选和单选入口。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "tags": [
+        "startGoTurn",
+        "onFloatStart",
+        "多选"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzb5t70-zc5jv6",
+      "createdAt": "2026-10-08T09:02:23.246Z",
+      "updatedAt": "2026-10-08T09:02:23.246Z",
+      "kind": "decision",
+      "summary": "主题颜色通过 CSS 变量维护：悬浮栏深色主题变量定义在 float-bar.html，主界面及深色主题变量定义在 styles.css，便于统一换肤。",
+      "paths": [
+        "electron/lib/float-bar.html",
+        "renderer/styles.css"
+      ],
+      "tags": [
+        "CSS变量",
+        "主题",
+        "深色"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzb5t70-v6n928",
+      "createdAt": "2026-10-08T09:02:23.246Z",
+      "updatedAt": "2026-10-08T09:02:23.246Z",
+      "kind": "invariant",
+      "summary": "start-go 相关样式应集中维护在 styles.css/float-bar.html，不要在 renderer/app.js 中重复注入，否则会回潮重复样式。",
+      "paths": [
+        "renderer/app.js",
+        "renderer/styles.css",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "样式",
+        "重复注入"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzb5t70-wb1m4s",
+      "createdAt": "2026-10-08T09:02:23.245Z",
+      "updatedAt": "2026-10-08T09:02:23.245Z",
+      "kind": "invariant",
+      "summary": "多选开始时各选项按钮只负责切换 startPicked 勾选，真正生成必须由 start-go-submit 提交按钮触发，点击委托需先识别提交，否则会误触发生成。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "start-go",
+        "多选",
+        "提交"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzb5t70-14tj9s",
+      "createdAt": "2026-10-08T09:02:23.245Z",
+      "updatedAt": "2026-10-08T09:02:23.245Z",
+      "kind": "invariant",
+      "summary": "开始选项勾选集合 startPicked 在 setBoundKey/applyStartReady 时必须清空，避免切换绑定或就绪状态后残留旧选择。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "startPicked",
+        "状态清理",
+        "float-bar"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzb5t70-ue6l1f",
+      "createdAt": "2026-10-08T09:02:23.245Z",
+      "updatedAt": "2026-10-08T09:02:23.245Z",
+      "kind": "decision",
+      "summary": "悬浮栏多选态由 paintStartButtons 给已选项加 .on 并追加“一起开工”提交按钮，未勾选时提交 disabled，样式由 .start-go.on/.start-go-submit/:disabled 统一控制，以保持交互一致。",
+      "paths": [
+        "electron/lib/float-bar.html",
+        "renderer/styles.css"
+      ],
+      "tags": [
+        "UI",
+        "多选",
+        "float-bar"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzb5t70-wsu3ln",
+      "createdAt": "2026-10-08T09:02:23.244Z",
+      "updatedAt": "2026-10-08T09:02:23.244Z",
+      "kind": "invariant",
+      "summary": "开始事件 value 可能是数组或字符串，从悬浮栏到主窗必须原样透传且不做 String() 转换，仅对空值兜底，否则多选信息会丢失。",
+      "paths": [
+        "electron/lib/float-bar.js",
+        "electron/main.js",
+        "electron/preload.js"
+      ],
+      "tags": [
+        "start",
+        "value",
+        "多选",
+        "透传"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaulkr-dim5g4",
+      "createdAt": "2026-10-08T08:53:40.157Z",
+      "updatedAt": "2026-10-08T08:53:40.157Z",
+      "kind": "invariant",
+      "summary": "float-bar 内可点击的 .sitem 必须设置 -webkit-app-region: no-drag，否则拖拽区域会吞掉点击导致列表项点不动。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "float-bar",
+        "拖拽",
+        "点击"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaulkr-p1a1s3",
+      "createdAt": "2026-10-08T08:53:40.157Z",
+      "updatedAt": "2026-10-08T08:53:40.157Z",
+      "kind": "decision",
+      "summary": "float-bar 的文本、边框、强调色、阴影、圆角、字体等主题样式已集中到 :root 变量，后续改样式应复用变量而非硬编码以保持统一。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "float-bar",
+        "主题变量",
+        "样式"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaulkr-2tc2u2",
+      "createdAt": "2026-10-08T08:53:40.156Z",
+      "updatedAt": "2026-10-08T08:53:40.156Z",
+      "kind": "invariant",
+      "summary": "float-bar 的会话列表应放在 #top 内部并用 top:100%; right:10px 贴顶栏下沿，避免顶栏高度变化时被写死的 top 值遮挡。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "float-bar",
+        "布局",
+        "会话列表"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzau9ku-scxbrr",
+      "createdAt": "2026-10-08T08:53:24.606Z",
+      "updatedAt": "2026-10-08T08:53:24.606Z",
+      "kind": "pin",
+      "summary": "原因：小窗会话列表 #sessList 原先写死 top:36px 且 .sitem 没有 -webkit-app-region:no-drag，落在窗口拖拽条 #top（会随会话名变长而变高）里的那一行点击被当成拖窗口，导致列表最上面一项永远点不动；结论：#sessList 必须嵌在 #top 内部、用 top:100% 贴顶栏下沿（right 保持 10px），#sessList .sitem 必须常驻 no-drag，禁止再写死 top 魔数",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "floatbar",
+        "sessList",
+        "no-drag",
+        "定位"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzamm69-4wvjsl",
+      "createdAt": "2026-10-08T08:47:27.683Z",
+      "updatedAt": "2026-10-08T08:47:27.683Z",
+      "kind": "invariant",
+      "summary": "改 buildSystemPrompt 时不得改动开工选项标记块约束、`${memoryBlock}` 之后内容、总结模块提示词，以免破坏既有交互、记忆和总结逻辑。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "buildSystemPrompt",
+        "边界"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzamm69-gta0rf",
+      "createdAt": "2026-10-08T08:47:27.682Z",
+      "updatedAt": "2026-10-08T08:47:27.682Z",
+      "kind": "decision",
+      "summary": "汇报改动时必须列出改动文件（文件名+一句话），不贴代码、不逐条讲解，便于快速确认变更范围。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "汇报格式",
+        "改动文件"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzamm69-f6dpfc",
+      "createdAt": "2026-10-08T08:47:27.682Z",
+      "updatedAt": "2026-10-08T08:47:27.682Z",
+      "kind": "invariant",
+      "summary": "buildSystemPrompt 的中英文提示词需保持统一回答口径：结论在前、不复述需求/不写过程、只答被问到的、默认短、汇报必列改动文件、要点击才说点哪个。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "buildSystemPrompt",
+        "prompt",
+        "回答口径"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzamc0z-s4iv7q",
+      "createdAt": "2026-10-08T08:47:14.531Z",
+      "updatedAt": "2026-10-08T08:47:14.531Z",
+      "kind": "pin",
+      "summary": "汇报口径钉死：回答第一句给结论、不复述需求/不写过程/不解释查了什么、只答被问到的、默认短；汇报改动时必须列清改了哪些文件（文件名＋一句话），不贴代码、不逐条讲解。约束写在 agent.js buildSystemPrompt 的英文 Reply style 段与中文「回答与汇报口径」段，改口径只改这两处。 [electron/lib/agent.js]",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "汇报口径",
+        "提示词",
+        "勿破坏"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaewer-78jsx2",
+      "createdAt": "2026-10-08T08:41:27.706Z",
+      "updatedAt": "2026-10-08T08:41:27.706Z",
+      "kind": "invariant",
+      "summary": "因为本次标记化改动有明确边界，所以单颗“开始”分支、`data-start-go`+`onStart` 链路、小窗绑定/紧凑态、插话 AGI 门槛和 `electron/main.js` 不应被误改。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/agent.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "边界",
+        "未改动",
+        "开始按钮"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaewer-am0srr",
+      "createdAt": "2026-10-08T08:41:27.706Z",
+      "updatedAt": "2026-10-08T08:41:27.706Z",
+      "kind": "decision",
+      "summary": "因为临时自测脚本不应进入正式代码，所以 `renderer/_tmp_marker_test.cjs` 这类标记解析临时测试用后即删。",
+      "paths": [
+        "renderer/_tmp_marker_test.cjs"
+      ],
+      "tags": [
+        "临时脚本",
+        "清理",
+        "测试"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaewer-p60ab2",
+      "createdAt": "2026-10-08T08:41:27.705Z",
+      "updatedAt": "2026-10-08T08:41:27.705Z",
+      "kind": "decision",
+      "summary": "因为旧自由格式识别已全仓移除，所以不要恢复旧识别函数或非标记格式的开工选项解析。",
+      "paths": [
+        "renderer/app.js",
+        "renderer/markdown.js",
+        "electron/lib/float-bar-md.js"
+      ],
+      "tags": [
+        "旧识别",
+        "自由格式",
+        "移除"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaewer-q54i33",
+      "createdAt": "2026-10-08T08:41:27.704Z",
+      "updatedAt": "2026-10-08T08:41:27.704Z",
+      "kind": "invariant",
+      "summary": "因为标记块不能污染正文，所以 Markdown 渲染需整块隐藏 `[开工选项] … [/开工选项]`，并在收段落遇标记时立即停止。",
+      "paths": [
+        "renderer/markdown.js",
+        "electron/lib/float-bar-md.js"
+      ],
+      "tags": [
+        "markdown",
+        "渲染",
+        "段落",
+        "标记隐藏"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaewer-tj9wud",
+      "createdAt": "2026-10-08T08:41:27.704Z",
+      "updatedAt": "2026-10-08T08:41:27.704Z",
+      "kind": "invariant",
+      "summary": "因为主窗口和小窗正文渲染必须一致，所以 float-bar-md 需与 markdown.js 同口径隐藏标记并停段落。",
+      "paths": [
+        "electron/lib/float-bar-md.js",
+        "renderer/markdown.js"
+      ],
+      "tags": [
+        "小窗",
+        "float-bar",
+        "渲染一致性"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaewer-ghafij",
+      "createdAt": "2026-10-08T08:41:27.702Z",
+      "updatedAt": "2026-10-08T08:41:27.702Z",
+      "kind": "decision",
+      "summary": "因为本轮确定按“提示词中英文各一份”执行，所以 agent 中开工选项约束需同时保留英文和中文两份。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "提示词",
+        "中英文",
+        "agent"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaewer-ulrg9g",
+      "createdAt": "2026-10-08T08:41:27.701Z",
+      "updatedAt": "2026-10-08T08:41:27.701Z",
+      "kind": "invariant",
+      "summary": "因为提示词生成与前端解析必须对齐，所以前端应使用统一标记常量解析开标记，agent 中英文提示词中的标记字面量也必须与前端一字符不差。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "标记字面量",
+        "提示词",
+        "一致性"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzaewer-rc168p",
+      "createdAt": "2026-10-08T08:41:27.700Z",
+      "updatedAt": "2026-10-08T08:41:27.700Z",
+      "kind": "decision",
+      "summary": "因为开工按钮已统一为暗号式标记识别，所以只认 `[开工选项] … [/开工选项]`，序号/符号/甲乙丙/A还是B 等自由格式只出单颗“开始”。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "开工选项",
+        "标记解析",
+        "按钮"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzadzh5-yq1x1c",
+      "createdAt": "2026-10-08T08:40:45.017Z",
+      "updatedAt": "2026-10-08T08:40:45.017Z",
+      "kind": "pin",
+      "summary": "[开工选项] 标记块只在主窗 markdown.js 与 小窗 float-bar-md.js 里被整块跳过、正文不显示（流式未闭合跳到文末防闪出），两处都用字符串字面量判断、不引 app.js 常量；agent.js buildSystemPrompt 中英文各一段硬约束要求模型给多选项必须写该标记块、否则只给一颗「开始」，禁止 ①/1./•/甲乙丙/A 还是 B/方案一： 等自由格式当选项",
+      "paths": [
+        "renderer/markdown.js",
+        "electron/lib/float-bar-md.js",
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "开工选项",
+        "markdown",
+        "提示词",
+        "钉死"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muzady65-fv0ko1",
+      "createdAt": "2026-10-08T08:40:43.325Z",
+      "updatedAt": "2026-10-08T08:40:43.325Z",
+      "kind": "pin",
+      "summary": "开工选项改为只认专用标记块 [开工选项]…[/开工选项]（app.js:143-148 常量 START_OPTION_MARKER_OPEN/CLOSE、:1446-1508 parseMarkerStartOptions + parseStartOptions 只返回标记内逐行内容，流式未闭合取到末尾）；旧自由格式识别（编号块/项目符号块/天干/括号字母/A 还是 B/方案一：/isCodeLikeStartOption 代码味过滤/startOptionPrefixOf 系列）全部删除，禁止恢复或另加启发式识别 [renderer/app.js]",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "tags": [
+        "开工选项",
+        "钉死"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjs-ushckm",
+      "createdAt": "2026-10-08T06:29:00.811Z",
+      "updatedAt": "2026-10-08T06:29:00.811Z",
+      "kind": "decision",
+      "summary": "AGI 关闭时小窗发送不插话，改为广播排队提示并借 chat:float-user-message 走主窗原有排队链路，保持 renderer/app.js 零改动。",
+      "paths": [
+        "electron/main.js"
+      ],
+      "tags": [
+        "float-bar",
+        "queue",
+        "AGI"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjs-59cisb",
+      "createdAt": "2026-10-08T06:29:00.811Z",
+      "updatedAt": "2026-10-08T06:29:00.811Z",
+      "kind": "decision",
+      "summary": "AGI 开着时已排进队的插话在随后关闭 AGI 时不追溯撤回；主窗退回排队不加灰提示。",
+      "paths": [
+        "electron/lib/agent.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "interject",
+        "AGI",
+        "排队"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjs-gjnf0t",
+      "createdAt": "2026-10-08T06:29:00.810Z",
+      "updatedAt": "2026-10-08T06:29:00.810Z",
+      "kind": "invariant",
+      "summary": "插话 pushInterjection 必须在 AGI 开启时才生效；AGI 关时返回 false 且不广播已插话，小窗改走主窗排队。",
+      "paths": [
+        "electron/lib/agent.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "interject",
+        "AGI",
+        "queue"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjs-xxsli5",
+      "createdAt": "2026-10-08T06:29:00.810Z",
+      "updatedAt": "2026-10-08T06:29:00.810Z",
+      "kind": "invariant",
+      "summary": "pushInterjection 统一返回布尔值，成功入队 true，AGI 关/空 key/空 body false；main 以 !== true 判定失败并返回 no-agi。",
+      "paths": [
+        "electron/lib/agent.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "interject",
+        "返回值",
+        "no-agi"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjr-fjynb6",
+      "createdAt": "2026-10-08T06:29:00.809Z",
+      "updatedAt": "2026-10-08T06:29:00.809Z",
+      "kind": "invariant",
+      "summary": "float-bar-md.js 渲染必须先整段 escape 再套格式，且链接只放行 http/https/mailto，避免 XSS 与协议注入。",
+      "paths": [
+        "electron/lib/float-bar-md.js"
+      ],
+      "tags": [
+        "markdown",
+        "安全",
+        "xss"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjr-a49lp2",
+      "createdAt": "2026-10-08T06:29:00.809Z",
+      "updatedAt": "2026-10-08T06:29:00.809Z",
+      "kind": "decision",
+      "summary": "小窗 Markdown 不支持 _斜体_，链接识别需排除全角字符、星号等内容，避免误格式化与误识别链接。",
+      "paths": [
+        "electron/lib/float-bar-md.js"
+      ],
+      "tags": [
+        "markdown",
+        "链接",
+        "解析"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjs-lw0o7i",
+      "createdAt": "2026-10-08T06:29:00.809Z",
+      "updatedAt": "2026-10-08T06:29:00.809Z",
+      "kind": "decision",
+      "summary": "小窗 Markdown 渲染带 60 条上限缓存，减少重复渲染开销。",
+      "paths": [
+        "electron/lib/float-bar-md.js"
+      ],
+      "tags": [
+        "markdown",
+        "缓存"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjs-cmnxwf",
+      "createdAt": "2026-10-08T06:29:00.809Z",
+      "updatedAt": "2026-10-08T06:29:00.809Z",
+      "kind": "invariant",
+      "summary": ".msg.md 样式需用页面现成主题变量并覆盖父级 white-space: pre-wrap 为 normal，避免 Markdown 块级元素产生空行并保持主题一致。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "css",
+        "float-bar",
+        "markdown",
+        "主题"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjr-l10m3d",
+      "createdAt": "2026-10-08T06:29:00.808Z",
+      "updatedAt": "2026-10-08T06:29:00.808Z",
+      "kind": "invariant",
+      "summary": "小窗中只有 AI 消息（kind==='ai'）走 Markdown 渲染并设置 className='msg ai md'、innerHTML=FloatBarMd.render(...)，用户/工具/系统消息必须保持 textContent 纯文本，避免非 AI 内容被格式化或注入。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "float-bar",
+        "markdown",
+        "渲染"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5okjr-0um2v4",
+      "createdAt": "2026-10-08T06:29:00.808Z",
+      "updatedAt": "2026-10-08T06:29:00.808Z",
+      "kind": "decision",
+      "summary": "小窗 Markdown 渲染器以普通脚本挂 window.FloatBarMd={render} 并由 float-bar.html 在内联脚本前引入，保证现有内联脚本可直接调用。",
+      "paths": [
+        "electron/lib/float-bar-md.js",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "float-bar-md",
+        "window",
+        "脚本"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5nszh-0y15kw",
+      "createdAt": "2026-10-08T06:28:25.085Z",
+      "updatedAt": "2026-10-08T06:28:25.085Z",
+      "kind": "pin",
+      "summary": "小窗消息区 AI 正文走 Markdown：float-bar.html 是独立 file:// 页不能 import 主窗模块，故新建同目录普通脚本 electron/lib/float-bar-md.js 挂 window.FloatBarMd.render（先整段 escape 再套格式、链接只放行 http/https/mailto、不支持 _斜体_），:732 用 script src 引入；paint 里只对 kind==='ai' 走 className='msg ai md' + innerHTML，user/tool/sys 仍 textContent；.msg.md{white-space:normal} 覆盖父级 pre-wrap 才不出空行。主窗 markdown.js/app.js 零改动。",
+      "paths": [
+        "electron/lib/float-bar.html",
+        "electron/lib/float-bar-md.js"
+      ],
+      "tags": [
+        "小窗",
+        "markdown",
+        "渲染"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5nszf-4lq58m",
+      "createdAt": "2026-10-08T06:28:25.083Z",
+      "updatedAt": "2026-10-08T06:28:25.083Z",
+      "kind": "pin",
+      "summary": "插话只在 AGI 开着时成立：pushInterjection 开头判 desktopOn()，关着就 return false；main.js chat:interject 返回 {ok:false,reason:'no-agi'} 且不广播「已插话」；handleFloatBarSend 在 AGI 关时广播「AGI 没开，这条先排队」并把消息 sendTo 主窗 chat:float-user-message 走主窗排队。已排队的旧插话不追溯撤回。",
+      "paths": [
+        "electron/lib/agent.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "插话",
+        "AGI",
+        "小窗"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5fcdv-36fceu",
+      "createdAt": "2026-10-08T06:21:50.326Z",
+      "updatedAt": "2026-10-08T06:21:50.326Z",
+      "kind": "decision",
+      "summary": "按方案 A，点击小窗按钮不看小窗当前开关状态，只要点击就绑定当前会话。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "tags": [
+        "floatbar",
+        "decision",
+        "toggle"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5fcdv-sfetet",
+      "createdAt": "2026-10-08T06:21:50.326Z",
+      "updatedAt": "2026-10-08T06:21:50.326Z",
+      "kind": "invariant",
+      "summary": "小窗仍禁止焦点跟随，切标签不抢绑定；会话只能由发消息或点小窗按钮显式更换。",
+      "paths": [
+        "renderer/app.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "floatbar",
+        "focus",
+        "binding"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5fcdv-a23uy6",
+      "createdAt": "2026-10-08T06:21:50.325Z",
+      "updatedAt": "2026-10-08T06:21:50.325Z",
+      "kind": "invariant",
+      "summary": "点击小窗按钮时必须在调用 floatBarToggle 之前上报当前会话绑定，绑定失败要静默且不能阻断小窗显隐。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "tags": [
+        "floatbar",
+        "onFloatBarBtnClick",
+        "floatBarToggle"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5fcdv-kln42v",
+      "createdAt": "2026-10-08T06:21:50.325Z",
+      "updatedAt": "2026-10-08T06:21:50.325Z",
+      "kind": "invariant",
+      "summary": "无活动会话（欢迎页）时点小窗按钮应跳过绑定且不弹提示，避免空 tabId 触发换会话。",
+      "paths": [
+        "renderer/app.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "floatbar",
+        "welcome",
+        "tabId"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5fcdv-ty1j7t",
+      "createdAt": "2026-10-08T06:21:50.324Z",
+      "updatedAt": "2026-10-08T06:21:50.324Z",
+      "kind": "invariant",
+      "summary": "小窗绑定应只有两条合法入口：发消息链路和点击小窗按钮，二者都以 active=true 上报当前会话，避免其他行为误换小窗会话。",
+      "paths": [
+        "renderer/app.js",
+        "electron/preload.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "floatbar",
+        "binding",
+        "entrypoint"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz5f1bx-onkd2d",
+      "createdAt": "2026-10-08T06:21:35.997Z",
+      "updatedAt": "2026-10-08T06:21:35.997Z",
+      "kind": "pin",
+      "summary": "小窗绑定上报有两条合法入口，取代旧的「只有主窗发消息才抢绑定」：① 主窗发消息（app.js:3304，tab.id/tab.title/active=true）；② 用户点主窗「小窗」按钮（app.js onFloatBarBtnClick:5824 内、调 floatBarToggle 之前用 activeSession() 的 id/title 上报 active=true，try/catch 包住、失败不阻断显隐，无会话时跳过）。仍禁止焦点跟随/窗口焦点检测；切标签和启动仍只更新会话清单不抢绑定。",
+      "paths": [
+        "renderer/app.js",
+        "electron/main.js",
+        "electron/preload.js"
+      ],
+      "tags": [
+        "小窗",
+        "绑定",
+        "floatBind",
+        "floatbar"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-qdigo5",
+      "createdAt": "2026-10-08T06:06:39.686Z",
+      "updatedAt": "2026-10-08T06:06:39.686Z",
+      "kind": "invariant",
+      "summary": "紧凑高度 182 下必须让 2 条消息和输入区都可见可点，因此 #top.compact ~ #msgs 要保持 flex:1 1 auto、min-height:0、overflow:hidden 等布局约束。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "紧凑态",
+        "布局",
+        "输入区"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-bm9qqo",
+      "createdAt": "2026-10-08T06:06:39.686Z",
+      "updatedAt": "2026-10-08T06:06:39.686Z",
+      "kind": "decision",
+      "summary": "滚动到底抽成具名 scrollMsgsToBottom() 供 paint 与 repaint 复用，避免再建第二个重绘或滚动函数。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "scrollMsgsToBottom",
+        "paint",
+        "repaint"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-hzk2vd",
+      "createdAt": "2026-10-08T06:06:39.686Z",
+      "updatedAt": "2026-10-08T06:06:39.686Z",
+      "kind": "decision",
+      "summary": "窗口关闭时 repaint 通知要 try/catch 静默失败，避免对已销毁 webContents 调用抛错。",
+      "paths": [
+        "electron/lib/float-bar.js"
+      ],
+      "tags": [
+        "重绘",
+        "销毁"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-0qs86k",
+      "createdAt": "2026-10-08T06:06:39.686Z",
+      "updatedAt": "2026-10-08T06:06:39.686Z",
+      "kind": "invariant",
+      "summary": "改小窗相关功能时不得改变 savedBottomY/savedHeight 语义与落盘换算、COMPACT_HEIGHT=182、resizeBy、setWinResizable=false 等既有窗口状态约定。",
+      "paths": [
+        "electron/lib/float-bar.js",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "窗口状态",
+        "兼容"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-xbz85s",
+      "createdAt": "2026-10-08T06:06:39.686Z",
+      "updatedAt": "2026-10-08T06:06:39.686Z",
+      "kind": "invariant",
+      "summary": "扭柄 #grip、#btn-mini 不跳位、#ask/#askOpts/#askText、开始按钮区位置和插话链路是既有交互约束，非专门需求不要顺手改。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "交互",
+        "兼容"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-5bg37o",
+      "createdAt": "2026-10-08T06:06:39.685Z",
+      "updatedAt": "2026-10-08T06:06:39.685Z",
+      "kind": "decision",
+      "summary": "repaint 分支应复用已有 forceRepaint() 并滚到底，不要新建第二个重绘函数。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "forceRepaint",
+        "重绘"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-bj0qs7",
+      "createdAt": "2026-10-08T06:06:39.685Z",
+      "updatedAt": "2026-10-08T06:06:39.685Z",
+      "kind": "decision",
+      "summary": "紧凑态消息统一由 applyCompactMsgs() 处理：只显示最后 2 条，其余加 .msg-hide-compact，退出时全部移除，paint 也走同一处。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "applyCompactMsgs",
+        "紧凑态",
+        "消息"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-d906on",
+      "createdAt": "2026-10-08T06:06:39.685Z",
+      "updatedAt": "2026-10-08T06:06:39.685Z",
+      "kind": "invariant",
+      "summary": "紧凑态不能裁切丢消息，必须用 .msg-hide-compact{display:none} 隐藏，退出后消息要能恢复。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "msg-hide-compact",
+        "消息隐藏"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-axwjlc",
+      "createdAt": "2026-10-08T06:06:39.684Z",
+      "updatedAt": "2026-10-08T06:06:39.684Z",
+      "kind": "decision",
+      "summary": "bounds 变化后的重绘统一走 repaintAfterBounds()：webContents.invalidate() 整窗失效并通过既有 floatbar:event 推 {kind:'repaint'}，不要另起通道。",
+      "paths": [
+        "electron/lib/float-bar.js"
+      ],
+      "tags": [
+        "repaintAfterBounds",
+        "floatbar:event"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-5c1hkd",
+      "createdAt": "2026-10-08T06:06:39.684Z",
+      "updatedAt": "2026-10-08T06:06:39.684Z",
+      "kind": "invariant",
+      "summary": "进入和退出紧凑态两处 setBounds 后都要调用重绘，不能只处理进入紧凑态，否则展开后会保留矮态残影。",
+      "paths": [
+        "electron/lib/float-bar.js"
+      ],
+      "tags": [
+        "setBounds",
+        "紧凑态",
+        "重绘"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-umqa8b",
+      "createdAt": "2026-10-08T06:06:39.684Z",
+      "updatedAt": "2026-10-08T06:06:39.684Z",
+      "kind": "invariant",
+      "summary": "repaint 是全局口令，dispatch 中该分支必须放在 sessionKey 过滤之前，否则不带会话键的重绘通知会被丢弃。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "repaint",
+        "sessionKey",
+        "dispatch"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4vtqa-6cngb7",
+      "createdAt": "2026-10-08T06:06:39.683Z",
+      "updatedAt": "2026-10-08T06:06:39.683Z",
+      "kind": "invariant",
+      "summary": "小窗进/出紧凑态会改变窗口 bounds，必须在 setBounds 后触发整窗重绘，否则会残留叠字或残影。",
+      "paths": [
+        "electron/lib/float-bar.js"
+      ],
+      "tags": [
+        "紧凑态",
+        "重绘",
+        "bounds"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4v6t9-fo8hvc",
+      "createdAt": "2026-10-08T06:06:09.981Z",
+      "updatedAt": "2026-10-08T06:06:09.981Z",
+      "kind": "pin",
+      "summary": "小窗进出紧凑态（setCompact 两处 setBounds 后）必须调用共用函数 repaintAfterBounds()（webContents.invalidate + 通过 floatbar:event 推 {kind:'repaint'}），渲染层在 dispatch 的 sessionKey 过滤之前认领 repaint 并调 forceRepaint() + 滚到底；紧凑态只显示最近 2 条消息改用 .msg-hide-compact 显隐（不再靠固定高度裁切），#top.compact ~ #msgs 补 flex:1 1 auto + min-height:0 + overflow:hidden 保输入区不被挤出。原因：透明无边框窗改尺寸后不重绘会叠字残影 + 消息被裁。",
+      "paths": [
+        "electron/lib/float-bar.js",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "float-bar",
+        "紧凑态",
+        "重绘",
+        "残影"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4q7xs-t5x0ge",
+      "createdAt": "2026-10-08T06:02:18.163Z",
+      "updatedAt": "2026-10-08T06:02:18.163Z",
+      "kind": "decision",
+      "summary": "涉及已废弃口径的长期记忆条目必须原位替换或合并，不得新旧并存，否则每轮都会把互相矛盾的内容注入上下文。",
+      "paths": [],
+      "tags": [
+        "记忆维护",
+        "流程"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4q7xr-fkkiqn",
+      "createdAt": "2026-10-08T06:02:18.162Z",
+      "updatedAt": "2026-10-08T06:02:18.162Z",
+      "kind": "invariant",
+      "summary": "float-bar.html 的 appendStartButton 中 btn.title 必须直接复用按钮正面文案 text，不得硬拼「开始当前会话的新一轮：」等前缀，保证悬停全文与正面同源。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "开工选项",
+        "tooltip",
+        "浮窗"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4q7xs-jy946d",
+      "createdAt": "2026-10-08T06:02:18.162Z",
+      "updatedAt": "2026-10-08T06:02:18.162Z",
+      "kind": "decision",
+      "summary": "#askOpts 统一走 flex:0 0 auto，旧的「flex:0 1 auto + min-height:0」口径已废弃且与新口径矛盾，不得再按旧版本修改或注入。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "布局",
+        "askOpts",
+        "浮窗"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4q7xr-vph3np",
+      "createdAt": "2026-10-08T06:02:18.161Z",
+      "updatedAt": "2026-10-08T06:02:18.161Z",
+      "kind": "decision",
+      "summary": "主窗开工按钮文案按常量硬截断到约 120 字，小窗开工按钮不截断、只折行，两端展示策略刻意不同，别当成 bug 去对齐。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "开工选项",
+        "浮窗",
+        "截断"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4q7xr-8mupkv",
+      "createdAt": "2026-10-08T06:02:18.160Z",
+      "updatedAt": "2026-10-08T06:02:18.160Z",
+      "kind": "decision",
+      "summary": "开工选项按钮文案长度上限统一由 renderer/app.js 的 MAX_START_OPTION_LABEL（120 字）控制，旧的 START_OPTION_SUMMARY_MAX / 字面量 48 已废弃，改长度只能改这一处常量。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "tags": [
+        "开工选项",
+        "常量",
+        "文案截断"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4pkfe-geu0py",
+      "createdAt": "2026-10-08T06:01:47.690Z",
+      "updatedAt": "2026-10-08T06:01:47.690Z",
+      "kind": "pin",
+      "summary": "小窗提问/危险确认卡片防按钮消失的固定口径：#ask 必须 overflow:hidden 且 flex:0 1 auto；#askOpts 必须 flex:0 0 auto 并保留 max-height:30vh + overflow-y:auto（禁止回到 flex:0 1 auto + min-height:0，那正是选项按钮被压成 0 高、只看得见标题的原因）；卡片露脸时 #msgs 钉成 flex:0 0 auto + min/max-height:24px；#askText 保 flex:1 1 auto + min-height:0 + 自己滚动；保留 #bar:has(#ask:not(.hidden)) 让 #startArea 收起。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "小窗",
+        "浮条",
+        "卡片",
+        "CSS"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4pjan-pi0nyd",
+      "createdAt": "2026-10-08T06:01:46.223Z",
+      "updatedAt": "2026-10-08T06:01:46.223Z",
+      "kind": "pin",
+      "summary": "开工选项的给法（老大定）：按钮文字必须写成「一句比喻 ＋ 具体要做的事」，禁止直接甩代码标识符/文件名/拼音；正文复述不用比喻，只有收尾总结用比喻。选项文案由大脑复述的原文决定。主窗截断上限已由 48 字放宽到常量 MAX_START_OPTION_LABEL = 120（app.js 顶部常量区），超过才补省略号、全文进 title；小窗按钮不截断只折行，title 复用同一份文案（float-bar.html appendStartButton）。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "开工选项",
+        "文案",
+        "UI"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4flyb-89qfr8",
+      "createdAt": "2026-10-08T05:54:03.113Z",
+      "updatedAt": "2026-10-08T05:54:03.113Z",
+      "kind": "decision",
+      "summary": "#askOpts 不得再回到 flex:0 1 auto + min-height:0，因为那正是按钮消失的原因；新口径是 flex:0 0 auto 并保留 max-height:30vh + overflow-y:auto。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "#askOpts",
+        "旧约定推翻"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4flyb-2l23m2",
+      "createdAt": "2026-10-08T05:54:03.113Z",
+      "updatedAt": "2026-10-08T05:54:03.113Z",
+      "kind": "decision",
+      "summary": "float-bar.html 已统一使用主题样式变量和全局 box-sizing: border-box，后续尺寸调整按 border-box 计算。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "box-sizing",
+        "主题变量"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz4flyb-b3k5fy",
+      "createdAt": "2026-10-08T05:54:03.112Z",
+      "updatedAt": "2026-10-08T05:54:03.112Z",
+      "kind": "decision",
+      "summary": "为避免小窗确认卡片按钮被压成 0 高，卡片出现时 #msgs 固定 24px 不压缩、#askOpts 用 flex:0 0 auto 自身滚动、#askText 用 flex:1 1 auto 承担长文本滚动。",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "布局",
+        "flex",
+        "确认卡片"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz3q78x-quk97r",
+      "createdAt": "2026-10-08T05:34:17.649Z",
+      "updatedAt": "2026-10-08T05:34:17.649Z",
+      "kind": "pin",
+      "summary": "小窗「唤出」按钮链路固定为五处一致：renderer/index.html 的 #btn-floatbar（排在 AGI 之后、紧邻 .left 那排）、i18n 键 floatBarToggle/floatBarToggleTitle、preload.js 主窗 api 的 floatBarToggle()/floatBarVisible()/onFloatBarVisibility(cb)、main.js registerFloatBarIpc 内的 floatbar:toggle 与 floatbar:visible handler + 模块级 broadcastFloatBarVisibility(visible)（靠 floatBarOwnsWindow 跳过小窗自身，主窗收 floatbar:visibility）、app.js 的 applyFloatBarVisible 同",
+      "paths": [
+        "renderer/index.html",
+        "renderer/i18n.js",
+        "renderer/app.js",
+        "renderer/styles.css",
+        "electron/preload.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "小窗",
+        "浮动条",
+        "IPC",
+        "按钮"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz3ky9e-p4m7tz",
+      "createdAt": "2026-10-08T05:30:12.722Z",
+      "updatedAt": "2026-10-08T05:30:12.722Z",
+      "kind": "pin",
+      "summary": "小窗紧凑态改为「钉住底边、只压顶棚」：setCompact 进紧凑先记 savedBottomY=b.y+b.height 与 savedHeight=b.height，再用 y=savedBottomY-COMPACT_HEIGHT、height=182 调 setBounds（x/width 不动）；退出以当前底边 b.y+b.height 为基准升回 restore 高度；saveBoundsNow 与 moveToPlace 在紧凑态落盘的 y 必须写「底边 - 正常高度」，否则重启后小窗位置整体上漂。已推翻旧的「只改高度、y 不动」口径。 [electron/lib/float-bar.js]",
+      "paths": [
+        "electron/lib/float-bar.js"
+      ],
+      "tags": [
+        "小窗",
+        "紧凑态",
+        "钉住底边"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz3d1he-j0f2pz",
+      "createdAt": "2026-10-08T05:24:03.650Z",
+      "updatedAt": "2026-10-08T05:24:03.650Z",
+      "kind": "pin",
+      "summary": "AGI 挪小窗工具链路的固定接口：float-bar.js 导出 moveToPlace(place)（只改 x/y、宽高不动、挪完落盘，place 取 tl/tr/bl/br/left/right/opposite，非法值返回 bad-place 且不移动）；main.js 在 createFloatBar 之后调 agent.setFloatBarHooks({move, rects})；agent.js 里 float_bar_move 必须留在 DESKTOP_TOOLS（AGI 关着不给）、并把小窗坐标行附在 screen_read/screen_look 结果末尾；改任一端都要保持这三处接口一致 [electron/lib/float-bar.js, electron/main.js, electron/lib/agent.js]",
+      "paths": [
+        "electron/lib/float-bar.js",
+        "electron/main.js",
+        "electron/lib/agent.js"
+      ],
+      "tags": [
+        "AGI",
+        "浮动条",
+        "工具"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz31h7f-z66pxj",
+      "createdAt": "2026-10-08T05:15:04.155Z",
+      "updatedAt": "2026-10-08T05:15:04.155Z",
+      "kind": "pin",
+      "summary": "重启/关闭开发版必须按精确 PID（写入 pid 文件后只杀那一个），禁止用 Get-CimInstance 按进程名或命令行匹配批量 kill electron.exe——SpCode 自己也是 electron.exe，会把自己杀掉导致整体崩溃",
+      "paths": [
+        "scripts/launch.js",
+        "electron/main.js"
+      ],
+      "tags": [
+        "electron",
+        "崩溃",
+        "进程",
+        "重启"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz1vdvh-i54yjq",
+      "createdAt": "2026-10-08T04:42:20.285Z",
+      "updatedAt": "2026-10-08T04:42:20.285Z",
+      "kind": "pin",
+      "summary": "开始区 #startArea 已从顶栏移到消息区下方、输入区上方（#bar 内与 #top 同级、#msgs 之后 #bottom 之前），紧凑态靠通用兄弟选择器 #top.compact ~ #startArea 隐藏；挪回顶栏或改成子级选择器都会让顶栏被长按钮撑爆或紧凑态露出按钮区 [electron/lib/float-bar.html]",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "悬浮小窗",
+        "开始区",
+        "紧凑态"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz1nqag-rq9j4x",
+      "createdAt": "2026-10-08T04:36:23.128Z",
+      "updatedAt": "2026-10-08T04:36:23.128Z",
+      "kind": "pin",
+      "summary": "小窗危险确认卡片的长问句必须滚动显示、选项按钮始终固定可见可点，否则文本超长会把确认按钮挤出 280 高的窗口导致无法确认",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "tags": [
+        "float-bar",
+        "危险确认",
+        "滚动"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-muz1lceo-7dy8xv",
+      "createdAt": "2026-10-08T04:34:31.824Z",
+      "updatedAt": "2026-10-08T04:34:31.824Z",
+      "kind": "pin",
+      "summary": "小窗绑定改为「主窗开工主动塞」：只有 renderer 发消息时上报 active=true 才抢绑定并推送 canStart，切标签只更新会话清单；已删除焦点跟随（isFloatFollowHeld/followFocusToFloatBar/lastFocusedWin/manualBindAt），registerFloatBarIpc 提前到 createWindow 之前，别再加回焦点检测。",
+      "paths": [
+        "electron/main.js",
+        "electron/preload.js",
+        "renderer/app.js"
+      ],
+      "tags": [
+        "floatbar",
+        "绑定",
+        "小窗"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    },
+    {
+      "id": "mem-munj2xec-u3c50o",
+      "createdAt": "2026-09-30T03:10:51.540Z",
+      "updatedAt": "2026-09-30T03:10:51.540Z",
+      "kind": "pin",
+      "summary": "发布安装包统一走 scripts\\publish-release.cmd（内部用 git 凭据调 GitHub API，token 不落盘）；沙盒命令 60 秒超时，上传 400MB 级安装包必须用 WMI/计划任务脱离沙盒进程树，否则会被中途掐断",
+      "paths": [
+        "scripts/publish-release.ps1",
+        "scripts/publish-release.cmd",
+        "scripts/release-notes.md"
+      ],
+      "tags": [
+        "发布",
+        "打包",
+        "github",
+        "release"
+      ],
+      "source": "user",
+      "pinned": true,
+      "superseded": false
+    }
+  ]
+}

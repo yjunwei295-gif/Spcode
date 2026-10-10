@@ -1,5 +1,5 @@
 const {
-  app, BrowserWindow, ipcMain, dialog, nativeTheme, clipboard, shell, crashReporter, session
+  app, BrowserWindow, ipcMain, dialog, nativeTheme, clipboard, shell, crashReporter, session, globalShortcut
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -28,6 +28,7 @@ const codeIndex = require('./lib/code-index');
 const codeEmbed = require('./lib/code-embed');
 const desktopHand = require('./lib/desktop-hand');
 const contextPreview = require('./lib/context-preview');
+const { createFloatBar } = require('./lib/float-bar');
 const { parseAttachment, isDocumentExt } = require('./lib/media');
 // 文件树、@ 搜索、预览都走这里。漏导入时列目录会抛错，侧栏被收成空目录
 const {
@@ -43,6 +44,36 @@ let APP_ROOT = path.join(__dirname, '..');
 /** 代码/资源根（asar 内只读即可：图标、renderer） */
 const CODE_ROOT = path.join(__dirname, '..');
 const windows = new Set();
+/** 常驻置顶悬浮对话栏（主进程持有，退出流程里 destroy） */
+let floatBar = null;
+/** 已建出来的小窗实例，广播时逐个推，单实例时也走这里 */
+const floatBars = [];
+/** 主窗身份编号：窗口 ↔ 编号双向表，会话键靠它找到该发给哪个窗口 */
+let winSeq = 0;
+const winIdByWin = new Map();
+const winById = new Map();
+/** 本进程占用的悬浮栏槽位号（多开进程时各占一个，免得小窗叠在一起） */
+let mySlot = 1;
+/** 全局快捷键是否注册成功：失败时小窗不给隐藏入口 */
+let shortcutOk = false;
+/** turnId -> { win, tabId }：这一轮属于哪个窗口的哪个标签页 */
+const turnOwner = new Map();
+/** winId -> Set<turnId>：哪些窗口还有轮次在跑（原全局 runningTurns 的按窗口版本） */
+const runningByWin = new Map();
+/** sessionKey -> 显示名，小窗的会话清单用 */
+const sessionsByKey = new Map();
+/** sessionKey -> { canStart, options }：能不能新起一轮，以及开始按钮可选的方案清单 */
+const canStartByKey = new Map();
+/** 小窗当前绑定的会话键 */
+let boundKey = '';
+/** 最近一次被主窗激活的会话键：小窗发空键时用它兜底 */
+let lastActiveKey = '';
+/** 窗口 -> 最近上报的标签页编号，can-start 不带 key 时靠它补出会话键 */
+const lastTabIdByWin = new Map();
+/** 小窗「开始」回调（由 registerFloatBarIpc 里的 startFromFloatBar 赋值） */
+let floatBarStartHandler = null;
+/** 小窗「绑定」回调（由 registerFloatBarIpc 里的 bindFromFloatBar 赋值） */
+let floatBarBindHandler = null;
 const workspaceByWin = new WeakMap();
 /** win -> Map(turnId, AbortController) */
 const abortByWin = new WeakMap();
@@ -103,13 +134,265 @@ function sendTo(win, channel, data) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, data);
 }
 
+/** 会话键：窗口编号 + 标签页编号。拿不到窗口编号时给空串，小窗侧会丢弃这条 */
+function makeSessionKey(win, tabId) {
+  const wid = winIdByWin.get(win);
+  if (!wid) return '';
+  return wid + ':' + (tabId || '');
+}
+
+/** 一轮对应的会话键 */
+function sessionKeyOfTurn(turnId) {
+  const o = turnOwner.get(turnId);
+  if (!o) return '';
+  return makeSessionKey(o.win, o.tabId);
+}
+
+/**
+ * 这一轮该记在哪个标签页上：先用渲染层报上来的 tabId，没报就回落到这个窗口上次上报的标签页。
+ * 渲染层 sendOne 的载荷里没有 tabId，这里若直接取空串，事件键会算成「窗口N:」，
+ * 跟小窗那边由 floatbar:bind-from-window 上报得到的「窗口N:真实tabId」永远不相等，
+ * 小窗会一条事件都收不到、插话也进不了正在跑的那一轮，所以必须有这次兜底。
+ */
+function resolveTurnTabId(win, payload) {
+  const raw = String((payload && payload.tabId) || '');
+  if (raw) return raw;
+  const last = win ? lastTabIdByWin.get(win) : '';
+  return String(last || '');
+}
+
+/** 会话键长这样「3:tab-1」，用它前半段解析窗口编号，绝不猜「第一个窗口」 */
+function looksLikeSessionKey(s) {
+  return /^\d+:/.test(String(s == null ? '' : s));
+}
+
+/** 从会话键定位主窗；窗口已关或键非法都返回 null */
+function winFromKey(key) {
+  const raw = String(key == null ? '' : key);
+  if (!looksLikeSessionKey(raw)) return null;
+  const wid = Number(raw.split(':')[0]);
+  if (!Number.isFinite(wid) || wid <= 0) return null;
+  const win = winById.get(wid);
+  if (!win || win.isDestroyed()) return null;
+  return win;
+}
+
+/** 按 winId 记/删一轮的存活状态 */
+function setTurnRunning(win, turnId, on) {
+  const wid = winIdByWin.get(win);
+  if (!wid) return;
+  let s = runningByWin.get(wid);
+  if (!s) {
+    s = new Set();
+    runningByWin.set(wid, s);
+  }
+  const id = turnId || '';
+  if (on) s.add(id);
+  else s.delete(id);
+  if (!s.size) runningByWin.delete(wid);
+}
+
+/** 这个窗口还有没有轮次在跑（有就按插话处理，不新起一轮） */
+function turnIsRunning(win) {
+  const wid = winIdByWin.get(win);
+  if (!wid) return false;
+  const s = runningByWin.get(wid);
+  return !!(s && s.size > 0);
+}
+
+/** 向所有小窗实例推同一条事件；小窗自己按 sessionKey 过滤 */
+function broadcastToFloatBars(payload) {
+  if (!payload) return;
+  for (const bar of floatBars) {
+    if (bar && typeof bar.pushEvent === 'function') bar.pushEvent(payload);
+  }
+}
+
+/** 危险确认卡片和普通事件分开走，这里对每个小窗实例推一次 */
+function broadcastAskToFloatBars(payload) {
+  if (!payload) return;
+  for (const bar of floatBars) {
+    if (bar && typeof bar.pushAsk === 'function') bar.pushAsk(payload);
+  }
+}
+
+/** 小窗回传参数的兼容写法：既支持 (key, value)，也支持 ({ key, value, turnId, tabId }) */
+function parseFloatBarCallback(a, b) {
+  if (a && typeof a === 'object' && !Array.isArray(a)) {
+    const value = a.value !== undefined ? a.value : (a.answer !== undefined ? a.answer : a.text);
+    return {
+      key: String(a.key || ''),
+      value,
+      turnId: String(a.turnId || ''),
+      tabId: String(a.tabId || '')
+    };
+  }
+  const first = String(a == null ? '' : a);
+  // 只传一个字符串时：像会话键就当键，否则当值（旧调用形态兜底）
+  if (b === undefined) {
+    return { key: looksLikeSessionKey(first) ? first : '', value: first, turnId: '', tabId: '' };
+  }
+  return { key: first, value: b, turnId: '', tabId: '' };
+}
+
+/** canStart 或绑定变化时，把各小窗自己的 start-ready 回推一次 */
+function pushStartReady(keyHint) {
+  const key = String(keyHint || boundKey || '');
+  const state = canStartByKey.get(key);
+  // 兼容旧形态：这里历史上存过纯布尔值，读的时候两种都要认
+  const canStart = state === true || !!(state && state.canStart === true);
+  // options 一律给数组，缺省空数组，小窗自己决定要不要多摆几颗方案按钮
+  const options = state && Array.isArray(state.options) ? state.options : [];
+  broadcastToFloatBars({ kind: 'start-ready', sessionKey: key, canStart, options });
+}
+
+/** 小窗会话清单：窗口编号 + 渲染层报上来的标题 */
+function sessionsPayload() {
+  const list = [];
+  for (const [key, label] of sessionsByKey) list.push({ key, label });
+  return list;
+}
+
+function broadcastSessions() {
+  broadcastToFloatBars({ kind: 'sessions', sessions: sessionsPayload() });
+}
+
+// 一轮里的状态、当前步骤、危险确认顺手转给常驻悬浮栏，原来的下发逻辑不动
+// 每条推送都带 turnId + sessionKey，小窗按会话键认领，不会串到别的窗口的对话
+function forwardTurnEventToFloatBar(ev, turnId) {
+  if (!ev || !floatBars.length) return;
+  const tid = turnId || '';
+  const sessionKey = tid ? sessionKeyOfTurn(tid) : '';
+  const base = { turnId: tid, sessionKey };
+  if (ev.type === 'rewrite_text') {
+    // AI 的正文（最终回答的那种），非空字符串才推给悬浮栏，字段名沿用事件里的 text
+    if (typeof ev.text === 'string' && ev.text) {
+      broadcastToFloatBars({ ...base, kind: 'ai', text: ev.text });
+    }
+    return;
+  }
+  if (ev.type === 'text') {
+    // AI 的流式增量正文，同样只推非空字符串，字段名沿用事件里的 text
+    if (typeof ev.text === 'string' && ev.text) {
+      broadcastToFloatBars({ ...base, kind: 'ai-delta', text: ev.text });
+    }
+    return;
+  }
+  if (ev.type === 'status') {
+    broadcastToFloatBars({ ...base, kind: 'status', text: String(ev.text || '') });
+    return;
+  }
+  if (ev.type === 'tool') {
+    const step = String(ev.text || ev.detail || ev.name || '');
+    if (step) broadcastToFloatBars({ ...base, kind: 'tool', text: step });
+    return;
+  }
+  if (ev.type === 'ask') {
+    // 危险确认同样要带轮次和会话键，不然小窗不知道这条答复该送回哪一轮
+    broadcastAskToFloatBars({
+      ...base,
+      kind: 'ask',
+      question: String(ev.question || ''),
+      options: Array.isArray(ev.options) ? ev.options : []
+    });
+    return;
+  }
+  if (ev.type === 'error') {
+    broadcastToFloatBars({ ...base, kind: 'error', text: String(ev.message || ev.text || '') });
+  }
+}
+
+// 悬浮栏发送入口：按小窗带来的会话键定位窗口；空闲时交给那个窗口的发送流程，跑着就插话
+function handleFloatBarSend(payload) {
+  const incoming = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+  const key = String(incoming.key || '');
+  const raw = payload && typeof payload === 'object' && !Array.isArray(payload) ? incoming.text : payload;
+  const msg = String(raw == null ? '' : raw).trim();
+  // 小窗发来的图片附件：只认真实存在的本地路径，键名统一成 { path, name }，最多留 6 张
+  var list = Array.isArray(incoming.attachments) ? incoming.attachments : [];
+  const attList = list
+    .filter((item) => item && typeof item.path === 'string' && fs.existsSync(item.path))
+    .map((item) => ({ path: item.path, name: String(item.name || path.basename(item.path) || '') }))
+    .slice(0, 6);
+  // 纯图消息也算消息：只有「既没字也没图」才什么都不做
+  if (!msg && attList.length === 0) return;
+  if (!key) {
+    // 没有会话键就不知道发给谁，宁可提示也不塞进别人的对话
+    broadcastToFloatBars({ kind: 'error', text: '小窗还没绑定对话，先在主窗里打开一个对话' });
+    return;
+  }
+  const target = winFromKey(key);
+  if (!target) {
+    broadcastToFloatBars({ kind: 'error', sessionKey: key, text: '对应的主界面已关闭，这条没发出去' });
+    return;
+  }
+  // 主窗正在跑一轮时，带图的消息不插队（插话只能带文本、图会丢）：
+  // 不广播成正式消息，只提示一句，并把文本与附件原样退回，让小窗自己留着重建
+  if (attList.length > 0 && turnIsRunning(target)) {
+    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '带图片的消息等这一轮结束再发' });
+    broadcastToFloatBars({ kind: 'attachments-back', sessionKey: key, attachments: attList, text: msg });
+    return;
+  }
+  // 小窗要显示带了几张图，所以广播文案里带上张数；images 只是占位，小窗不渲染图片本身
+  const userText = attList.length > 0 ? msg + `（附 ${attList.length} 张图）` : msg;
+  broadcastToFloatBars({ kind: 'user', sessionKey: key, text: userText, images: attList.map((a) => a.path) });
+  if (turnIsRunning(target)) {
+    let pushed = false;
+    try {
+      pushed = agent.pushInterjection(key, msg) === true;
+    } catch (e) {
+      diag.log('floatbar', '插话失败', { message: e && e.message });
+    }
+    if (pushed) {
+      broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '已插话，下一轮就能读到' });
+      return;
+    }
+    // AGI 没开：插话不成立，这条改成排队——本轮跑完再发。
+    // 只提示一句，然后借主窗现有的 send() 走它自己的排队流程，不另起队列
+    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: 'AGI 没开，这条先排队，这一轮跑完就发' });
+    sendTo(target, 'chat:float-user-message', { text: msg, attachments: attList });
+    return;
+  }
+  // 会话历史由渲染层维护，所以这条提示转发给那个主窗，复用现有的发送流程，不另起一套
+  sendTo(target, 'chat:float-user-message', { text: msg, attachments: attList });
+}
+
+// 小窗的答复：key 定位窗口，把答复送进那个窗口里对应的一轮
+function handleFloatBarAnswer(a, b, c) {
+  const p = parseFloatBarCallback(a, b);
+  if (!p.turnId && c) p.turnId = String(c);
+  const target = winFromKey(p.key);
+  if (!target) {
+    broadcastToFloatBars({ kind: 'error', sessionKey: p.key, text: '这条答复没找到对应的主界面，已丢弃' });
+    return;
+  }
+  handleChatAnswer(target, { answer: p.value, turnId: p.turnId, tabId: p.tabId });
+}
+
+// 小窗的停止：同样只停它绑定的那个窗口，不再猜第一个窗口
+function handleFloatBarAbort(a, b, c) {
+  const p = parseFloatBarCallback(a, b);
+  if (!p.turnId && c) p.turnId = String(c);
+  const target = winFromKey(p.key);
+  if (!target) {
+    broadcastToFloatBars({ kind: 'error', sessionKey: p.key, text: '停止没找到对应的主界面，已忽略' });
+    return;
+  }
+  // 带轮次就只停那一轮，不带就停这个窗口当前在等的所有轮次
+  handleChatAbort(target, p.turnId);
+}
+
 function createWindow() {
+  // 每个主窗一个身份编号，会话键和轮次归属都靠它分辨，窗口标题也用它
+  winSeq += 1;
+  const winId = winSeq;
   const win = new BrowserWindow({
     width: 1280,
     height: 840,
     minWidth: 900,
     minHeight: 600,
     frame: false,
+    title: `窗口${winId}`,
     icon: path.join(CODE_ROOT, 'icons.png'),
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#141414' : '#f3f3f3',
     webPreferences: {
@@ -119,12 +402,30 @@ function createWindow() {
       sandbox: false
     }
   });
+  winIdByWin.set(win, winId);
+  winById.set(winId, win);
   windows.add(win);
   workspaceByWin.set(win, '');
   win.on('closed', () => {
     diag.log('window', '窗口已关闭');
     stopWorkspaceWatch(win);
     windows.delete(win);
+    // 这个窗口的身份和会话一起撤掉，免得小窗还挂着一个已经没了的会话
+    winIdByWin.delete(win);
+    winById.delete(winId);
+    runningByWin.delete(winId);
+    lastTabIdByWin.delete(win);
+    const prefix = winId + ':';
+    for (const k of [...sessionsByKey.keys()]) {
+      if (k.startsWith(prefix)) sessionsByKey.delete(k);
+    }
+    for (const k of [...canStartByKey.keys()]) {
+      if (k.startsWith(prefix)) canStartByKey.delete(k);
+    }
+    if (boundKey.startsWith(prefix)) boundKey = '';
+    broadcastSessions();
+    // 主窗全关了就顺手收掉悬浮栏窗口，否则常驻小窗会让 window-all-closed 永远不触发、进程白白挂着
+    if (windows.size === 0 && floatBar) floatBar.destroy();
   });
   win.on('unresponsive', () => diag.log('window', '窗口无响应'));
   win.on('responsive', () => diag.log('window', '窗口恢复响应'));
@@ -272,12 +573,310 @@ app.on('before-quit', () => {
   downloader.cancelAll();
   try { visionEngine.stop(); } catch { /* 退出时忽略 */ }
 });
-app.on('will-quit', () => diag.log('app', '即将退出 will-quit'));
+app.on('will-quit', () => {
+  try { globalShortcut.unregisterAll(); } catch { /* 退出时忽略 */ }
+  if (floatBar) floatBar.destroy();
+  releaseFloatBarSlot();
+  diag.log('app', '即将退出 will-quit');
+});
 app.on('quit', (_e, code) => diag.log('app', '已退出 quit', { code }));
 
 ipcMain.on('log:client', (_e, payload) => {
   diag.log('renderer', (payload && payload.message) || '界面异常', payload && payload.detail);
 });
+
+// ── 悬浮栏槽位：多开进程时每个进程占一个，免得两个小窗叠在同一处互相打架 ──
+function floatBarSlotDir() {
+  return path.join(app.getPath('userData'), 'floatbar-slots');
+}
+
+/** pid 还活着吗；EPERM 说明进程在只是不归自己管，也算活着 */
+function pidAlive(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return !!(e && e.code === 'EPERM');
+  }
+}
+
+/** 依次试 slot-1 .. slot-9，全被占也退回 1 号继续跑，不崩 */
+function claimFloatBarSlot() {
+  const dir = floatBarSlotDir();
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (e) {
+    diag.log('floatbar', '创建槽位目录失败', { message: e && e.message });
+  }
+  for (let n = 1; n <= 9; n += 1) {
+    const file = path.join(dir, `slot-${n}.pid`);
+    let holder = 0;
+    try {
+      holder = Number(String(fs.readFileSync(file, 'utf8')).trim());
+    } catch { holder = 0; }
+    if (holder && holder !== process.pid && pidAlive(holder)) continue;
+    try {
+      fs.writeFileSync(file, String(process.pid), 'utf8');
+      return n;
+    } catch (e) {
+      diag.log('floatbar', `占用槽位 slot-${n} 失败`, { message: e && e.message });
+    }
+  }
+  diag.log('floatbar', '没有空闲的悬浮栏槽位，退回 slot-1', { pid: process.pid });
+  return 1;
+}
+
+/** 退出时把自己的 slot 文件删掉，只删还写着自己 pid 的那个 */
+function releaseFloatBarSlot() {
+  if (!mySlot) return;
+  try {
+    const file = path.join(floatBarSlotDir(), `slot-${mySlot}.pid`);
+    const holder = Number(String(fs.readFileSync(file, 'utf8')).trim());
+    if (holder === process.pid) fs.unlinkSync(file);
+  } catch { /* 文件不在或读不了就算了，退出时不折腾 */ }
+}
+
+// 小窗新增的四个通道都在这里绑一次：语义都是新增，原有通道一个没动
+function registerFloatBarIpc() {
+  // 小窗点「开始」：由 lib/float-bar.js 的 onStart 回调触发。
+  // 注意：小窗内部已经自己监听 floatbar:start / floatbar:bind 两个通道，这里绝不能再绑一次，
+  // 否则同一次点击会被处理两遍。原先的 ipcMain.handle/on 注册已按此删除。
+  // key 定位哪个会话，value 是用户点的那颗方案字母（单颗「开始」是空串 = 点默认那颗；
+  // 多选「一起开工」是勾中的 value 字符串数组）；
+  // 第三位 note 是用户在开工选项下面填的补充说明，空串表示没填，同样原样转发；
+  // 这里只管转发，错误返回 no-key / no-window 与原样一致，判定仍只有 renderer/app.js 一份
+  function startFromFloatBar(key, value, note) {
+    const k = String(key == null ? '' : key);
+    if (!looksLikeSessionKey(k)) return { ok: false, error: 'no-key' };
+    const target = winFromKey(k);
+    if (!target) return { ok: false, error: 'no-window' };
+    // value 原样带上：数组就是数组，只有 undefined/null 才兜底成空串。
+    // 这里禁止 String()/join()，否则「一起开工」的三个勾选项会被压成 "[object Object]" 或 "a,b"
+    sendTo(target, 'floatbar:do-start', { sessionKey: k, value: value == null ? '' : value, note: note == null ? '' : String(note) });
+    return { ok: true };
+  }
+  floatBarStartHandler = startFromFloatBar;
+
+  // 小窗绑定会话键：记下来，并立刻回推一次这个键的 start-ready
+  function bindFromFloatBar(key) {
+    const raw = String(key == null ? '' : key);
+    const k = raw || lastActiveKey;          // 小窗发空键时用主进程记的最近会话兜底
+    boundKey = k;
+    diag.log('floatbar', `小窗绑定会话 ${k || '(空)'}`);
+    // 关键：小窗页面发空键时不会自己认领，默认绑定必须由主进程主动灌回去
+    for (const bar of floatBars) {
+      if (bar && typeof bar.setBoundKey === 'function') bar.setBoundKey(k);
+    }
+    pushStartReady(k);
+    return { ok: true };
+  }
+  floatBarBindHandler = bindFromFloatBar;
+
+  /** 主窗报上来的开始方案：必须是数组，每项只留 { value, label } 两个字符串字段，其余一律丢掉 */
+  function readStartOptions(payload) {
+    const raw = payload && payload.options;
+    if (!Array.isArray(raw)) return [];   // 非数组一律当没有方案，别让小窗拿到乱七八糟的东西
+    const out = [];
+    for (const one of raw) {
+      if (!one || typeof one !== 'object') continue;
+      // value 留空是合法的（表示默认那颗），这里只做类型收敛，不替主窗做取舍
+      out.push({
+        value: String(one.value == null ? '' : one.value),
+        label: String(one.label == null ? '' : one.label)
+      });
+    }
+    return out;
+  }
+
+  // 主窗渲染层回报「这个会话此刻能不能新起一轮」，顺带带上可选的开始方案
+  function noteCanStart(e, payload) {
+    const win = getWin(e);
+    if (!win) return;
+    const tabId = String((payload && payload.tabId) || lastTabIdByWin.get(win) || '');
+    const key = String((payload && payload.key) || makeSessionKey(win, tabId));
+    if (!key) return;
+    canStartByKey.set(key, {
+      canStart: !!(payload && payload.canStart),
+      options: readStartOptions(payload)
+    });
+    pushStartReady(key);
+  }
+  ipcMain.on('floatbar:can-start', noteCanStart);
+  ipcMain.handle('floatbar:can-start', (e, payload) => {
+    noteCanStart(e, payload);
+    return { ok: true };
+  });
+
+  // 主窗渲染层回报它绑定的标签页标题：更新会话清单后广播给小窗
+  function noteBindFromWindow(e, payload) {
+    const win = getWin(e);
+    const tabId = String((payload && payload.tabId) || '');
+    // 收到空键（这次回报没带标签页）时不更新会话，只把小窗当前的绑定键和该键已缓存的事件回灌一次，
+    // 让小窗页面自己校准绑定键，免得顶栏一直停在「未绑定会话」
+    if (!tabId) {
+      for (const bar of floatBars) {
+        if (bar && typeof bar.setBoundKey === 'function') bar.setBoundKey(boundKey);
+      }
+      return;
+    }
+    const key = makeSessionKey(win, tabId);
+    if (!key) return;
+    const wid = winIdByWin.get(win);
+    const title = String((payload && payload.title) || '').trim();
+    lastTabIdByWin.set(win, tabId);
+    lastActiveKey = key;
+    sessionsByKey.set(key, `窗口${wid} · ${title || '对话'}`);
+    // 只有主窗真的开工（active=true）才把绑定切过来；单纯切标签只更新会话清单，不抢绑定
+    if (payload && payload.active === true) {
+      boundKey = key;
+      console.log('[floatbar] 主窗开工，小窗切到会话 ' + key);
+      for (const bar of floatBars) {
+        if (bar && typeof bar.setBoundKey === 'function') bar.setBoundKey(key);
+      }
+      pushStartReady(key);
+    }
+    broadcastSessions();
+  }
+  ipcMain.on('floatbar:bind-from-window', noteBindFromWindow);
+  ipcMain.handle('floatbar:bind-from-window', (e, payload) => {
+    noteBindFromWindow(e, payload);
+    return { ok: true };
+  });
+
+  // 小窗顶栏的「最小化 / 还原」：页面发来 on=true 表示收成紧凑态，false 表示还原展开态。
+  // 定位方式跟别的小窗通道一样，先从 event.sender 找回发出这条消息的那个小窗窗口，再落到对应的实例上；
+  // 认不出实例就静默忽略，绝不抛错，也绝不误调别的小窗
+  ipcMain.on('floatbar:compact', (event, on) => {
+    const senderWin = BrowserWindow.fromWebContents(event.sender);
+    if (!senderWin) return;
+    for (const bar of floatBars) {
+      if (!bar || typeof bar.setCompact !== 'function') continue;
+      // 本进程里小窗实例与窗口一一对应：只有一个实例时 sender 就是它的；
+      // 实例若自带归属判定就优先用判定结果，认不出来直接跳过
+      const mine = typeof bar.ownsWindow === 'function' ? bar.ownsWindow(senderWin) : floatBars.length === 1;
+      if (!mine) continue;
+      bar.setCompact(on === true);
+      return;
+    }
+  });
+
+  // 主窗顶栏那颗「小窗」开关：切换小窗显隐，切完把新可见性回给调用方，并广播给所有主窗
+  ipcMain.handle('floatbar:toggle', () => {
+    try {
+      if (!floatBar) return { ok: false, visible: false };
+      if (typeof floatBar.toggle === 'function') {
+        // 实例自带切换能力（lib/float-bar.js 的返回值里确实有 toggle()），优先用它
+        floatBar.toggle();
+      } else if (typeof floatBar.show === 'function' && typeof floatBar.hide === 'function') {
+        // 没有 toggle() 时退回 show/hide 自行组合成一次切换
+        if (floatBarVisibleNow()) floatBar.hide();
+        else floatBar.show();
+      } else {
+        return { ok: false, visible: false };
+      }
+      const visible = floatBarVisibleNow();
+      broadcastFloatBarVisibility(visible);
+      return { ok: true, visible: visible };
+    } catch (e) {
+      // 切换失败不往外抛，只回一份 ok:false，免得渲染层 invoke 直接 reject
+      diag.log('floatbar', '切换小窗失败', { message: e && e.message });
+      return { ok: false, visible: false };
+    }
+  });
+
+  // 只读小窗当前可见性：主窗按钮初始化时用它对齐状态，异常同样不抛
+  ipcMain.handle('floatbar:visible', () => {
+    try {
+      return { ok: true, visible: floatBarVisibleNow() };
+    } catch (e) {
+      return { ok: false, visible: false };
+    }
+  });
+
+  // 小窗右下角自制抓柄请求改尺寸：页面把算好的目标宽高 { w, h } 发过来，这里落到对应实例的 resizeBy。
+  // 定位方式与本函数里其它小窗通道完全一致：先由 event.sender 找回发出消息的那个小窗窗口，再按实例归属判定，
+  // 认不出实例、实例没有这个方法、或 resizeBy 自己抛错，统一回 { ok:false, error }，绝不抛错、也绝不误改别的小窗
+  ipcMain.handle('floatbar:resize', (event, payload) => {
+    const senderWin = BrowserWindow.fromWebContents(event.sender);
+    if (!senderWin) return { ok: false, error: 'no-window' };
+    for (const bar of floatBars) {
+      if (!bar || typeof bar.resizeBy !== 'function') continue;
+      // 本进程里小窗实例与窗口一一对应：只有一个实例时 sender 就是它的；
+      // 实例若自带归属判定就优先用判定结果，认不出来直接跳过
+      const mine = typeof bar.ownsWindow === 'function' ? bar.ownsWindow(senderWin) : floatBars.length === 1;
+      if (!mine) continue;
+      try {
+        // 返回值（{ ok:true, w, h } 或 { ok:false, error }）原样回给渲染端，这里不再包一层
+        return bar.resizeBy(payload);
+      } catch (e) {
+        diag.log('floatbar', '小窗改尺寸失败', { message: e && e.message });
+        return { ok: false, error: 'resize-failed' };
+      }
+    }
+    return { ok: false, error: 'no-window' };
+  });
+}
+
+/**
+ * 判定某个窗口是不是任意一个已登记小窗实例的窗口。
+ * 小窗实例自带归属判定（lib/float-bar.js 返回的 ownsWindow()）时优先用它；
+ * 实例没有该方法时退回兜底判定：把它内部的窗口对象拿出来与传入窗口做引用比较。
+ */
+function floatBarOwnsWindow(win) {
+  for (let i = 0; i < floatBars.length; i++) {
+    const bar = floatBars[i];
+    if (!bar) continue;
+    if (typeof bar.ownsWindow === 'function') {
+      try {
+        if (bar.ownsWindow(win) === true) return true;
+      } catch (e) {
+        // 判定本身报错就当认不出这个小窗，继续比下一个
+      }
+      continue;
+    }
+    const inner = bar.window || bar.win || bar.browserWindow;
+    if (inner && inner === win) return true;
+  }
+  return false;
+}
+
+/** 读小窗当前可见性：实例自带 isVisible() 就用它，否则问实例内部的窗口对象；取不到一律按不可见处理 */
+function floatBarVisibleNow() {
+  const bar = floatBar;
+  if (!bar) return false;
+  if (typeof bar.isVisible === 'function') {
+    try {
+      return bar.isVisible() === true;
+    } catch (e) {
+      return false;
+    }
+  }
+  const inner = bar.window || bar.win || bar.browserWindow;
+  if (inner && typeof inner.isDestroyed === 'function' && !inner.isDestroyed() && typeof inner.isVisible === 'function') {
+    try {
+      return inner.isVisible() === true;
+    } catch (e) {
+      return false;
+    }
+  }
+  return false;
+}
+
+/**
+ * 把小窗当前的可见性广播给所有主窗：主窗顶栏那颗「小窗」开关靠这条消息同步状态。
+ * 遍历 BrowserWindow.getAllWindows()，跳过小窗自身的窗口，只给主窗发 floatbar:visibility。
+ */
+function broadcastFloatBarVisibility(visible) {
+  const on = visible === true;
+  const all = BrowserWindow.getAllWindows();
+  for (let i = 0; i < all.length; i++) {
+    const win = all[i];
+    if (!win || win.isDestroyed()) continue;
+    if (floatBarOwnsWindow(win)) continue;   // 小窗自己不收这条广播
+    sendTo(win, 'floatbar:visibility', on);
+  }
+}
 
 app.whenReady().then(async () => {
   ensureAppRoot();
@@ -292,7 +891,162 @@ app.whenReady().then(async () => {
   }
   reportPreviousCrashes();
   startHeartbeat();
+  // 小窗 IPC 必须赶在建主窗之前登记：主窗一开工就会回报绑定/开工状态，晚登记会漏掉首批消息。
+  // 这些通道只用到模块级的表（floatBars / sessionsByKey / winIdByWin 等），不依赖 mySlot、floatBar、shortcutOk
+  registerFloatBarIpc();
   createWindow();
+  // 先注册快捷键：是否成功决定小窗要不要留「隐藏」入口，所以要在建小窗之前知道
+  try {
+    shortcutOk = globalShortcut.register('CommandOrControl+Alt+Space', function () {
+      if (floatBar) floatBar.toggle();
+      // 快捷键也能改小窗状态，切换完成后补一次广播，主窗那颗「小窗」开关跟着同步
+      if (floatBar) broadcastFloatBarVisibility(floatBarVisibleNow());
+    });
+    if (!shortcutOk) diag.log('floatbar', '全局快捷键 Ctrl+Alt+Space 注册失败，可能已被别的程序占用，小窗不再提供隐藏入口');
+  } catch (e) {
+    shortcutOk = false;
+    diag.log('floatbar', '全局快捷键注册异常', { message: e && e.message });
+  }
+  mySlot = claimFloatBarSlot();
+  diag.log('floatbar', `本进程占用悬浮栏槽位 slot-${mySlot}`, { pid: process.pid });
+  // 常驻置顶悬浮栏：回调都是主进程已有的逻辑，窗口自己收在 lib/float-bar.js 里
+  floatBar = createFloatBar({
+    slotIndex: mySlot,
+    // 主窗有常备的「小窗」按钮可以随时唤出小窗，所以热键是否注册成功不再决定隐藏入口的有无
+    canHide: true,
+    // 第三位是小窗带来的图片附件清单，原样交给 handleFloatBarSend 去过滤和截断
+    onSend: function (key, text, attachments) { handleFloatBarSend({ key: String(key || ''), text: String(text == null ? '' : text), attachments: attachments }); },
+    onAnswer: function (a, b, c) { handleFloatBarAnswer(a, b, c); },
+    onAbort: function (a, b, c) { handleFloatBarAbort(a, b, c); },
+    // 小窗点「开始」：key 定位会话，value 是用户点的那颗方案字母或勾选项数组，
+    // note 是开工选项下面填的补充说明（空串 = 没填），三个一起透传给 startFromFloatBar
+    onStart: function (key, value, note) {
+      // 兼容两种回调形态：键与值分两个参数传，或整份载荷当一个对象传
+      // value 一律原样往下传：空串是单颗「开始」，数组是多选「一起开工」，
+      // note 同样原样往下传，对象形态里带了就用对象里的，没带就用分参数那一路的
+      // 这里不做任何 String()/join()，一转就把数组压坏了，后面再也分不出勾了哪几项
+      if (key && typeof key === 'object') {
+        const raw = key;
+        const rawKey = raw.key == null ? raw.sessionKey : raw.key;
+        const rawValue = raw.value == null ? value : raw.value;
+        const rawNote = raw.note == null ? note : raw.note;
+        if (floatBarStartHandler) floatBarStartHandler(rawKey, rawValue, rawNote);
+        return;
+      }
+      if (floatBarStartHandler) floatBarStartHandler(key, value, note);
+    },
+    onBind: function (key) { if (floatBarBindHandler) floatBarBindHandler(key); },
+    // 小窗自己收起（点关闭/隐藏）后补一次广播：hide 由 lib/float-bar.js 内部完成，这里只同步主窗那颗开关
+    onHide: function () { broadcastFloatBarVisibility(floatBarVisibleNow()); }
+  });
+  floatBars.push(floatBar);
+  // ===== AGI 小窗挪位接口（工具 float_bar_move）=====
+  // floatBars 是普通数组（见文件顶部声明），元素就是 lib/float-bar.js 建出来的小窗实例，
+  // 实例上已有 isVisible() / ownsWindow() 等方法，挪位由实例自己的 moveToPlace(place) 完成。
+  // 这里只把「挪」和「读位置」两件事交给 agent 模块，窗口的创建与销毁逻辑一概不动。
+
+  /** 小窗实例当前是否可见：没有可见性方法的实例按不可见处理，取异常也不抛错 */
+  function floatBarIsVisible(bar) {
+    if (!bar || typeof bar.isVisible !== 'function') return false;
+    try {
+      return bar.isVisible() === true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * 取一个小窗实例当前的窗口矩形 { x, y, width, height }：
+   * 实例自带 getBounds() 就用它，否则按 ownsWindow() 在窗口表里找到它的小窗再用 win.getBounds()。
+   * 认不出窗口或调用异常一律返回 null，绝不抛错。
+   */
+  function floatBarBoundsOf(bar) {
+    if (!bar) return null;
+    if (typeof bar.getBounds === 'function') {
+      try {
+        const own = bar.getBounds();
+        if (own) return { x: own.x, y: own.y, width: own.width, height: own.height };
+      } catch (e) {
+        return null;
+      }
+    }
+    if (typeof bar.ownsWindow !== 'function') return null;
+    const allWins = BrowserWindow.getAllWindows();
+    for (let i = 0; i < allWins.length; i++) {
+      const win = allWins[i];
+      if (!win || win.isDestroyed()) continue;
+      if (!bar.ownsWindow(win)) continue;
+      try {
+        const b = win.getBounds();
+        return { x: b.x, y: b.y, width: b.width, height: b.height };
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * float_bar_move 的主进程实现：把所有「当前可见」的小窗挪到 place 指定的方位。
+   * 某个小窗挪失败（回 ok:false 或抛异常）只跳过它，其它小窗照挪，绝不整批失败。
+   * 返回 { ok:true, moved:[{ x, y, width, height }] }；一个可见小窗都没有时返回 no-float-bar。
+   */
+  function moveFloatBarsToPlace(place) {
+    const moved = [];
+    let visibleCount = 0;
+    for (let i = 0; i < floatBars.length; i++) {
+      const bar = floatBars[i];
+      if (!floatBarIsVisible(bar)) continue;
+      visibleCount++;
+      if (typeof bar.moveToPlace !== 'function') continue;
+      let res = null;
+      try {
+        res = bar.moveToPlace(place);
+      } catch (e) {
+        diag.log('floatbar', '挪小窗失败，跳过这一个', { place: place, message: e && e.message });
+        continue;
+      }
+      // 单个小窗明确回了 ok:false 就跳过它，继续处理其它小窗
+      if (res && res.ok === false) continue;
+      const b = floatBarBoundsOf(bar);
+      if (b) {
+        moved.push({ x: b.x, y: b.y, width: b.width, height: b.height });
+      } else if (res && typeof res.x === 'number' && typeof res.y === 'number') {
+        // 取不到窗口矩形时退回实例回传的坐标，宁可少几个字段也不漏掉这一次成功的挪动
+        moved.push({ x: res.x, y: res.y, width: res.width, height: res.height });
+      }
+    }
+    if (visibleCount === 0) {
+      return { ok: false, error: 'no-float-bar', message: '现在没有悬浮小窗可挪' };
+    }
+    return { ok: true, moved: moved };
+  }
+
+  /** 读所有可见小窗的窗口矩形，供 AGI 判断挪完之后画面还剩哪块被挡着 */
+  function floatBarRects() {
+    const out = [];
+    for (let i = 0; i < floatBars.length; i++) {
+      const bar = floatBars[i];
+      if (!floatBarIsVisible(bar)) continue;
+      const b = floatBarBoundsOf(bar);
+      if (!b) continue;
+      out.push({ x: b.x, y: b.y, width: b.width, height: b.height });
+    }
+    return out;
+  }
+
+  // 交给 agent 模块；版本不一致（拿不到 setFloatBarHooks）时静默跳过，不影响小窗本身。
+  // 两个回调都用具名函数表达式传，方便在栈里认出是谁调的。
+  if (agent && typeof agent.setFloatBarHooks === 'function') {
+    agent.setFloatBarHooks({
+      move: function move(place) { return moveFloatBarsToPlace(place); },
+      rects: function rects() { return floatBarRects(); }
+    });
+  } else {
+    diag.log('floatbar', 'agent 模块没有 setFloatBarHooks，AGI 挪小窗能力未注册');
+  }
+  // 小窗刚起来时先给它一份已有会话清单，免得等下一次变更才知道有什么可绑
+  broadcastSessions();
   startClipboardWatch();
   if (store.load().desktopAlive) desktopHand.setAlive(true);
   app.on('activate', () => {
@@ -1513,8 +2267,8 @@ ipcMain.handle('sessions:rename', (_e, { id, title }) => {
   return { id: data.id, title: data.title };
 });
 
-ipcMain.handle('chat:abort', (e, turnId) => {
-  const win = getWin(e);
+// 主窗按钮与悬浮栏「停止」共用这一份中断逻辑
+function handleChatAbort(win, turnId) {
   const id = String(turnId || '');
   const asks = pendingAskMap(win);
   const aborts = abortMap(win);
@@ -1533,10 +2287,12 @@ ipcMain.handle('chat:abort', (e, turnId) => {
   }
   asks.clear();
   for (const c of aborts.values()) c.abort();
-});
+}
 
-ipcMain.handle('chat:answer', (e, payload) => {
-  const win = getWin(e);
+ipcMain.handle('chat:abort', (e, turnId) => handleChatAbort(getWin(e), turnId));
+
+// 主窗与悬浮栏共用同一份回答交付逻辑，不复制两份，免得改一处漏一处
+function handleChatAnswer(win, payload) {
   const asks = pendingAskMap(win);
   const answer = payload && typeof payload === 'object' && !Array.isArray(payload)
     ? payload.answer
@@ -1554,8 +2310,13 @@ ipcMain.handle('chat:answer', (e, payload) => {
   } else {
     pending.resolve(String((answer && typeof answer === 'object' ? answer.text : answer) ?? ''));
   }
+  // 在主窗里点了确认时，顺手让悬浮栏把危险确认卡片收掉，免得卡片一直挂着
+  const answeredKey = sessionKeyOfTurn(id) || makeSessionKey(win, resolveTurnTabId(win, payload));
+  broadcastToFloatBars({ kind: 'answered', turnId: id, sessionKey: answeredKey });
   return true;
-});
+}
+
+ipcMain.handle('chat:answer', (e, payload) => handleChatAnswer(getWin(e), payload));
 
 ipcMain.handle('chat:contextPreview', (_e, turnId) => contextPreview.get(turnId));
 
@@ -1566,11 +2327,24 @@ ipcMain.handle('chat:send', async (e, payload) => {
   const modelCfg = store.resolveModelCfg(payload.modelId || s.currentModelId, s);
   const ctl = new AbortController();
   const turnId = String(payload?.turnId || '');
-  if (turnId) abortMap(win).set(turnId, ctl);
+  // 这一轮挂在哪个窗口的哪个标签页上：渲染层没上报 tabId 时用该窗口上次上报的标签页兜底，
+  // 否则事件键会变成「窗口N:」，与小窗的绑定键对不上，不新增协议字段
+  const tabId = resolveTurnTabId(win, payload);
+  if (turnId) {
+    abortMap(win).set(turnId, ctl);
+    turnOwner.set(turnId, { win, tabId });
+  }
+  // 用户这一轮的正文额外推一份给常驻悬浮栏，让悬浮栏能看到真正的对话内容；本轮启动逻辑保持原样
+  if (floatBars.length && typeof payload?.text === 'string' && payload.text) {
+    broadcastToFloatBars({ kind: 'user', turnId, sessionKey: makeSessionKey(win, tabId), text: payload.text });
+  }
   const order = store.load().skillOrder || [];
   const skills = agent.listSkills(APP_ROOT, ws, order);
   const allSkills = skillsLib.listDetailed(path.join(APP_ROOT, 'skills'), ws, order);
-  const onEvent = (ev) => sendTo(win, 'chat:event', turnId ? { ...ev, turnId } : ev);
+  const onEvent = (ev) => {
+    sendTo(win, 'chat:event', turnId ? { ...ev, turnId } : ev);
+    forwardTurnEventToFloatBar(ev, turnId);
+  };
   // 用当前对话勾着的那一组，可多个一起用。没带上来时才默认 zabingsk。
   const source = Array.isArray(payload.skillIds)
     ? payload.skillIds
@@ -1601,6 +2375,7 @@ ipcMain.handle('chat:send', async (e, payload) => {
     pendingAskMap(win).set(turnId, { resolve, reject, ask });
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
   });
+  setTurnRunning(win, turnId, true);
   try {
     const result = await contextPreview.run(turnId, () => agent.runTurn({
       workspace: ws,
@@ -1620,7 +2395,8 @@ ipcMain.handle('chat:send', async (e, payload) => {
       extraFolders: payload.extraFolders || [],
       waitForUserAnswer,
       maxAgentRounds: payload.maxAgentRounds,
-      unlimitedRounds: !!payload.unlimitedRounds
+      unlimitedRounds: !!payload.unlimitedRounds,
+      interjectKey: makeSessionKey(win, resolveTurnTabId(win, payload)),
     }));
     return result;
   } catch (err) {
@@ -1631,7 +2407,35 @@ ipcMain.handle('chat:send', async (e, payload) => {
     onEvent({ type: 'error', message: msg });
     throw err;
   } finally {
+    setTurnRunning(win, turnId, false);
+    turnOwner.delete(turnId);
     pendingAskMap(win).delete(turnId);
     abortMap(win).delete(turnId);
+    // 这个窗口的轮次都收工了，让悬浮栏顶栏回到「空闲」；同一窗口还有别的标签页在跑就别清
+    if (!turnIsRunning(win)) {
+      broadcastToFloatBars({ kind: 'idle', turnId, sessionKey: makeSessionKey(win, tabId) });
+    }
   }
+});
+
+// 主窗运行中把这条消息插话给当前轮，下一个 round 边界生效
+ipcMain.handle('chat:interject', async (e, payload) => {
+  const win = getWin(e);
+  const text = payload && typeof payload.text === 'string' ? payload.text.trim() : '';
+  // 空文本不塞也不广播，直接告诉调用方原因
+  if (!text) return { ok: false, reason: 'empty' };
+  // 会话键算法与 chat:send 完全一致，保证主窗插话和小窗插话落进同一个桶
+  const key = makeSessionKey(win, resolveTurnTabId(win, payload));
+  try {
+    // AGI 关着时 pushInterjection 返回非 true：不广播「已插话」，
+    // 告诉渲染层没插上，渲染层本来就有「ok !== true → 退回排队」的分支
+    if (agent.pushInterjection(key, text) !== true) {
+      return { ok: false, reason: 'no-agi' };
+    }
+    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '已插话，下一轮就能读到' });
+  } catch (err) {
+    diag.log('floatbar', '插话失败', { message: err && err.message });
+    return { ok: false, reason: 'error' };
+  }
+  return { ok: true, key };
 });

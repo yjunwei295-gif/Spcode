@@ -1,0 +1,228 @@
+{
+  "version": 1,
+  "items": [
+    {
+      "summary": "小窗最小化走 main.js 的 floatbar:compact → preload 暴露 floatBar.compact → float-bar.js setCompact：只改高度 COMPACT_HEIGHT=182，位置宽度不动，紧凑期 setResizable(false)，落盘时写原高度；页面紧凑态只渲染最后 2 条并隐藏顶栏其它元素，危险确认卡片弹出会自动还原。",
+      "paths": [
+        "electron/lib/float-bar.html",
+        "electron/lib/float-bar.js",
+        "electron/main.js",
+        "electron/preload.js"
+      ],
+      "deletedAt": "2026-10-08T05:30:10.142Z",
+      "id": "mem-muz1lcep-rn37sh"
+    },
+    {
+      "summary": "小窗切换到紧凑态时只改高度，x/y/width 原样保留，紧凑期禁止缩放，落盘时仍保存正常高度，避免破坏用户窗口布局。",
+      "paths": [
+        "electron/lib/float-bar.js",
+        "electron/preload.js",
+        "electron/main.js"
+      ],
+      "deletedAt": "2026-10-08T05:30:11.191Z",
+      "id": "mem-muz1lvhk-gxxkfy"
+    },
+    {
+      "summary": "给开工选项时必须先加工：正文里用一句比喻说明现状与取舍，选项按钮只写「具体要做的动作」人话，禁止直接把代码标识符/文件名/拼音当选项文案；选项文案由大脑复述文本决定（app.js:1574 原样取文本），代码只做剥前缀、代码味过滤、48 字摘要。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/float-bar.html"
+      ],
+      "deletedAt": "2026-10-08T05:57:22.921Z",
+      "id": "mem-muz4ic3z-boazvl"
+    },
+    {
+      "summary": "开工选项的给法（老大定）：选项按钮文字写成「一句比喻 ＋ 具体要做的事」，禁止直接甩代码标识符/文件名/拼音；正文复述不用比喻，只有收尾总结用比喻。选项文案由大脑复述文本原样决定（app.js:1574 取原文），主窗按钮 app.js:1530 超 48 字会截断（全文进 title），小窗按钮不截断只折行，所以写法要控在 48 字内。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/float-bar.html"
+      ],
+      "deletedAt": "2026-10-08T06:01:42.925Z",
+      "id": "mem-muz4jxf5-no1ln1"
+    },
+    {
+      "summary": "小窗提问卡片被输入区截断的修法：卡片 #ask 必须 overflow:hidden 且 flex:0 1 auto，#askOpts 必须 flex:0 1 auto + min-height:0（让选项在卡片内滚动而不是越出边框去压发送键），并保留 #bar:has(#ask:not(.hidden)) 让 #msgs 降到 24px、#startArea 收起；改回 flex:0 0 auto 会让长选项重新贴住输入区 [electron/lib/float-bar.html]",
+      "paths": [
+        "electron/lib/float-bar.html"
+      ],
+      "deletedAt": "2026-10-08T06:01:42.926Z",
+      "id": "mem-muz3d1hb-lk6ido"
+    },
+    {
+      "summary": "开工选项识别已扩容：startOptionPrefixOf（renderer/app.js:1530）除原有三类前缀（方案N：／第N种／①·1.·一、）外，新增项目符号（• · ∙ ‣ ▪ ◦ - * +，符号后必须紧跟空白，避免吃掉 **粗体**）与中文天干（甲~癸＋｜、：等分隔符）；复合前缀逐层剥最多 3 层，且只有第一层是项目符号或编号块符号时才继续剥下一层（天干/关键词前缀只剥一层，否则「丙：甲、乙都做」会被削成「乙都做」）。parseNumberedStartOptions 增加项目符号块收集，与编号块同行数取最长；④ 兜底切圈号时改成传 hasExplicitMarker=true。isCodeLikeStartOption 新增第二参 hasExplicitMarker（默认 false＝判据与改动前逐条一致），传 true 时先剥反引号内容/斜杠路径/名字.扩展名文件名，剥",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.437Z",
+      "id": "mem-muza5win-zbm3jl"
+    },
+    {
+      "summary": "纯拼音/纯 ASCII 的开工方案不出按钮是用户裁决保留的行为：isCodeLikeStartOption 里「整条不含中文即判代码味」那条（app.js:1516）保持不动，禁止放宽；多按钮只在含中文的方案上出现。路径判据（:1509）已放宽为斜杠两侧都紧邻路径字符，两条互不冲突。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.439Z",
+      "id": "mem-muz4s4fh-6ht5un"
+    },
+    {
+      "summary": "采用宽容版代码剔除口径：先剔除反引号内容、斜杠路径和文件名，若剩余仍含中文则保留开工按钮，避免含英文文件名的中文说明被一票否决。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.441Z",
+      "id": "mem-muza6wf4-ca12a1"
+    },
+    {
+      "summary": "`isCodeLikeStartOption` 不传第二参时必须保持与改前逐条一致的判据，避免影响旧调用路径。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.442Z",
+      "id": "mem-muza6wf4-okopdf"
+    },
+    {
+      "summary": "仅当选项正文紧跟显式标记时才给 `isCodeLikeStartOption` 传 true 启用宽容剥离，普通无标记行继续走旧判据。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.443Z",
+      "id": "mem-muza6wf4-d2ws9s"
+    },
+    {
+      "summary": "代码混合选项应先剥反引号内容、斜杠路径和文件名，再走常见源码扩展名判据，避免误杀带中文说明的选项。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.444Z",
+      "id": "mem-muza6wf4-sc6fvb"
+    },
+    {
+      "summary": "开工选项前缀支持天干甲~癸，后接 `｜、：` 或空白。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.445Z",
+      "id": "mem-muza6wf4-42tle4"
+    },
+    {
+      "summary": "开工选项前缀逐层剥离最多 3 层，避免过度剥离正文。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.446Z",
+      "id": "mem-muza6wf4-3a0d0w"
+    },
+    {
+      "summary": "逐层剥离时只有第一层为项目符号或编号块符号才继续剥下一层，防止「丙：甲、乙都做」被削成「乙都做」。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.447Z",
+      "id": "mem-muza6wf4-6i9s2i"
+    },
+    {
+      "summary": "新增项目符号/天干前缀时，原有「方案N：/第N种/①·1.·一、」三类识别必须逐条保留不变。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.448Z",
+      "id": "mem-muza6wf4-bflvm2"
+    },
+    {
+      "summary": "项目符号后必须紧跟空白，避免把 `**粗体**` 误当开工选项前缀。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.449Z",
+      "id": "mem-muza6wf4-no1nhw"
+    },
+    {
+      "summary": "`parseNumberedStartOptions` 中项目符号块与编号块收集需同行数取最长，保持块级开工选项识别一致。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.450Z",
+      "id": "mem-muza6wf4-afdzt1"
+    },
+    {
+      "summary": "圈号兜底解析调用 `isCodeLikeStartOption` 应传 `hasExplicitMarker=true`，因圈号后的正文确实紧跟显式标记。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.451Z",
+      "id": "mem-muza6wf4-31cpj7"
+    },
+    {
+      "summary": "因项目符号包含 `-`，普通 `- xxx` 列表也会像编号列表一样被当成并列开工选项出按钮；若要禁止需显式加限制。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.452Z",
+      "id": "mem-muza6wf4-frsqi6"
+    },
+    {
+      "summary": "以「先/再/然后」开头的正文仍不算并列开工选项，即使带方案前缀也照旧剔除。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.453Z",
+      "id": "mem-muza6wf4-tzrgff"
+    },
+    {
+      "summary": "开工选项解析改动只影响按钮生成，不应改动 `MAX_START_OPTION_LABEL`、单颗「开始」分支、`data-value`+`onStart(key,value)`、能开工才出按钮闸门、小窗、markdown、electron/main.js、agent.js。",
+      "paths": [
+        "renderer/app.js",
+        "float-bar.html",
+        "float-bar-md.js",
+        "renderer/markdown.js",
+        "electron/main.js",
+        "agent.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:36.454Z",
+      "id": "mem-muza6wf4-15tth6"
+    },
+    {
+      "summary": "开工选项的识别与触发链路（parseStartOptions 规则与代码味过滤、选项条数门槛、data-value + onStart(key, value)、无待办闸门、单颗「开始」分支、抓柄与 #btn-mini）是稳定契约，只改文案或布局时不要顺手改动。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/float-bar.html"
+      ],
+      "deletedAt": "2026-10-08T08:40:41.602Z",
+      "id": "mem-muz4q7xs-juep2m"
+    },
+    {
+      "summary": "选项识别仍保持三级识别、最多 3 条，并通过 data-value + onStart 链路传递，改动按钮逻辑时不要破坏。",
+      "paths": [
+        "renderer/app.js",
+        "electron/lib/float-bar.html"
+      ],
+      "deletedAt": "2026-10-08T08:40:41.604Z",
+      "id": "mem-muz4flyb-s2q5qx"
+    },
+    {
+      "summary": "app.js 会直接剔除整条不含中文的候选，因此纯拼音并列不会出按钮；支持纯拼音前必须先改这条中文检测。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:41.606Z",
+      "id": "mem-muz4flyb-slm9l5"
+    },
+    {
+      "summary": "路径识别需保持斜杠两侧都紧邻路径字符的判据，以免“A / B”并列被误判为路径；有效相对路径和盘符路径仍应命中。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:41.607Z",
+      "id": "mem-muz4flyb-e4jxvk"
+    },
+    {
+      "summary": "临时自测脚本仅用于本轮验证并已删除，不应提交或作为长期依赖。",
+      "paths": [
+        "renderer/__tmp_startopt_check.js",
+        "_selftest_start_option.js"
+      ],
+      "deletedAt": "2026-10-08T08:40:41.608Z",
+      "id": "mem-muza6wf4-xqavhx"
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { safeJoin, resolveAllowed, resolveRead, resolveWrite, extraRoots, listTree, readTextFile, readLineRange, isInside, isForeignAiSkill, SKIP } = require('./workspace');
 const snapshot = require('./snapshot');
 const skillsLib = require('./skills');
@@ -26,17 +27,108 @@ const apiProtocol = require('./api-protocol');
 const sandbox = require('./sandbox');
 const toolXml = require('./tool-xml');
 const houseStyle = require('./house-style');
+const sheetCore = require('./sheet-core');
 // 看图端点请求统一走 httpFetch（Electron net.fetch，与聊天主链路同用系统代理），避免裸 fetch 在代理环境下 fetch failed
 const { httpFetch } = require('./http-fetch');
 
 const DEFAULT_MAX_ROUNDS = 16;
 const SAFETY_MAX_ROUNDS = 128;
 
+// [铆钉优化] 常驻悬浮栏的插话收件箱：按会话键（key，形如 '1:tabId'）分桶，值是待插话的字符串数组。
+// 轮次进行中用户发的提示先存进本会话的桶里，下一轮次开头才并进上下文。
+// 其他 AI 请勿改成打断当前轮，也请勿改回全局单队列：多会话共用一个队列会把一处的提示串到另一处。
+const interjectInbox = new Map();
+
+/**
+ * 悬浮栏插话入口：不打断当前轮，只把提示排进本会话（key）的队列，
+ * 等下一轮次开头才生效。key 为空或 text 为空直接忽略。
+ * AGI 没开时插话不成立：返回 false，让调用方退回成「排队、本轮跑完再发」。
+ * 返回 true 表示已排进队列。
+ */
+function pushInterjection(key, text) {
+  // AGI（桌面辅助）关着时没有插话这回事，先拦掉；desktopOn 是函数声明，会提升，可直接调
+  if (!desktopOn()) return false;
+  const k = key == null ? '' : String(key);
+  if (!k) return false;
+  const body = String(text == null ? '' : text).trim();
+  if (!body) return false;
+  let q = interjectInbox.get(k);
+  if (!q) {
+    q = [];
+    interjectInbox.set(k, q);
+  }
+  q.push(body);
+  return true;
+}
+
 // [铆钉优化] 桌面工具只在「AGI」打开时给模型，关着时模型看不到也不会乱报"AGI 没开"。其他 AI 请勿改回始终暴露。
 const DESKTOP_TOOLS = new Set([
-  'screen_read', 'screen_look', 'clipboard_look', 'window_list', 'window_focus', 'ui_act', 'agi_note',
-  'mouse_move', 'mouse_click', 'mouse_drag', 'mouse_scroll', 'keyboard_type', 'keyboard_key'
+  'screen_read', 'screen_look', 'float_bar_move', 'clipboard_look', 'window_list', 'window_focus', 'ui_act', 'agi_note',
+  'mouse_move', 'mouse_click', 'mouse_drag', 'mouse_scroll', 'keyboard_type', 'keyboard_key',
+  'sheet_read_image', 'sheet_write', 'sheet_to_wps'
 ]);
+
+// [铆钉优化] 悬浮小窗 hooks：由 electron/main.js 调 setFloatBarHooks 注册。
+// move(place) 把当前可见的小窗挪到指定方位，rects() 返回所有可见小窗的窗口矩形。
+// 小窗还没起来、或主进程版本旧时这里是 null，工具要返回一段中文说明，不要改成抛异常。
+// 其他 AI 请勿删掉这个注册口，也请勿改成在模块加载时自己去 require 小窗模块。
+let floatBarHooks = null;
+
+/** 注册悬浮小窗 hooks（主进程调用）。传入的不是对象时忽略，保持原状态。 */
+function setFloatBarHooks(hooks) {
+  if (!hooks || typeof hooks !== 'object') return;
+  floatBarHooks = hooks;
+}
+
+/** 把 hooks.move(place) 的返回值转成给模型看的中文结果：成功写明新坐标，失败写明原因。 */
+function describeFloatBarMove(place, res) {
+  if (!res || res.ok !== true) {
+    let why = '原因未知';
+    if (res && res.error === 'no-float-bar') why = '现在没有悬浮小窗可挪';
+    else if (res && res.message) why = String(res.message);
+    return `挪动悬浮小窗失败：${why}。也可以提示用户手动挪开小窗。`;
+  }
+  const moved = Array.isArray(res.moved) ? res.moved : [];
+  if (!moved.length) {
+    return `已按 ${place} 挪动悬浮小窗，但没取到新坐标，请调用 screen_read 重新读一遍确认。`;
+  }
+  const parts = [];
+  for (let i = 0; i < moved.length; i++) {
+    const m = moved[i] || {};
+    parts.push(`@(${Math.round(m.x)},${Math.round(m.y)}) ${m.width}×${m.height}`);
+  }
+  return `已把 ${moved.length} 个悬浮小窗挪到 ${place}，新坐标：${parts.join('；')}。请再调用 screen_read 重新读被它压过的区域。`;
+}
+
+/** 悬浮小窗坐标说明行：没有可见小窗时返回空串，调用方就不追加这一行。 */
+function floatBarRectLines() {
+  if (!floatBarHooks || typeof floatBarHooks.rects !== 'function') return '';
+  let rects = null;
+  try {
+    rects = floatBarHooks.rects();
+  } catch {
+    return '';
+  }
+  if (!Array.isArray(rects) || !rects.length) return '';
+  let text = '';
+  for (let i = 0; i < rects.length; i++) {
+    const r = rects[i] || {};
+    text += `\n悬浮小窗：@(${Math.round(r.x)},${Math.round(r.y)}) ${r.width}×${r.height}（置顶；它压住的区域不代表没有内容，先调用 float_bar_move 挪开再读）`;
+  }
+  return text;
+}
+
+// 用系统默认程序打开文件（表格走到 WPS 这一步）。延迟引入 electron：本文件在非 Electron 环境也会被加载，顶层不能 require electron。
+// 成功返回空串，失败返回错误说明字符串。
+async function openWithSystem(absPath) {
+  try {
+    const { shell } = require('electron');
+    const r = await shell.openPath(String(absPath == null ? '' : absPath));
+    return r ? String(r) : '';
+  } catch (err) {
+    return err && err.message ? err.message : String(err);
+  }
+}
 
 // [铆钉优化] 危险桌面操作（删除、发送、付款、永久删除等）先问用户，由 agentLoop 接住后弹选项。其他 AI 请勿删除或改成默认放行
 const RISK_ALLOW = '允许这一步';
@@ -358,6 +450,19 @@ function allToolsSpec() {
     {
       type: 'function',
       function: {
+        name: 'float_bar_move',
+        description: '同时只能挪动本程序自己的悬浮小窗；该小窗是置顶的，会挡住屏幕上的内容。如果你要看、要点的地方被小窗挡住，或者 screen_read 的结果里提示某区域被小窗覆盖，就先用这个工具把小窗挪开，再用 screen_read 重新读一遍，不要因为被挡住就认为那里没有内容。',
+        parameters: {
+          type: 'object',
+          properties: {
+            place: { type: 'string', description: '挪到哪个方位：opposite（挪到对角，最常用、优先用这个，默认）、tl、tr、bl、br、left、right' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'ui_act',
         description: '按【屏幕文字】里的控件编号 [c编号] 直接操作控件（Windows UI 自动化），比按坐标点击更准，控件被挡住也能按。有控件编号时优先用它。结果带【操作后】画面变化。',
         parameters: {
@@ -504,6 +609,51 @@ function allToolsSpec() {
             key: { type: 'string', description: '键名，组合用加号连接' }
           },
           required: ['key']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'sheet_read_image',
+        description: '把一张表格图片交给本地看图模型，读出行数、列数、合并单元格和每格文字，返回一段 JSON 文本：{"rows":行数,"cols":列数,"merges":[{"r1","c1","r2","c2"}],"cells":[["文字",""],...]}。行列号与合并区域都从 0 起算，空单元格是空字符串。要把表格落成文件，就把这段 JSON 原样交给 sheet_write。',
+        parameters: {
+          type: 'object',
+          properties: {
+            imagePath: { type: 'string', description: '表格图片的路径，绝对路径最稳（png/jpg/bmp/webp 等）' }
+          },
+          required: ['imagePath']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'sheet_write',
+        description: '把 sheet_read_image 读出的表格 JSON 写成 .xlsx 文件（可直接用 WPS/Excel 打开）。先校验行列与 cells 对不对得上，再把 merges 里的合并单元格一起补上，返回写出的绝对路径。',
+        parameters: {
+          type: 'object',
+          properties: {
+            spec: { type: 'object', description: '表格数据，形如 {"rows":,"cols":,"merges":[...],"cells":[[...]]}；也可以直接传它的 JSON 字符串，两种都收' },
+            outPath: { type: 'string', description: '要写出的 .xlsx 路径，绝对路径最好；没写 .xlsx 后缀会自动补上' }
+          },
+          required: ['spec', 'outPath']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'sheet_to_wps',
+        description: '读一张表格图片，把表里的内容直接送进 WPS 表格（一步到位，不用模型自己抄 JSON）。mode="paste"：把内容以制表符分隔的文本写进系统剪贴板，之后用 keyboard_key 按 ctrl+v 粘进 WPS 当前活动单元格。mode="open"（默认）：先把表格写成 .xlsx，再用系统默认程序（WPS）打开该文件。合并单元格 TSV 表示不了，paste 模式下需要用户手动合并。',
+        parameters: {
+          type: 'object',
+          properties: {
+            imagePath: { type: 'string', description: '表格图片的路径，绝对路径最稳（png/jpg/bmp/webp 等）' },
+            outPath: { type: 'string', description: 'mode="open" 时要写出的 .xlsx 路径，绝对路径最好；不填就写到桌面' },
+            mode: { type: 'string', description: 'open（默认）先写 xlsx 再用 WPS 打开；paste 把内容放进剪贴板，再用 Ctrl+V 粘进 WPS 当前活动单元格' }
+          },
+          required: ['imagePath']
         }
       }
     }
@@ -1156,10 +1306,113 @@ async function execTool(workspace, snap, name, args, onEvent, extra, signal, lan
       if (wait) await new Promise((r) => setTimeout(r, wait));
       desktopHand.hold();
       try {
-        return screenText.formatBlock(await screenText.observe({ threshold: 0 }));
+        // 小窗是置顶的：结果末尾附上它的坐标，模型才知道哪块被压着、不代表没内容
+        return `${screenText.formatBlock(await screenText.observe({ threshold: 0 }))}${floatBarRectLines()}`;
       } catch (err) {
         return `识别屏幕失败：${err && err.message ? err.message : err}`;
       }
+    }
+    // 看图建表：把表格图片读成 JSON，再落成 .xlsx。图片/数据有问题时返回中文说明，不要抛到崩。
+    if (name === 'sheet_read_image') {
+      const imagePath = String(args.imagePath || args.path || '').trim();
+      if (!imagePath) return '要读表格图片，请给出 imagePath（图片路径）。';
+      let abs = imagePath;
+      if (!path.isAbsolute(abs)) abs = path.resolve(abs);
+      let st = null;
+      try {
+        st = fs.statSync(abs);
+      } catch (e) {
+        st = null;
+      }
+      if (!st || !st.isFile()) return `图片不存在或不是文件：${abs}。请给出图片的绝对路径。`;
+      onEvent({ type: 'tool', name, status: 'running', text: `读表格图片 ${path.basename(abs)}` });
+      try {
+        const spec = await sheetCore.parseSheetImage(abs, { signal, onWait: visionWait(onEvent) });
+        const mergeCount = Array.isArray(spec.merges) ? spec.merges.length : 0;
+        return `表格图片已读成 JSON（${spec.rows} 行 × ${spec.cols} 列，${mergeCount} 处合并单元格）。要落成文件就把下面这段 JSON 原样交给 sheet_write：\n${JSON.stringify(spec)}`;
+      } catch (err) {
+        return `读表格图片失败：${err && err.message ? err.message : err}`;
+      }
+    }
+    if (name === 'sheet_write') {
+      let spec = args.spec;
+      if (typeof spec === 'string') {
+        const raw = spec.trim();
+        try {
+          spec = JSON.parse(raw);
+        } catch (err) {
+          return `spec 是字符串但不是合法 JSON：${err && err.message ? err.message : err}`;
+        }
+      }
+      if (!sheetCore.isSheetSpecOk(spec)) {
+        return '表格数据不合法：需要 { rows, cols, cells }，cells 要是 rows 行、每行正好 cols 格的二维数组（merges 可省略）。请先用 sheet_read_image 读图，别手写行列数。';
+      }
+      const outPath = String(args.outPath || args.path || '').trim();
+      if (!outPath) return '要生成表格文件，请给出 outPath（.xlsx 的路径）。';
+      onEvent({ type: 'tool', name, status: 'running', text: '生成表格文件' });
+      try {
+        const abs = await sheetCore.writeSheetFile(spec, outPath);
+        const mergeCount = Array.isArray(spec.merges) ? spec.merges.length : 0;
+        return `已生成表格文件：${abs}（${spec.rows} 行 × ${spec.cols} 列，${mergeCount} 处合并单元格）。可以直接用 WPS 或 Excel 打开核对。`;
+      } catch (err) {
+        return `生成表格文件失败：${err && err.message ? err.message : err}`;
+      }
+    }
+    // 表格图片直接进 WPS：paste 走剪贴板（模型再用 keyboard_key 按 Ctrl+V），open 先写 xlsx 再用系统默认程序打开。
+    if (name === 'sheet_to_wps') {
+      const imagePath = String(args.imagePath || '').trim();
+      if (!imagePath) return '没有给表格图片的路径。';
+      onEvent({ type: 'tool', name, status: 'running', text: `读表格图片 ${path.basename(imagePath)}` });
+      let spec = null;
+      try {
+        spec = await sheetCore.parseSheetImage(imagePath, { signal, onWait: visionWait(onEvent) });
+      } catch (err) {
+        return `读表格图片失败：${err && err.message ? err.message : err}`;
+      }
+      const mergeCount = Array.isArray(spec.merges) ? spec.merges.length : 0;
+      const mode = String(args.mode || 'open').trim().toLowerCase();
+      if (mode === 'paste') {
+        // 内容进剪贴板，交给模型的 keyboard_key 按 Ctrl+V 粘进 WPS
+        let tsv = '';
+        try {
+          tsv = sheetCore.specToTsv(spec);
+        } catch (err) {
+          return `表格数据不合法：${err && err.message ? err.message : err}`;
+        }
+        try {
+          require('electron').clipboard.writeText(tsv);
+        } catch (err) {
+          return `写剪贴板失败：${err && err.message ? err.message : err}`;
+        }
+        return `已识别 ${spec.rows} 行 × ${spec.cols} 列，内容已放进剪贴板。请先点进 WPS 表格左上角那个单元格，再用 keyboard_key 按 ctrl+v 粘贴。合并单元格需要手动设置。`;
+      }
+      let outPath = String(args.outPath || args.path || '').trim();
+      if (!outPath) outPath = path.join(os.homedir(), 'Desktop', '表格-' + Date.now() + '.xlsx');
+      let abs = '';
+      try {
+        abs = await sheetCore.writeSheetFile(spec, outPath);
+      } catch (err) {
+        return `生成表格文件失败：${err && err.message ? err.message : err}`;
+      }
+      // 打开失败不影响已经写好的文件，只在返回文案里附一句提醒
+      const openErr = await openWithSystem(abs);
+      const tail = openErr ? ' 未能自动打开，请手动打开该文件。' : '';
+      return `已把表格写成 xlsx：${abs}（${spec.rows} 行 × ${spec.cols} 列，合并 ${mergeCount} 处）。${tail}`;
+    }
+    if (name === 'float_bar_move') {
+      const place = args.place || 'opposite';
+      // 没注册 hooks（小窗没起来、或主进程没接线）时给模型一段可读说明，不要抛错
+      if (!floatBarHooks || typeof floatBarHooks.move !== 'function') {
+        return '当前没有可用的悬浮小窗控制，我没法替你挪小窗。\n也可以提示用户手动挪开小窗，挪完再调用 screen_read 重新读一遍被挡的区域。';
+      }
+      onEvent({ type: 'tool', name, status: 'running', text: `把悬浮小窗挪到 ${place}` });
+      let moved = null;
+      try {
+        moved = floatBarHooks.move(place);
+      } catch (err) {
+        return `挪动悬浮小窗失败：${err && err.message ? err.message : err}。也可以提示用户手动挪开小窗。`;
+      }
+      return describeFloatBarMove(place, moved);
     }
     if (name === 'ui_act') return guardDesktop(name, args, () => desktopHand.uiAct(args.id, args.action, args.text));
     if (name === 'agi_note') {
@@ -1173,7 +1426,7 @@ async function execTool(workspace, snap, name, args, onEvent, extra, signal, lan
       onEvent({ type: 'tool', name, status: 'running', text: '全屏截图并识别屏幕文字（本地 OCR）' });
       const shot = await desktopHand.captureScreen();
       if (!shot.ok) return shot.message;
-      return `${shot.text || '【屏幕文字】本地 OCR 未能返回识别结果。'}\n截图已保存：${shot.path}\n画面 ${shot.frameId || ''} ${shot.width}×${shot.height}，左上角 0,0 对应系统坐标 (${shot.originX}, ${shot.originY})。`;
+      return `${shot.text || '【屏幕文字】本地 OCR 未能返回识别结果。'}\n截图已保存：${shot.path}\n画面 ${shot.frameId || ''} ${shot.width}×${shot.height}，左上角 0,0 对应系统坐标 (${shot.originX}, ${shot.originY})。${floatBarRectLines()}`;
     }
     if (name === 'clipboard_look') {
       onEvent({ type: 'tool', name, status: 'running', text: '读取剪贴板图片' });
@@ -1409,10 +1662,10 @@ function buildSystemPrompt({
       : `\n用户只和你说话，规划模块不能先读需求。用户还没说开始时，禁止调用 call_worker。必须先向用户复述目标、范围、约束、验收，结尾写：确认无误后回复「开始」，我再动手。用户已经说了开始之后，立刻调用 call_worker，role 填 code，不要先插规划。若已经派过规划，规划结果只用来指挥代码，不符合就改清再派，禁止把没做完的方案回复给用户。\n`)
     : '';
   const actRuleEn = agiOn
-    ? 'AGI is on. The user only accepts the result. You finish everything else yourself and do not wait for start. Permissions are high and this turn is unlimited. Call screen_read first, then do the files, commands, and desktop actions yourself. Open apps and web pages with the keyboard and mouse only. Do not use run_command to run start, Start-Process, or chrome.exe. Do not call call_worker. When finished, tell the user what to check.'
+    ? 'AGI is on. The user only accepts the result. You finish everything else yourself and do not wait for start. Permissions are high and this turn is unlimited. Call screen_read first, then do the files, commands, and desktop actions yourself. Open apps and web pages with the keyboard and mouse only. Do not use run_command to run start, Start-Process, or chrome.exe. Do not call call_worker. If the always-on-top mini window of this app covers what you need to see or click, or the screen_read result warns that an area is covered by the mini window, call float_bar_move first to move it aside, then screen_read again; never claim that area has no content just because it is covered. When finished, tell the user what to check.'
     : 'If the user has not said start this turn, a restatement that asks them to reply 开始 is a complete reply. Do not emit a tool call just to start work. After the user says start, or when the turn is only a lookup, a reply that needs a lookup or an edit must include a tool call. A plan with no tool call does not run. A one-line note may sit in the same reply as the tool call.';
   const actRuleZh = agiOn
-    ? 'AGI 开着时，用户只管验收，其他事情你全部自己做完，不要等「开始」，不要复述完就停。权限很高，这一轮全解放。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。打开软件和网页只用键鼠，禁止 run_command 去 start、Start-Process 或启动 chrome.exe。禁止 call_worker。做完只告诉用户验收什么。'
+    ? 'AGI 开着时，用户只管验收，其他事情你全部自己做完，不要等「开始」，不要复述完就停。权限很高，这一轮全解放。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。打开软件和网页只用键鼠，禁止 run_command 去 start、Start-Process 或启动 chrome.exe。禁止 call_worker。看屏幕时若发现本程序的悬浮小窗挡住了你要看或要点的地方，或者 screen_read 结果里提示某区域被小窗覆盖，先调用 float_bar_move 把它挪开，再用 screen_read 重新读一遍；不要因为被挡住就断言那个区域没有内容。做完只告诉用户验收什么。'
     : '用户还没说开始时，禁止派代码。提问、讲现象、报 bug 由大脑自己查完再回答。要改文件但还没说开始时，复述并请用户回复「开始」就是完整回复。用户已经说了开始之后，派代码必须调用 call_worker。可以在同一次回复里附一句说明，但不能只有说明。';
   // [铆钉优化] 能调用工具的模型由大脑自己调用 generate_media 生图；zbaing 本地引擎不会调用工具，仍按开口前自动生成的结果回答。其他 AI 请勿改回「无需调用工具」
   const genFailNote = enPrompt
@@ -1426,7 +1679,37 @@ function buildSystemPrompt({
       ? `\nTo generate images/videos/3D/docs, call generate_media yourself (kind + a full prompt you write from the conversation). It uses the generation model in the model combo. It does not need the user to say start, and must not be handed to the code worker or run through run_command / sd-cli. One call per image. After it returns, tell the user the file path. Never say you have no image tool.${genFailNote}\n`
       : `\n要生图/生视频/生3D/生文档时，你自己调用 generate_media：kind 填类型，prompt 写你按对话整理好的完整描述（主体、风格、构图、颜色）。它用「模型组合」里挂的生成模型，不需要用户说「开始」，禁止派给代码模块、禁止用 run_command 去跑 sd-cli。要几张就调用几次。返回后把文件路径告诉用户。禁止说自己没有生图工具。${genFailNote}\n`);
   if (enPrompt) {
-    return `${langLine}${personaSection}${zbaingSection}${visionSection}${genNote}${memoryBlock}${askHint}
+    return `${langLine}[RED LINE #1 — DO NOT TAKE OVER THE USER'S AUTHORITY]
+- Decisions and actions the user has not made yet belong to the user, not to you. What the user uses, binds, fills in, connects or picks is the user's call; you have no right to decide it for them. Typical case: the user has just created a UI in Unity and the component references are still empty, parameters are not filled in, the configuration is not chosen — in that case you are forbidden from finding that component yourself, judging which one to bind, and binding, assigning or fixing it on your own. That is not "lending a hand", that is taking the user's authority.
+- Before doing anything the user did not explicitly ask for, you must ask first: say what you found, what you plan to do, which file or object it touches, and why. Do the work only after the user allows it; if the user does not allow it, do not do it.
+- Never do it first and report afterwards. A report afterwards is not permission.
+- This rule has the same force as [HIGHEST PRIORITY — DO NOT CROSS] and stands with it at the very front of this prompt.
+- Exception: this rule does not apply while AGI is on. AGI mode may ignore it.
+[HIGHEST PRIORITY — DO NOT CROSS]
+- Only change the files and content the user explicitly named.
+- Never change features, fields, wording or behavior the user did not name, no matter how obviously they seem to need changing.
+- If you notice something else that should change, stop and ask the user with ask_user: say what you found, what you want to change, and why. Only act after the user agrees.
+- Never change first and report afterwards. A report is not permission.
+- This rule outranks every other entry in this prompt.
+${personaSection}${zbaingSection}${visionSection}${genNote}When you need to offer multiple clickable start options, you MUST use exactly this marker block:
+[开工选项]
+1. <a short metaphor + the concrete thing to do>
+2. <a short metaphor + the concrete thing to do>
+[/开工选项]
+Otherwise offer only a single "Start" button. Never use free formats such as ①, 1., •, 甲乙丙, "A or B", or "方案一：" as start options. Use the marker block only when restating a requirement and waiting for the user to reply "开始". Do not use metaphors in the body restatement; use them only in the closing summary.
+Reply style (mandatory):
+1. Answer in the first sentence. Put the conclusion first.
+2. Do not restate the user's request, do not describe your process, do not explain what you searched or read.
+3. Answer only what was asked. Do not expand, do not drift to unrelated topics.
+4. Be short by default: one or two sentences when that is enough.
+5. When reporting file changes, always list which files you changed (file name plus one short clause each). Do not paste code, do not explain line by line.
+6. Only when the user must click a button or choose an option, say which one to click.
+Defensive programming ban (mandatory):
+1. Implement only what is explicitly required or written in the dispatch/task. Do not add unrequested branches, fallbacks, compatibility shims, default values, heuristics, switches/parameters, or abstraction layers "just in case", and no "while I'm at it" optimizations.
+2. When information is missing, stop, call ask_user to ask the user, and wait for the user's answer before changing anything; do not invent business semantics to fill the gap yourself.
+3. Do not wrap already-correct logic in extra exception-swallowing protection.
+4. Comments explain what the code does and why only; never add self-locking warnings like "other AIs, do not delete".
+${memoryBlock}${askHint}
 Workspace: ${workspace || '(none)'}
 You may read absolute paths on this machine (not limited to the workspace). list_dir / read_file / search_text / map_lookup / semantic_search accept absolute paths. Do not read other AI skills or rules: .cursor, .claude, AGENTS.md, CLAUDE.md, GEMINI.md, or any SKILL.md outside this app's skills folder and the project's .simple/skills (legacy .sinpo/skills). Follow only the selected skill below.
 Relevant modules may already appear under "项目地图" in the user message. Use goto_definition for a known symbol name, semantic_search when you only know the intent, map_lookup for the module method list, and search_text for an exact string. After write_file, a 【类型检查】 block is real compiler output for that file; fix those errors before finishing.
@@ -1447,7 +1730,37 @@ Source files must be UTF-8. Never produce mojibake.
 ${ruleText || 'None'}
 ${skillText}${handoff}${planLine}${houseStyle.promptBlock(enPrompt)}${brainPressure.promptBlock(workspace, enPrompt, agiOn)}`;
   }
-  return `${langLine}${personaSection}${zbaingSection}${visionSection}${genNote}${memoryBlock}${askHint}
+  return `${langLine}【第一红线·不得和用户抢权】
+- 用户还没做的决定、还没做的动作，属于用户，不属于你。用户自己决定用什么、绑什么、填什么、连什么、选什么，你没有权力替他定。典型场景：用户在 Unity 里新建了界面，组件引用还空着、参数还没填、配置还没选——这时禁止你自己去找那个组件、自己判断该绑哪一个就直接绑上、赋值、改好。这不是「顺手帮忙」，这是抢用户的权力。
+- 做任何用户没有明确要求你做的事之前，必须先请示：说清发现了什么、打算做什么、动哪里、为什么。用户允许了才能做；用户不允许就不做。
+- 禁止先做了再报告。事后汇报不算获得允许。
+- 本条与【最高优先级·不得越过】同等效力，一起排在提示词最前面。
+- 例外：AGI 开着时本条不适用，AGI 模式可以无视本条。
+【最高优先级·不得越过】
+- 只改用户明确点名的文件和内容。
+- 用户没点名的功能、字段、文案、行为，一律不准自己判断后动手改，包括「顺手改」「看起来也该改」「显然有问题」这类情况。
+- 发现别处需要改，必须停下，用 ask_user 问用户：发现了什么、想改什么、为什么。得到同意才动。
+- 禁止先改完再报告。事后报告不算许可。
+- 本条优先于本提示词其他所有条目。
+${personaSection}${zbaingSection}${visionSection}${genNote}需要给出多个可点开工选项时，必须写成下面这种标记块，前后标记都不能少：
+[开工选项]
+1. 一句比喻＋具体要做的事
+2. 一句比喻＋具体要做的事
+[/开工选项]
+否则只给一颗「开始」。禁止用 ①、1.、•、甲乙丙、A 还是 B、方案一： 这类自由格式当开工选项。标记块只在复述完需求、等用户回复「开始」时使用；正文复述不要用比喻，只有收尾总结用比喻。
+回答与汇报口径（强制）：
+1. 第一句直接给答案，结论在前。
+2. 不复述用户的需求，不写过程，不解释查了什么、读了什么。
+3. 只回答被问到的，不扩展、不跑题、不延伸到无关内容。
+4. 默认短：能一两句就说一两句。
+5. 汇报改动时，必须列清改了哪些文件（文件名＋一句话说明改了什么），不贴代码、不逐条讲解。
+6. 只有需要用户点按钮或做选择时，才说明点什么。
+禁止防御性编程（强制）：
+1. 只实现明确要求或派单写明的内容。禁止擅自新增没要求的分支、兜底、回退、兼容、默认值、启发式、开关/参数/抽象层，以及「以防万一」「顺手优化」。
+2. 信息缺口先停下，调用 ask_user 问用户，等到用户答复后再动手；不自行补业务语义。
+3. 不得给已经正确的逻辑额外套吞异常的保护壳。
+4. 注释只说明功能与原因，禁止写「其他 AI 请勿删除」这类自我加锁警告。
+${memoryBlock}${askHint}
 当前工作目录：${workspace || '（未选择）'}
 你可以读取本机绝对路径（不限于当前工作目录）。list_dir / read_file / search_text / map_lookup / semantic_search 都支持绝对路径。禁止读取其他 AI 的技能和规则：.cursor、.claude、AGENTS.md、CLAUDE.md、GEMINI.md，以及不在本程序 skills 目录、项目 .simple/skills（旧目录 .sinpo/skills）里的 SKILL.md。只遵守下面选中的技能。
 已知符号名用 goto_definition 跳到定义。只知道意图、不知道名字时用 semantic_search。模块方法列表用 map_lookup。精确字符串用 search_text。write_file 返回里的【类型检查】是该文件的编译错误，改到通过再收尾。
@@ -2310,7 +2623,7 @@ async function completeWithFallback(opts) {
   throw lastErr || new Error('模型没有返回内容');
 }
 
-async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, signal, lang, workingMemoryRef, waitForUserAnswer, maxRounds, toolSpec, workers, roleTag, depth, hardRounds, unlimitedRounds, wantPlanning, userOrder, startOrdered }) {
+async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, signal, lang, workingMemoryRef, waitForUserAnswer, maxRounds, toolSpec, workers, roleTag, depth, hardRounds, unlimitedRounds, wantPlanning, userOrder, startOrdered, interjectKey }) {
   const thinkLimit = store.clampAgentRounds(maxRounds != null ? maxRounds : DEFAULT_MAX_ROUNDS);
   const toolLabel = {
     list_dir: '查看目录',
@@ -2387,6 +2700,14 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
   const roundCap = hardRounds > 0 ? hardRounds : (unlimited ? Number.POSITIVE_INFINITY : SAFETY_MAX_ROUNDS);
   for (let round = 0; round < roundCap; round++) {
     if (signal?.aborted) throw new Error('已停止');
+    // 每轮开始先把本会话用户从悬浮栏插话的内容并入消息，让模型下一轮立即看到。
+    // 只排空本会话（interjectKey）的队列，其他会话的队列留着，避免串会话；key 为空时不动任何队列
+    const k = interjectKey == null ? '' : String(interjectKey);
+    const queued = k ? (interjectInbox.get(k) || []) : [];
+    if (k) interjectInbox.delete(k);
+    for (let i = 0; i < queued.length; i++) {
+      messages.push({ role: 'user', content: queued[i] });
+    }
     const brainName = modelCfg.model || modelCfg.name || '主模型';
     const tag = roleTag || 'brain';
     const mustDispatchNow = !agiBrain && (orderedStart || forcedDispatch) && !handedOff && tag === 'brain' && workers && workers.code;
@@ -2721,7 +3042,7 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
             const out = await agentLoop({
               modelCfg: worker,
               messages: [
-                { role: 'system', content: `你是实现模型，不和用户对接。「开始」不约束你，禁止因为用户没说开始而停手或复述。大脑的派单就是开工令，立刻按派单改文件。派单里给出的绝对路径，文件已经存在就先 read_file 要改的那一段，再用 edit_file 把原文替换成新内容（old_string 从读到的内容原样复制，不带行号前缀）；新建文件或几乎整份重写才用 write_file。禁止用 run_command 跑 python/node/powershell 脚本改文件，禁止用它搜代码或列目录（用 search_text、list_dir）。edit_file 返回没找到或出现多次时，重新 read_file 那一段照抄再改。禁止说执行环境找不到，禁止要求把目录加进工作区。禁止因为找不到参考、锚点或生成逻辑而停手；派单里写明的目标就是依据，必须写入派单给出的文件。地图归纳不足时读原代码，不准猜。禁止读取 .cursor、AGENTS.md、CLAUDE.md 以及其他 AI 的技能和规则，只按本程序已选技能和这次派单做。遵循 UTF-8、中文注释和禁止改动范围。这一轮要改多个互不依赖的文件时，一次发出多条 edit_file / write_file，每条一个文件。同一个文件的多处修改按顺序逐条 edit_file。改完只列出这次实际写入的文件，没写进去的不要说改了。${unityCode}${houseStyle.promptBlock(false)}` },
+                { role: 'system', content: `你是实现模型，不和用户对接。「开始」不约束你，禁止因为用户没说开始而停手或复述。大脑的派单就是开工令，立刻按派单改文件。派单里给出的绝对路径，文件已经存在就先 read_file 要改的那一段，再用 edit_file 把原文替换成新内容（old_string 从读到的内容原样复制，不带行号前缀）；新建文件或几乎整份重写才用 write_file。禁止用 run_command 跑 python/node/powershell 脚本改文件，禁止用它搜代码或列目录（用 search_text、list_dir）。edit_file 返回没找到或出现多次时，重新 read_file 那一段照抄再改。禁止说执行环境找不到，禁止要求把目录加进工作区。禁止因为找不到参考、锚点或生成逻辑而停手；派单里写明的目标就是依据，必须写入派单给出的文件。地图归纳不足时读原代码，不准猜。禁止读取 .cursor、AGENTS.md、CLAUDE.md 以及其他 AI 的技能和规则，只按本程序已选技能和这次派单做。遵循 UTF-8、中文注释和禁止改动范围。这一轮要改多个互不依赖的文件时，一次发出多条 edit_file / write_file，每条一个文件。同一个文件的多处修改按顺序逐条 edit_file。改完只列出这次实际写入的文件，没写进去的不要说改了。只实现派单写明的内容，派单没写的不改，禁止擅自新增没要求的分支、兜底、回退、兼容、默认值、启发式、开关/参数/抽象层，以及「以防万一」「顺手优化」。只改派单点名的文件与内容，派单没点名的一律不动；发现别处也该改，只在报告里列出来，不自己动手；派单存在信息缺口就停下，如实报给大脑说明缺口（发现了什么、缺什么、打算怎么处理、为什么），不许自己拍板继续，等大脑带回用户同意再写；不得给已经正确的逻辑额外套吞异常的保护壳；注释只说明功能与原因，禁止写「其他 AI 请勿删除」这类自我加锁警告。${unityCode}${houseStyle.promptBlock(false)}` },
                 { role: 'user', content: task }
               ],
               workspace,
@@ -2737,7 +3058,8 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
               toolSpec: toolsFor('worker'),
               workers: null,
               roleTag: 'code',
-              depth: (depth || 0) + 1
+              depth: (depth || 0) + 1,
+              interjectKey
             });
             result = String(out || '').trim().slice(0, 2000) || '实现模型没有返回说明。';
             result += '\n\n【交给大脑判断】文件还没按需求写入时，禁止把这段告诉用户。用你已经读到的绝对路径和内容把改法写进新 task，立刻再派代码，直到写入。写入且符合需求后，才向用户说是你做成的。中途部下写错的，完成说明里点名。';
@@ -3114,7 +3436,9 @@ async function runTurn({
   waitForUserAnswer,
   extraFolders,
   maxAgentRounds,
-  unlimitedRounds
+  unlimitedRounds,
+  // 会话键：多会话各自一条插话队列，runTurn 不解析它的含义，只当字符串键用
+  interjectKey
 }) {
   // 一下命令就停住虚拟光标，这轮结束再跟着，避免写代码时置顶窗拖死系统鼠标
   try { require('./desktop-hand').hold(); } catch { /* 桌面手未就绪时忽略 */ }
@@ -3600,7 +3924,8 @@ async function runTurn({
       depth: 0,
       wantPlanning,
       userOrder: userText,
-      startOrdered: turnStart
+      startOrdered: turnStart,
+      interjectKey
     });
   } catch (e) {
     if (compact.isContextOverflowError(e)) {
@@ -3637,7 +3962,8 @@ async function runTurn({
         depth: 0,
         wantPlanning,
         userOrder: userText,
-        startOrdered: turnStart
+        startOrdered: turnStart,
+        interjectKey
       });
     } else {
       throw e;
@@ -3754,6 +4080,9 @@ async function runTurn({
   return result;
   } finally {
     try { require('./desktop-hand').release(); } catch { /* 没开桌面操作时不用收尾 */ }
+    // 轮次结束（完成/出错/被停）只清本会话的插话队列，别把上一轮的提示带进本会话的下一次；
+    // 其他会话的队列留着，不能被本会话清掉
+    if (interjectKey) interjectInbox.delete(String(interjectKey));
   }
 }
 
@@ -3814,4 +4143,4 @@ function parseProjectMapJsonArray(text) {
 }
 
 
-module.exports = { runTurn, listSkills, listRules, toolsSpec, describeProjectMap };
+module.exports = { runTurn, listSkills, listRules, toolsSpec, describeProjectMap, pushInterjection, setFloatBarHooks };

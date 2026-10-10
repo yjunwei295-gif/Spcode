@@ -134,7 +134,18 @@ async function persistModels(currentId) {
   refreshQuotaBar();
 }
 
-const quotaMem = { key: '', at: 0, payload: null, seq: 0 };
+// source：当前额度条数值来源，'provider' 表示厂商返回值，'manual' 表示用户手填钱包快照
+// inflightSeq：记录是「哪一次请求」占用 inflight，避免旧请求复位新请求的标记（纯内存，不落盘）
+const quotaMem = { key: '', at: 0, payload: null, seq: 0, blocked: {}, inflight: false, inflightSeq: 0, source: null };
+// 厂商额度值保活时长：正确厂商值在 30 分钟内优先于手填钱包，避免对话中被手填值顶掉
+const PROVIDER_QUOTA_KEEP_MS = 30 * 60 * 1000;
+// 开工选项按钮文案上限：超过则截断显示（补省略号），全文仍进 title
+const MAX_START_OPTION_LABEL = 120;
+// 开工方案条数的安全上限：正常「有几个方案出几个按钮」，超过 12 条说明是异常长列表，只取前 12 条防止按钮区被撑爆
+const START_OPTION_MAX_COUNT = 12;
+// 开工选项专用标记：AI 必须用它给出可点击的开工方案，其它自由格式一律不认
+const START_OPTION_MARKER_OPEN = '[开工选项]';
+const START_OPTION_MARKER_CLOSE = '[/开工选项]';
 
 function formatQuotaMoney(n, currency) {
   if (!Number.isFinite(n)) return '—';
@@ -160,7 +171,23 @@ function currentQuotaKey() {
 }
 
 function quotaCanShow(b) {
-  return !!(b && b.available && Number.isFinite(b.used) && Number.isFinite(b.total) && b.total > 0);
+  // 放宽：厂商可能只回一个剩余额度（如 DeepSeek 的 balance_infos[0].total_balance），
+  // 没有 used/total 也允许显示；缺字段时 paintQuotaBar 只渲染 remaining
+  return !!(b && b.available === true && Number.isFinite(b.remaining));
+}
+
+// 当前额度条上是否已有「本厂商」的可用厂商值：来源必须是 provider 且该值能显示
+function hasProviderQuota(key) {
+  if (!key) return false;
+  if (quotaMem.source !== 'provider') return false;
+  if (quotaMem.key !== key) return false;
+  return quotaCanShow(quotaMem.payload);
+}
+
+// 厂商值是否仍在保活期内：只有还新鲜才拒绝被手填值覆盖
+function providerQuotaStillFresh(key) {
+  if (!hasProviderQuota(key)) return false;
+  return Date.now() - quotaMem.at < PROVIDER_QUOTA_KEEP_MS;
 }
 
 function walletSnapshotOf(p) {
@@ -198,55 +225,104 @@ function paintQuotaBar(b) {
   });
 }
 
-async function refreshQuotaBar(force) {
+async function refreshQuotaBar(force, opts) {
+  const isAuto = !!(opts && opts.auto);
   const key = currentQuotaKey();
   if (!key) {
     quotaMem.key = '';
     quotaMem.payload = null;
+    quotaMem.source = null;
     paintQuotaBar(null);
     return;
   }
   const p = providerById(key);
+  // 1) 先算出 manual 备用值（用户手填的钱包快照），只算不画；厂商值查不到时用它兜底
   const manual = walletSnapshotOf(p);
-  if (manual) {
-    quotaMem.key = key;
-    quotaMem.at = Date.now();
-    quotaMem.payload = manual;
-    paintQuotaBar(manual);
-    return;
+  // 2) 自动同步（对话结束）：该厂商已知查不到余额，或已有请求在飞，直接放弃，不发请求也不动界面
+  if (isAuto) {
+    if (quotaMem.blocked[key]) return;
+    if (quotaMem.inflight) return;
   }
   const now = Date.now();
+  // 3) 60 秒内存缓存：非强制刷新且未过期，直接用缓存结果，不再请求厂商
   if (!force && quotaMem.key === key && now - quotaMem.at < 60000) {
     paintQuotaBar(quotaMem.payload);
     return;
   }
   const seq = ++quotaMem.seq;
+  // 4) 非自动路径（手动刷新/切模型/钱包保存/启动）进入请求前清掉标记，允许重试一次
+  if (!isAuto) delete quotaMem.blocked[key];
+  // 5) 标记请求在飞，并记下占用者 seq，供 finally 判断是否该由自己复位
+  quotaMem.inflight = true;
+  quotaMem.inflightSeq = seq;
   try {
     const r = await api.fetchAccountBalance(key);
     if (seq !== quotaMem.seq) return;
-    const payload = quotaCanShow(r) ? r : null;
+    if (quotaCanShow(r)) {
+      // 6) 厂商值可用：写入缓存并以厂商值显示，来源记为 provider，同时清掉该 key 的失败标记
+      quotaMem.key = key;
+      quotaMem.at = Date.now();
+      quotaMem.payload = r;
+      quotaMem.source = 'provider';
+      delete quotaMem.blocked[key];
+      paintQuotaBar(r);
+      return;
+    }
+    // 6) 厂商这次没给可用值（available:false 或 remaining 非有限数）：
+    //    若已有仍在保活期内的正确厂商值，保留内存与顶部显示不动，不画手填值
+    if (providerQuotaStillFresh(key)) {
+      // 自动路径下仍照原样记标记，保持原有防重入行为
+      if (isAuto) quotaMem.blocked[key] = true;
+      return;
+    }
+    // 6.1) 没有可保留的厂商值（或已超过 30 分钟未刷新）：有 manual 就画 manual，否则隐藏额度条
     quotaMem.key = key;
     quotaMem.at = Date.now();
-    quotaMem.payload = payload;
-    paintQuotaBar(payload);
+    quotaMem.payload = manual;
+    quotaMem.source = manual ? 'manual' : null;
+    paintQuotaBar(manual);
+    // 自动路径下「查不到」也要记标记，避免每轮对话都白请求一次
+    if (isAuto) quotaMem.blocked[key] = true;
   } catch {
+    // 7) 请求异常：自动路径下先记标记；再判断是否保留已查到的正确厂商值
+    if (isAuto) quotaMem.blocked[key] = true;
     if (seq !== quotaMem.seq) return;
+    // 仍有保活期内的厂商值：保留内存与顶部显示不动，不画手填值
+    if (providerQuotaStillFresh(key)) return;
+    // 7.1) 无可保留厂商值：有 manual 就画 manual，无 manual 则隐藏额度条
     quotaMem.key = key;
     quotaMem.at = Date.now();
-    quotaMem.payload = null;
-    paintQuotaBar(null);
+    quotaMem.payload = manual;
+    quotaMem.source = manual ? 'manual' : null;
+    paintQuotaBar(manual);
+  } finally {
+    // 8) 只有自己那次请求仍是最新才复位 inflight，避免并发时旧请求复位新请求的标记导致同步卡死
+    if (quotaMem.inflightSeq === seq) quotaMem.inflight = false;
   }
 }
 
 function ingestProviderBalance(providerId, balance) {
   const key = currentQuotaKey();
   if (!providerId || providerId !== key) return;
-  if (walletSnapshotOf(providerById(key))) return;
-  const payload = quotaCanShow(balance) ? balance : null;
+  const manual = walletSnapshotOf(providerById(key));
+  if (quotaCanShow(balance)) {
+    // 厂商值优先写入内存并显示，来源记为 provider（字段解析沿用上游传来的 balance）
+    quotaMem.key = key;
+    quotaMem.at = Date.now();
+    quotaMem.payload = balance;
+    quotaMem.source = 'provider';
+    delete quotaMem.blocked[key];
+    paintQuotaBar(balance);
+    return;
+  }
+  // 厂商值不可用或缺失：若仍有保活期内的正确厂商值，保留内存与顶部显示不动
+  if (providerQuotaStillFresh(key)) return;
+  // 回退显示用户手填的钱包快照，来源记为 manual
   quotaMem.key = key;
   quotaMem.at = Date.now();
-  quotaMem.payload = payload;
-  paintQuotaBar(payload);
+  quotaMem.payload = manual;
+  quotaMem.source = manual ? 'manual' : null;
+  paintQuotaBar(manual);
 }
 
 function applyWalletSnapshot(ev) {
@@ -262,6 +338,10 @@ function applyWalletSnapshot(ev) {
       tokensOut: Number(ev.tokensOut) || 0
     };
   }
+  // 账本照旧写回 p.wallet；只有顶部显示的覆盖需要判断
+  // 厂商值优先：当前显示的就是厂商值，且该值仍在 30 分钟保活期内时，不覆盖顶部显示
+  const keepProvider = providerQuotaStillFresh(currentQuotaKey());
+  if (keepProvider) return;
   paintQuotaBar(quotaCanShow(ev) ? ev : walletSnapshotOf(p));
 }
 
@@ -955,6 +1035,8 @@ async function switchToTab(id) {
   renderMessages(true);
   renderQueue();
   syncSendBtn();
+  // 标签切好了就把小窗绑到这个标签页：tabId 用于小窗回传，标题给小窗显示用
+  if (api.floatBind) api.floatBind(String(id), String(tab.title || ''));
   if (isTabSending(tab) && tab.liveAssistant && !tab.liveAssistant.typewriterDone) ensureTypewriter();
 }
 
@@ -1351,13 +1433,199 @@ function renderZbChrome(m, i) {
   </div>`;
 }
 
+// 把方案正文压成一句按钮文字：去首尾空白、去 Markdown 粗体星号与反引号、连续空白压成一个空格，
+// 超过 MAX_START_OPTION_LABEL 才截断补省略号；完整正文由调用方另放在 title / data-start-go
+function summarizeStartOption(body) {
+  let s = String(body == null ? '' : body);
+  s = s.replace(/[*`]/g, '');
+  s = s.replace(/\s+/g, ' ').trim();
+  if (s.length > MAX_START_OPTION_LABEL) s = s.slice(0, MAX_START_OPTION_LABEL) + '…';
+  return s;
+}
+
+// [标记化] 只认 [开工选项] ... [/开工选项] 标记块：从开标记之后逐行取内容，每行当一条可点击方案。
+// 为什么改成只认标记：原来那套自由格式识别（编号块、项目符号块、括号字母、「A 还是 B」等）误判太多，
+// 会把正文里的普通列表、步骤叙述当成开工方案；现在只有 AI 主动写出标记，才认为它真的给了可选方案。
+// 流式输出中收标记可能还没吐出来（j < 0），这时就取到文本末尾，保证半截标记也能先出按钮。
+function parseMarkerStartOptions(text) {
+  const src = String(text == null ? '' : text);
+  const i = src.indexOf(START_OPTION_MARKER_OPEN);
+  // 没有开标记就一条都不认
+  if (i < 0) return [];
+  const from = i + START_OPTION_MARKER_OPEN.length;
+  const j = src.indexOf(START_OPTION_MARKER_CLOSE, from);
+  const inner = j < 0 ? src.slice(from) : src.slice(from, j);
+  // 行首序号规则：每条都是「剥一层」用的，要求序号后面紧跟空白或直接结束，避免把正文开头的字吃掉
+  const prefixRules = [
+    // 阿拉伯数字：1. / 1、 / 1) / 1． / 1）
+    /^\d{1,3}[.、)）．](?=\s|$)/,
+    // 圈号：①~⑫
+    /^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫](?=\s|$)/,
+    // 项目符号：- * • · ‣ ▪ ◦
+    /^[-*•·‣▪◦](?=\s|$)/,
+    // 天干加分隔符：甲｜ / 甲、 / 甲：（分隔符本身就算完，后面直接接正文）
+    /^[甲乙丙丁戊己庚辛壬癸][|｜、：]/,
+    // 光秃秃的天干：只有后面紧跟空白或到头才算序号，否则「甲方」这类词开头会被吃掉
+    /^[甲乙丙丁戊己庚辛壬癸](?=\s|$)/
+  ];
+  const out = [];
+  const lines = inner.split(/\r?\n/);
+  for (let k = 0; k < lines.length; k++) {
+    let line = String(lines[k] == null ? '' : lines[k]).trim();
+    // 空行跳过
+    if (!line) continue;
+    // 每行只剥一层序号，剥完再 trim
+    for (let r = 0; r < prefixRules.length; r++) {
+      const m = line.match(prefixRules[r]);
+      if (m) {
+        line = line.slice(m[0].length).trim();
+        break;
+      }
+    }
+    // 行尾去掉一个句号/中圆点结尾
+    line = line.replace(/[。.]$/, '').trim();
+    // 只有序号没有正文的行不算一条
+    if (!line) continue;
+    out.push(line);
+    if (out.length >= START_OPTION_MAX_COUNT) break;
+  }
+  return out;
+}
+
+// [标记化] 从大脑最后一条复述里认出可选的开工方案，让「开始」按钮拆成多颗可点选项；
+// 现在只认 [开工选项] ... [/开工选项] 标记块，认不出返回空数组
+function parseStartOptions(text) {
+  const src = String(text == null ? '' : text);
+  // 开工选项只认 [开工选项] ... [/开工选项] 标记块内的逐行内容，其它自由格式一律不认
+  const lines = parseMarkerStartOptions(src);
+  // 标记里解析出来的是纯字符串，这里统一转成 { value, label } 给调用方用；
+  // 按钮渲染和小窗（data-value / data-start-go）都按 value、label 取值，形状不能变
+  const out = [];
+  for (let k = 0; k < lines.length; k++) {
+    out.push({ value: lines[k], label: lines[k] });
+  }
+  return out;
+}
+
 // [铆钉优化] 大脑复述完方案等「开始」时给一个确定按钮，点了必定按「开始」开工，不再依赖关键词猜测；其他 AI 请勿删除或改成猜测式
 const START_ASK_RE = /确认无误后回复|回复[「"“]?开始|reply\s*["“]?start/i;
+
+// [铆钉优化] 复述里如果明说本轮没有要改的东西，就不该再给开工按钮，也不该让小窗亮「开始」
+// 判断方式：把各种「没有待改项」的显式中文字面量逐个 IndexOf，命中任一即算没有待改项
+// 刻意不用正则、不用箭头函数、不写链式调用，一个分支一行，方便按说法逐条增删
+function textSaysNoPendingWork(text) {
+  const src = String(text == null ? '' : text);
+  if (!src) return false;
+  if (src.indexOf('没有需要更改的项') >= 0) return true;
+  if (src.indexOf('没有需要修改的项') >= 0) return true;
+  if (src.indexOf('无待更改项') >= 0) return true;
+  if (src.indexOf('没有待更改项') >= 0) return true;
+  if (src.indexOf('待办：无') >= 0) return true;
+  if (src.indexOf('待办: 无') >= 0) return true;
+  if (src.indexOf('待办无') >= 0) return true;
+  if (src.indexOf('当前没有待改') >= 0) return true;
+  if (src.indexOf('没有待改的代码') >= 0) return true;
+  if (src.indexOf('不需要动任何文件') >= 0) return true;
+  if (src.indexOf('无需改动') >= 0) return true;
+  if (src.indexOf('不需要改任何文件') >= 0) return true;
+  return false;
+}
+
+// 只重画某一条消息的开工按钮区（勾选切换后调用）：
+// 重画时勾选态从 m.startPicked 恢复，提交按钮的 disabled 与选项的 .on 态会一起刷新
+function repaintStartGo(m, i, tab) {
+  const box = $('messages') || document;
+  const host = box.querySelector('.msg[data-msg-i="' + i + '"]');
+  if (!host) return;
+  const msgs = tab?.messages || [];
+  let lastIdx = msgs.length - 1;
+  while (lastIdx >= 0 && msgs[lastIdx].role === 'tool-note') lastIdx--;
+  const html = renderStartGo(m, i, lastIdx, tab);
+  const old = host.querySelector('.start-go-row');
+  if (old) {
+    if (html) old.outerHTML = html;
+    else old.remove();
+    return;
+  }
+  if (html) host.insertAdjacentHTML('beforeend', html);
+}
+
 function renderStartGo(m, i, lastIdx, tab) {
-  if (i !== lastIdx || m.stopped || m.askPending || isTabSending(tab)) return '';
-  if (!START_ASK_RE.test(String(m.text || ''))) return '';
+  // 只取这一次正文，闸门和原来的 START_ASK_RE 判定共用同一个字符串，保证两边看的是同一份内容
+  const text = String(m.text || '');
+  // [铆钉优化] 闸门：本轮明说没有待改项时，直接不渲染任何开工按钮（含那颗普通「开始」），
+  // 并沿本文件已有的上报路径把这条消息的 canStart 报成 false、方案为空，让小窗「开始」也保持不亮
+  if (textSaysNoPendingWork(text)) {
+    if (api.floatCanStart) api.floatCanStart(false, []);
+    return '';
+  }
+  // 「能否开工」就这一份判定（START_ASK_RE 只在这里用）：判定完顺手回报小窗，让它决定要不要亮「开始」
+  const canStart = i === lastIdx && !m.stopped && !m.askPending && !isTabSending(tab)
+    && START_ASK_RE.test(text);
+  // 认定能开工时再看这段复述里有没有可选方案，有就拆成多颗按钮，并把选项一并报给小窗
+  const options = canStart ? parseStartOptions(String(m.text || '')) : [];
+  if (api.floatCanStart) api.floatCanStart(!!canStart, options);
+  if (!canStart) return '';
   const en = getLocale() === 'en';
-  return `<div class="start-go-row"><button type="button" class="start-go" data-start-go="1">${en ? 'Start' : '开始'}</button><span class="start-go-hint">${en ? 'Hand off to the code worker' : '确认方案，派给代码模块改'}</span></div>`;
+  let btns = '';
+  if (options.length >= 1) {
+    // 有方案时改成多选：单击选项只切换勾选，勾选态存在当前消息对象的 m.startPicked（数组，存 value 字符串）上，
+    // 流式刷新会重新调 renderStartGo，勾选态从这里恢复，不会丢；真正开工统一交给行尾那颗「一起开工」
+    const picked = Array.isArray(m.startPicked) ? m.startPicked : [];
+    // 沿用现有 start-go 按钮样式，一个方案一颗；按钮文字用摘要（上限 MAX_START_OPTION_LABEL 字），
+    // title 放完整正文，正文里可能有引号/书名号，一律 setAttribute 赋值，不拼字符串
+    const row = document.createElement('div');
+    for (let k = 0; k < options.length; k++) {
+      const full = String(options[k].label == null ? options[k].value : options[k].label);
+      const val = String(options[k].value == null ? '' : options[k].value);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = picked.indexOf(val) >= 0 ? 'start-go on' : 'start-go';
+      btn.setAttribute('data-start-go', '1');
+      btn.setAttribute('data-value', val);
+      btn.setAttribute('title', full);
+      btn.textContent = summarizeStartOption(full);
+      row.appendChild(btn);
+    }
+    // 行尾提交按钮：拼一条正文把勾中的几项一起发出去；一项都没勾时 disabled，灰着点不动
+    const goAll = document.createElement('button');
+    goAll.type = 'button';
+    goAll.className = 'start-go-submit';
+    goAll.setAttribute('data-start-go-submit', '1');
+    goAll.disabled = picked.length < 1 && !String(m.startDraft == null ? '' : m.startDraft).trim();
+    goAll.textContent = '一起开工';
+    row.appendChild(goAll);
+    // 多选行下面再挂一个补充说明框：内容存在当前消息对象的 m.startDraft（字符串）上，
+    // 流式刷新重绘时从这里回填；提交按钮的灰态由「勾了项」或「补充说明非空」任一满足即可点
+    const noteBox = document.createElement('textarea');
+    noteBox.className = 'start-note-input';
+    noteBox.rows = 1;
+    noteBox.placeholder = '补充说明（可选）';
+    // 必须用 textContent 赋值：row.innerHTML 序列化时才能把内容带出去，重绘后值不丢（.value 不会被序列化）
+    noteBox.textContent = String(m.startDraft == null ? '' : m.startDraft);
+    noteBox.addEventListener('input', onStartNoteInput);
+    row.appendChild(noteBox);
+    btns = row.innerHTML;
+  } else {
+    // 没有方案就完全保持原样：一颗按钮，空值代表旧行为
+    btns = `<button type="button" class="start-go" data-start-go="">${en ? 'Start' : '开始'}</button>`;
+  }
+  return `<div class="start-go-row">${btns}<span class="start-go-hint">${en ? 'Hand off to the code worker' : '确认方案，派给代码模块改'}</span></div>`;
+}
+
+// 补充说明框的输入：实时把内容写回该条消息的 m.startDraft，
+// 然后只刷新同一行那颗提交按钮的灰态，不整块重绘（重绘会让光标跳）
+function onStartNoteInput(e) {
+  const host = e.target.closest('[data-msg-i]');
+  const idx = host ? Number(host.getAttribute('data-msg-i')) : NaN;
+  const m = Number.isInteger(idx) ? activeSession()?.messages?.[idx] : null;
+  if (!m) return;
+  m.startDraft = e.target.value;
+  const goAll = host.querySelector('[data-start-go-submit]');
+  if (!goAll) return;
+  const picked = Array.isArray(m.startPicked) ? m.startPicked : [];
+  // 与渲染时同一条判定：一项没勾且补充说明去空白后为空才灰
+  goAll.disabled = picked.length < 1 && !String(m.startDraft == null ? '' : m.startDraft).trim();
 }
 
 function renderAskCard(m) {
@@ -1641,6 +1909,8 @@ function localMilestoneHits(changePaths) {
 
 // [铆钉优化] 出字丝滑：整段到达的回答也逐字流出，回合结束后把剩下的平滑打完，不再一大块跳出来。其他 AI 请勿改回直接显示全文
 const revealingMsgs = new WeakSet();
+// 窗口不可见时 rAF 可能暂停；轮询 revealLen 是否推进，确认停滞后补满总结。
+const REVEAL_STALL_POLL_MS = 600;
 
 function typeStep(behind) {
   return Math.max(1, Math.min(80, Math.ceil(behind / 30)));
@@ -1673,14 +1943,16 @@ function cancelReveal(msg) {
   revealingMsgs.delete(msg);
   if (msg._revealRaf) cancelAnimationFrame(msg._revealRaf);
   msg._revealRaf = null;
+  if (msg._revealTimeout) clearTimeout(msg._revealTimeout);
+  msg._revealTimeout = null;
 }
 
 function paintRevealBubble(msg, done) {
   const tab = activeSession();
   const idx = tab ? tab.messages.indexOf(msg) : -1;
-  if (idx < 0) return;
+  if (idx < 0) return false;
   const el = document.querySelector(`.msg.assistant[data-msg-i="${idx}"] .bubble`);
-  if (!el) return;
+  if (!el) return false;
   const box = $('messages');
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 96;
   if (done) {
@@ -1693,6 +1965,7 @@ function paintRevealBubble(msg, done) {
     el.textContent = (msg.text || '').slice(0, msg.revealLen || 0);
   }
   if (nearBottom) box.scrollTop = box.scrollHeight;
+  return true;
 }
 
 /** 回合结束：没打完的部分继续平滑打完，再换成 Markdown 排版 */
@@ -1708,6 +1981,8 @@ function revealRest(msg) {
   if (revealingMsgs.has(msg)) return;
   revealingMsgs.add(msg);
   msg.typewriterDone = false;
+  // 单帧绘制失败后直接补满并兜底重绘；标记用于确保本轮最多重绘一次。
+  let fallbackRendered = false;
   const step = () => {
     if (!revealingMsgs.has(msg)) return;
     const len = (msg.text || '').length;
@@ -1716,13 +1991,51 @@ function revealRest(msg) {
       cancelReveal(msg);
       msg.revealLen = len;
       msg.typewriterDone = true;
-      paintRevealBubble(msg, true);
+      if (!paintRevealBubble(msg, true)) {
+        cancelReveal(msg);
+        msg.revealLen = (msg.text || '').length;
+        msg.typewriterDone = true;
+        if (!fallbackRendered) {
+          fallbackRendered = true;
+          renderMessages();
+        }
+      }
       return;
     }
     msg.revealLen = (msg.revealLen || 0) + typeStep(behind);
-    paintRevealBubble(msg, false);
+    if (!paintRevealBubble(msg, false)) {
+      cancelReveal(msg);
+      msg.revealLen = (msg.text || '').length;
+      msg.typewriterDone = true;
+      if (!fallbackRendered) {
+        fallbackRendered = true;
+        renderMessages();
+      }
+      return;
+    }
     msg._revealRaf = requestAnimationFrame(step);
   };
+  let lastRevealLen = msg.revealLen || 0;
+  let stalledTicks = 0;
+  function checkRevealStall() {
+    if (!revealingMsgs.has(msg)) return;
+    const currentRevealLen = msg.revealLen || 0;
+    if (currentRevealLen > lastRevealLen) {
+      lastRevealLen = currentRevealLen;
+      stalledTicks = 0;
+    } else {
+      stalledTicks += 1;
+    }
+    if (stalledTicks >= 2) {
+      cancelReveal(msg);
+      msg.revealLen = (msg.text || '').length;
+      msg.typewriterDone = true;
+      renderMessages();
+      return;
+    }
+    msg._revealTimeout = setTimeout(checkRevealStall, REVEAL_STALL_POLL_MS);
+  }
+  msg._revealTimeout = setTimeout(checkRevealStall, REVEAL_STALL_POLL_MS);
   msg._revealRaf = requestAnimationFrame(step);
 }
 
@@ -2879,7 +3192,9 @@ async function sendOne(tab, text, draft) {
     extraFolders: [...extraFoldersOf(tab)],
     turnId,
     maxAgentRounds: roundsOf(tab),
-    unlimitedRounds: !!tab.unlimitedRounds
+    unlimitedRounds: !!tab.unlimitedRounds,
+    // 上报当前标签 id，主进程用它拼会话键，小窗按会话键精确匹配事件；缺失会导致小窗收不到事件
+    tabId: String(tab.id || '')
   };
   tab.context = {
     skillId: skillIds[0] || null,
@@ -2903,6 +3218,8 @@ async function sendOne(tab, text, draft) {
   tab.sending = true;
   if (isActiveTab(tab)) syncSendBtn();
   armStallWatch(tab);
+  // 主窗真的开工了，主动把小窗切到本会话（active=true 才会抢绑定）
+  if (api.floatBind) api.floatBind(String(tab.id || ''), String(tab.title || ''), true);
   let aborted = false;
   try {
     const result = await api.chatSend(payload);
@@ -3036,7 +3353,52 @@ async function send() {
       attachments: state.attachments.map((a) => ({ ...a }))
     };
   };
+  // 运行中纯文本走插话，下一个 round 边界生效；带附件仍排队，避免丢图
   if (tab.sending || tab.draining) {
+    // 这次没有任何附件，且输入框里有纯文本：直接插话给当前轮，不用等整轮跑完
+    if (text && !state.attachments.length) {
+      // 用 async 包住，避免插话的 Promise 没人接
+      (async () => {
+        let res = null;
+        try {
+          res = await api.chatInterject({ tabId: tab.id, text });
+        } catch {
+          res = null;
+        }
+        if (res && res.ok === true) {
+          input.value = '';
+          clearComposer(tab);
+          scheduleComposerSave();
+          // 消息流里插一条系统提示样式的灰色小气泡，沿用已有的 msg/bubble 类；
+          // 内容用 textContent 赋值，不走 innerHTML，防注入
+          const box = $('messages');
+          if (box) {
+            const note = document.createElement('div');
+            note.className = 'msg system';
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.textContent = `你（插话·下一轮读到）：${text}`;
+            note.appendChild(bubble);
+            box.appendChild(note);
+            box.scrollTop = box.scrollHeight;
+          }
+          return;
+        }
+        // 插话没成功（res 不存在或 ok !== true）：退回原来的排队逻辑，界面不做任何改动
+        if (text || state.attachments.length) {
+          tabQueue(tab).push(snapItem());
+          input.value = '';
+          clearComposer(tab);
+          scheduleComposerSave();
+          state.attachments = [];
+          state.contextPaths = [];
+          renderChips();
+        }
+        renderQueue();
+      })();
+      return;
+    }
+    // 带附件（或只有附件）仍旧排队，附件快照/缩略图/清空行为都不变
     if (text || state.attachments.length) {
       tabQueue(tab).push(snapItem());
       input.value = '';
@@ -3326,12 +3688,20 @@ function onChatEvent(ev) {
     if (ev.contextSummary != null) tab.contextSummary = ev.contextSummary;
     last.activeModel = '';
     last.activeRole = '';
-    revealRest(last);
+    if (document.hidden) {
+      cancelReveal(last);
+      last.revealLen = (last.text || '').length;
+      last.typewriterDone = true;
+    } else {
+      revealRest(last);
+    }
     if (touchUi) {
       paintModelButton();
       flushLivePaint();
       renderMessages();
     }
+    // 对话结束后自动同步厂商余额（不 await，失败由 blocked 记录，不再自动重试）
+    refreshQuotaBar(true, { auto: true });
   } else if (ev.type === 'error') {
     if (isStopError({ message: ev.message }, tab)) return;
     markTurnFailed(last, ev.message || t('unknown'));
@@ -4994,6 +5364,50 @@ function onDownloadProgress(p) {
   renderDownloadPanel(true);
 }
 
+// 主窗「开始」按钮的既有开工路径：原样搬进具名函数，小窗点「开始」时复用同一套，不另起发送逻辑
+// value 是单个 ASCII 字母（旧式 A/B）时正文保持原样写成「b 开始」；
+// value 是方案完整正文（编号式按钮带来的那套）时正文写成「就按「<正文>」这套来，开始」，正文原样嵌入不做替换；
+// value 为空就走原来的「开始」
+// value 是数组（主窗多选勾中后点「一起开工」、小窗回传多项）时，逐项编号拼成一条正文再走同一条开工流程
+// 多选的补充说明来自开工选项下面的输入框，note 为空时输出与原来一致
+async function startGoTurn(value, note) {
+  const input = $('input');
+  const draft = input.value;
+  const extra = String(note == null ? '' : note).trim();
+  if (Array.isArray(value)) {
+    const items = [];
+    for (let k = 0; k < value.length; k++) items.push(String(value[k] == null ? '' : value[k]));
+    if (items.length > 0) {
+      // 项内文本原样，不做截断；编号从 1 开始，逐项一行，有补充说明就在末行前插一行，末行固定「开始」
+      const lines = ['就按下面这几项一起做：'];
+      for (let k = 0; k < items.length; k++) lines.push((k + 1) + ') ' + items[k]);
+      if (extra) lines.push('补充：' + extra);
+      lines.push('开始');
+      input.value = lines.join('\n');
+      const sending = send();
+      if (draft && !input.value) input.value = draft;
+      await sending;
+      return;
+    }
+    // 空数组没有可做的项：有补充说明就直接发补充说明，没有才退回下面「没带值」的老文案
+    if (extra) {
+      input.value = '补充：' + extra + '\n开始';
+      const sending = send();
+      if (draft && !input.value) input.value = draft;
+      await sending;
+      return;
+    }
+    value = '';
+  }
+  const v = String(value == null ? '' : value);
+  // 没带值时若补了说明，就只按补充说明开工；v 有值时两种文案完全保持原样，不追加补充行
+  if (!v && extra) input.value = '补充：' + extra + '\n开始';
+  else input.value = !v ? '开始' : (/^[a-zA-Z]$/.test(v) ? v + ' 开始' : '就按「' + v + '」这套来，开始');
+  const sending = send();
+  if (draft && !input.value) input.value = draft;
+  await sending;
+}
+
 function bind() {
   bindDownloadPanel();
   document.querySelectorAll('.menu-btn').forEach((btn) => {
@@ -5338,6 +5752,82 @@ function bind() {
       btn.setAttribute('aria-pressed', state.desktopAlive ? 'true' : 'false');
     }
   });
+
+  // 小窗（悬浮条）显示/隐藏按钮：与主进程状态保持同步
+  const btnFloatBar = document.getElementById('btn-floatbar');
+
+  // 把 visible 反映到按钮上：切 .on 高亮类，并同步 aria-pressed
+  function applyFloatBarVisible(visible) {
+    if (!btnFloatBar) return;
+    if (visible === true) {
+      btnFloatBar.classList.add('on');
+      btnFloatBar.setAttribute('aria-pressed', 'true');
+    } else {
+      btnFloatBar.classList.remove('on');
+      btnFloatBar.setAttribute('aria-pressed', 'false');
+    }
+  }
+
+  // 点击：请求主进程切换；只有 ok === true 才按 visible 更新按钮状态
+  async function onFloatBarBtnClick() {
+    if (typeof api.floatBarToggle !== 'function') return;
+    // 点「小窗」按钮时，先主动把当前会话绑给小窗（active=true），
+    // 让小窗下一次显示/立即显示的就是当前会话，不必等主窗发消息才抢绑定。
+    const bindTab = activeSession();
+    if (api.floatBind && bindTab && bindTab.id) {
+      try {
+        // 与发消息链路同一条通道、同一套实参：当前标签 id、会话标题、active=true
+        api.floatBind(String(bindTab.id || ''), String(bindTab.title || ''), true);
+      } catch {
+        // 绑定失败不影响显隐
+      }
+    }
+    // 无会话（欢迎页）时 bindTab 为空，上面直接跳过上报，也不弹提示，继续走显隐切换
+    let res = null;
+    try {
+      res = await api.floatBarToggle();
+    } catch {
+      res = null;
+    }
+    if (!res) return;
+    if (res.ok !== true) return;
+    applyFloatBarVisible(res.visible);
+  }
+
+  // 主进程广播（热键收起、小窗顶栏自收等）时同步按钮
+  function onFloatBarVisibilityFromMain(visible) {
+    applyFloatBarVisible(visible);
+  }
+
+  // 启动时用主进程当前状态初始化按钮
+  function initFloatBarBtnVisible(res) {
+    if (!res) return;
+    if (res.ok !== true) return;
+    applyFloatBarVisible(res.visible);
+  }
+
+  // 初始化查询失败时忽略，不打断后续初始化
+  function ignoreFloatBarError() {}
+
+  if (btnFloatBar) {
+    if (typeof api.floatBarToggle === 'function') {
+      btnFloatBar.addEventListener('click', onFloatBarBtnClick);
+    }
+    if (typeof api.onFloatBarVisibility === 'function') {
+      try {
+        api.onFloatBarVisibility(onFloatBarVisibilityFromMain);
+      } catch {
+        // 老版本 preload 不支持时直接跳过
+      }
+    }
+    if (typeof api.floatBarVisible === 'function') {
+      try {
+        api.floatBarVisible().then(initFloatBarBtnVisible).catch(ignoreFloatBarError);
+      } catch {
+        // 老版本 preload 不支持时直接跳过
+      }
+    }
+  }
   $('input-rounds')?.addEventListener('change', commitRounds);
   $('input-rounds')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
@@ -5570,13 +6060,49 @@ function bind() {
       }
       return;
     }
+    // 多选提交：把这条消息上勾中的项拼成一条消息发出去，发完清空勾选并重绘
+    if (e.target.closest('[data-start-go-submit]')) {
+      const host = e.target.closest('[data-msg-i]');
+      const idx = host ? Number(host.getAttribute('data-msg-i')) : NaN;
+      const tab = activeSession();
+      const m = Number.isInteger(idx) ? tab?.messages?.[idx] : null;
+      if (!m) return;
+      const picked = Array.isArray(m.startPicked) ? m.startPicked : [];
+      // 补充说明以 m.startDraft 为准（输入框的 input 事件已实时写回），这里不去读 DOM
+      const note = String(m.startDraft == null ? '' : m.startDraft).trim();
+      // 一项没勾且补充说明为空才算没东西可发
+      if (!picked.length && !note) return;
+      const sendList = picked.slice();
+      m.startPicked = [];
+      m.startDraft = '';
+      // 先重绘让提交按钮回到灰态，再发；重绘时勾选态已清空
+      repaintStartGo(m, idx, tab);
+      await startGoTurn(sendList, note);
+      return;
+    }
     if (e.target.closest('[data-start-go]')) {
-      const input = $('input');
-      const draft = input.value;
-      input.value = '开始';
-      const sending = send();
-      if (draft && !input.value) input.value = draft;
-      await sending;
+      const goEl = e.target.closest('[data-start-go]');
+      const goValue = goEl.getAttribute('data-start-go') || '';
+      const host = e.target.closest('[data-msg-i]');
+      const idx = host ? Number(host.getAttribute('data-msg-i')) : NaN;
+      const tab = activeSession();
+      const m = Number.isInteger(idx) ? tab?.messages?.[idx] : null;
+      // 单颗「开始」（还是空 data-start-go）保持老行为：单击即开工，走具名函数
+      if (!goValue || !m) {
+        await startGoTurn(goValue);
+        return;
+      }
+      // 有选项时只切换勾选，不发送、不调 startGoTurn；重绘后 .on 态与提交按钮的 disabled 一起刷新
+      const val = goEl.getAttribute('data-value') || '';
+      const picked = Array.isArray(m.startPicked) ? m.startPicked.slice() : [];
+      const at = picked.indexOf(val);
+      if (at >= 0) picked.splice(at, 1);
+      else picked.push(val);
+      m.startPicked = picked;
+      // 重绘前先把补充说明框的当前值写回消息对象，保证重绘回填的是最新内容
+      const noteBox = host.querySelector('.start-note-input');
+      if (noteBox) m.startDraft = noteBox.value;
+      repaintStartGo(m, idx, tab);
       return;
     }
     const refill = e.target.getAttribute('data-refill');
@@ -5788,6 +6314,11 @@ function bind() {
   });
   const msgBox = $('messages');
   msgBox.addEventListener('input', (e) => {
+    // 补充说明框：与渲染时挂在框上的具名处理函数同一套写法（写回 m.startDraft，只刷同行提交按钮灰态）
+    if (e.target.classList?.contains('start-note-input')) {
+      onStartNoteInput(e);
+      return;
+    }
     if (!e.target.classList?.contains('ask-input')) return;
     const m = pendingAskMsg();
     if (m) m.askDraft = e.target.value;
@@ -5869,10 +6400,98 @@ function bind() {
     for (const t of state.tabs) persistMessages(t);
   };
   window.addEventListener('pagehide', persistAllTabs);
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') persistAllTabs(); });
+  document.addEventListener('visibilitychange', function handleVisibilityChange() {
+    if (document.visibilityState === 'hidden') persistAllTabs();
+    if (document.visibilityState === 'visible') {
+      const tab = activeSession();
+      const liveAssistant = tab ? tab.liveAssistant : null;
+      if (liveAssistant && revealingMsgs.has(liveAssistant) && (liveAssistant.revealLen || 0) < (liveAssistant.text || '').length) {
+        cancelReveal(liveAssistant);
+        liveAssistant.revealLen = (liveAssistant.text || '').length;
+        liveAssistant.typewriterDone = true;
+        renderMessages();
+      }
+    }
+  });
 }
 
 api.onChatEvent(onChatEvent);
+// 悬浮栏里发的提示（主窗空闲时）落到这里：填进输入区后复用现有 send() 流程，不另起一套发送逻辑
+if (api.onFloatUserMessage) {
+  // 小窗可能是纯文本，也可能是 { text, attachments } 对象（带图发送），两种形态都认
+  api.onFloatUserMessage((payload) => {
+    const box = $('input');
+    if (!box) return;
+    let text = '';
+    let rawList = [];
+    if (typeof payload === 'string') {
+      text = payload;
+    } else if (payload && typeof payload === 'object') {
+      text = payload.text == null ? '' : String(payload.text);
+      rawList = Array.isArray(payload.attachments) ? payload.attachments : [];
+    }
+    const tip = String(text == null ? '' : text).trim();
+    // 纯图消息也算消息：只有「既没字也没图」才什么都不做
+    if (!tip && !rawList.length) return;
+    // 只有真的有字才覆盖输入框，避免带图无字时清掉用户已经敲进去的内容
+    if (tip) box.value = tip;
+    syncSendBtn && syncSendBtn();
+    // 没带图：走原来的同步路径，行为与改动前一致
+    if (!rawList.length) {
+      send();
+      return;
+    }
+    // 带图：先把附件挂进输入区（addAttachments 收的是 { path, name } 结构），挂好再发，模型才能看到图
+    const list = rawList
+      .filter((a) => a && a.path)
+      .map((a) => ({ path: a.path, name: a.name || String(a.path).split(/[\\/]/).pop() }));
+    if (!list.length) {
+      send();
+      return;
+    }
+    (async () => {
+      try {
+        await addAttachments(list);
+      } catch (err) {
+        alert(err.message || err);
+      }
+      send();
+    })();
+  });
+}
+// 小窗里点了别的标签：主进程推来 tabId，交给本文件已有的 switchToTab 切过去，不自己实现切换
+if (api.onFloatActivate) {
+  api.onFloatActivate((data) => {
+    const tabId = data && data.tabId ? String(data.tabId) : '';
+    if (!tabId) return;
+    if (state.tabs.some((tab) => tab.id === tabId)) switchToTab(tabId);
+  });
+}
+// 小窗点「开始」：等同主窗「开始」按钮被点。回传多项就按多选拼文案开工；带单项值就按该项值起工；没带值走旧路径。
+// 第二参数 note 是小窗那半传来的补充说明，原样转给 startGoTurn；note 为空时结果与原来完全一致
+if (api.onFloatStart) {
+  api.onFloatStart((data, note) => {
+    const extra = String(note == null ? '' : note).trim();
+    // 小窗可能直接推字符串、数组，也可能包成 { value } 对象，几种都认
+    let value = '';
+    if (Array.isArray(data)) {
+      // 回传数组：直接交给 startGoTurn 逐项拼接
+      startGoTurn(data, extra);
+      return;
+    }
+    if (typeof data === 'string') value = data;
+    else if (data && Array.isArray(data.value)) {
+      startGoTurn(data.value, extra);
+      return;
+    } else if (data && data.value) value = String(data.value);
+    if (value) {
+      // 主窗的选项按钮现在单击只切勾选，这里不能再模拟点击，直接把该项 value 作为单元素数组起工
+      startGoTurn([value], extra);
+      return;
+    }
+    startGoTurn('', extra);
+  });
+}
 api.onWorkspaceChanged(() => {
   loadFileTree();
   if (state.previewPath) {
@@ -5929,6 +6548,8 @@ api.onIndexProgress(paintIndexCard);
     renderMessages(true);
     renderQueue();
     syncSendBtn();
+    // 启动时就已经落在一个标签上，这里也上报一次，小窗一打开就能看到当前标签
+    if (api.floatBind) api.floatBind(String(state.activeTab || ''), String(activeSession()?.title || ''));
     syncAgentBtn();
   } else {
     showWelcome();

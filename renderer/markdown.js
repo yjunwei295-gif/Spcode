@@ -85,6 +85,20 @@ function renderMarkdownRaw(src) {
   while (i < lines.length) {
     const line = lines[i];
 
+    // 开工选项标记块只给按钮供数据，正文不显示：从含 [开工选项] 的这行起整块吞掉，
+    // 一直跳到含 [/开工选项] 的那行（含该行）；流式输出时收标记常常还没到，
+    // 那就一路跳到文本末尾，免得标记原文在正文里闪出来。
+    // 这里刻意用 indexOf 字面量判断，本文件是独立渲染模块，不引 app.js 的常量
+    if (line.indexOf('[开工选项]') >= 0) {
+      const closedSameLine = line.indexOf('[/开工选项]') >= 0;
+      i++;
+      if (!closedSameLine) {
+        while (i < lines.length && lines[i].indexOf('[/开工选项]') < 0) i++;
+        if (i < lines.length) i++; // 收标记的那一行也一起吃掉
+      }
+      continue; // 跳过的行不参与段落/列表/表格等任何渲染
+    }
+
     // 围栏代码块。流式输出时收尾的 ``` 往往还没到，所以没闭合也照样当代码块画，
     // 不然每次回答的中途都会闪一屏原始 markdown
     const fence = /^\s*```+\s*([\w+#.-]*)\s*$/.exec(line);
@@ -143,7 +157,9 @@ function renderMarkdownRaw(src) {
     // 段落。单个换行按 <br> 保留——聊天里换行几乎总是有意的，
     // 按 markdown 原义合并成一行反而更难读
     const body = [];
-    while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) body.push(lines[i++]);
+    // 收段落时也要在开工选项标记处停下，否则标记会被当普通行并进这一段正文
+    while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])
+      && lines[i].indexOf('[开工选项]') < 0) body.push(lines[i++]);
     out.push(`<p>${inline(esc(body.join('\n'))).replace(/\n/g, '<br>')}</p>`);
   }
 

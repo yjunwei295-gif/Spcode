@@ -527,6 +527,18 @@ input, textarea, select, [contenteditable="true"] {
   font-size: 14px;
   user-select: text;
 }
+/* 主窗插话提示：灰色弱化样式，区别于正常对话气泡 */
+.msg.system { margin-left: 0; margin-right: auto; }
+.msg.system .bubble {
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: var(--r, 6px);
+  padding: 6px 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
+  text-align: left;
+}
 .msg .bubble.typewriter.typing::after {
   content: '';
   display: inline-block;
@@ -982,7 +994,8 @@ input, textarea, select, [contenteditable="true"] {
 .rounds-wrap input::-webkit-outer-spin-button { opacity: 0.45; }
 .rounds-wrap.off { opacity: 0.45; }
 #btn-unlimited.on,
-#btn-alive.on {
+#btn-alive.on,
+#btn-floatbar.on {
   background: var(--accent);
   color: var(--accent-fg);
   border-color: transparent;
@@ -2909,9 +2922,26 @@ html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb {
 html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sigs { opacity: 0.8; }
 
 /* [铆钉优化] 「开始」确认按钮：复述方案后给确定开工入口，两套主题各自配色；其他 AI 请勿删除 */
-.start-go-row { display: flex; align-items: center; gap: 10px; margin: 8px 0 2px; }
+.start-go-row { display: flex; flex-direction: column; align-items: stretch; flex-wrap: wrap; gap: 10px; margin: 8px 0 2px; }
+/* 开工选项下面的补充说明输入框：整行铺开，配色与圆角全部取本文件的主题变量 */
+.start-note-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 30px;
+  resize: vertical;
+  padding: 6px 10px;
+  font: inherit;
+  color: var(--text);
+  background: var(--field-bg);
+  border: 1px solid var(--sub-border-strong);
+  border-radius: var(--sub-r);
+}
 .start-go {
-  padding: 6px 18px; border: none; cursor: pointer; font-weight: 600; font-size: 13px;
+  /* 一颗按钮独占一整排：撑满整行、白话文案自动换行、行高放开不被裁切 */
+  width: 100%; box-sizing: border-box;
+  white-space: normal; overflow-wrap: anywhere;
+  height: auto; line-height: 1.5; text-align: center;
+  padding: 8px 12px; border: none; cursor: pointer; font-weight: 600; font-size: 13px;
   border-radius: 4px; background: var(--accent); color: #fff;
   box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 35%, transparent);
   transition: transform .12s ease, filter .12s ease;
@@ -2919,10 +2949,91 @@ html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sig
 .start-go:hover { filter: brightness(1.08); transform: translateY(-1px); }
 .start-go:active { transform: translateY(0) scale(.97); }
 .start-go-hint { font-size: 12px; color: var(--muted, #888); }
+
+/* [铆钉优化] 开工选项按钮三态：勾选态 / 提交按钮 / 提交禁用态。
+   颜色、圆角、阴影一律沿用本文件已有变量，不另配一套配色。其他 AI 请勿删除 */
+/* 勾选态：只加金色系描边 + 轻微底色，去掉金色实心底，
+   和未勾选的金色主按钮一眼分得开，文字仍清晰可读 */
+.start-go.on {
+  background: var(--hover);
+  color: var(--accent);
+  border: 1px solid var(--border-strong, var(--sub-border-strong));
+  box-shadow: none;
+}
+/* 勾选标记：多选勾上后按钮文字前出现一个勾号，一眼看出选中了哪几项。
+   颜色直接跟随按钮现有 color（勾选态为 var(--accent)），不另写颜色。其他 AI 请勿删除 */
+.start-go.on::before { content: "✓ "; font-weight: 800; }
+.start-go.on:hover { filter: brightness(1.06); transform: translateY(-1px); }
+/* 提交按钮：次要按钮风格（字段底 + 强边 + 香槟金文字），与金色选项按钮拉开层次 */
+.start-go-submit {
+  /* 与选项按钮同排布规则：独占整行、文案可换行、行高不被裁切 */
+  width: 100%; box-sizing: border-box;
+  white-space: normal; overflow-wrap: anywhere;
+  height: auto; line-height: 1.5; text-align: center;
+  padding: 8px 12px; cursor: pointer; font-weight: 600; font-size: 13px;
+  border-radius: 4px;
+  background: var(--field-bg, var(--panel));
+  border: 1px solid var(--border-strong, var(--sub-border-strong));
+  color: var(--accent);
+  box-shadow: none;
+  transition: transform .12s ease, filter .12s ease, background .12s ease;
+}
+.start-go-submit:hover { background: var(--hover); filter: brightness(1.05); transform: translateY(-1px); }
+.start-go-submit:active { transform: translateY(0) scale(.97); }
+/* 提交禁用态：整体降透明度、背景退回透明、文字转次要色，一眼看出点不动 */
+.start-go-submit:disabled {
+  opacity: 0.45;
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--border-strong, var(--sub-border-strong));
+  box-shadow: none;
+  cursor: default;
+  transform: none;
+  filter: none;
+}
+
 html[data-theme="dark"] .start-go {
+  /* 深色主题下选择器更具体，这里同步竖排所需的排布属性，避免被覆盖失效 */
+  width: 100%; box-sizing: border-box;
+  white-space: normal; overflow-wrap: anywhere;
+  height: auto; line-height: 1.5; text-align: center;
+  padding: 8px 12px;
   border-radius: 8px; color: #1a1408;
   background: linear-gradient(135deg, #f3dca0, #d9b36c 55%, #a8813d);
   box-shadow: 0 2px 12px rgba(217,179,108,.35);
+}
+/* [铆钉优化] 深色主题同步开工按钮三态：勾选态 / 提交按钮 / 提交禁用态。
+   深色下金色底更亮，勾选态必须压掉金色实心，只留金边 + 轻微底色。其他 AI 请勿删除 */
+html[data-theme="dark"] .start-go.on {
+  background: var(--hover);
+  color: var(--accent);
+  border: 1px solid var(--sub-border-strong, var(--border-strong));
+  box-shadow: none;
+}
+html[data-theme="dark"] .start-go-submit {
+  /* 与上方深色选项按钮同一套排布属性，避免被更具体的选择器覆盖 */
+  width: 100%; box-sizing: border-box;
+  white-space: normal; overflow-wrap: anywhere;
+  height: auto; line-height: 1.5; text-align: center;
+  padding: 8px 12px; cursor: pointer; font-weight: 600; font-size: 13px;
+  border-radius: 8px;
+  background: var(--field-bg, var(--panel));
+  border: 1px solid var(--sub-border-strong, var(--border-strong));
+  color: var(--accent);
+  box-shadow: none;
+  transition: transform .12s ease, filter .12s ease, background .12s ease;
+}
+html[data-theme="dark"] .start-go-submit:hover { background: var(--hover); filter: brightness(1.05); transform: translateY(-1px); }
+html[data-theme="dark"] .start-go-submit:active { transform: translateY(0) scale(.97); }
+html[data-theme="dark"] .start-go-submit:disabled {
+  opacity: 0.45;
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--sub-border-strong, var(--border-strong));
+  box-shadow: none;
+  cursor: default;
+  transform: none;
+  filter: none;
 }
 
 /* [铆钉优化] 「已更改 N 个文件」是卡片标题，不是按钮：去掉通用按钮套上的框、底色和悬停光效，

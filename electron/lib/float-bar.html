@@ -1,0 +1,1779 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>SpCode 悬浮对话栏</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #060609;
+    --panel: #0d0d12;
+    --card: #101016;
+    --field: #09090d;
+    --text: #ece7de;
+    --muted: #8e8a94;
+    --border: rgba(255, 240, 220, 0.07);
+    --border-strong: rgba(227, 192, 122, 0.2);
+    --hover: rgba(217, 179, 108, 0.08);
+    --accent: #d9b36c;
+    --accent-fg: #17120a;
+    --danger: #ff6b6b;
+    --primary-bg: linear-gradient(135deg, #f6dea0 0%, #c8963e 28%, #f9e7b4 50%, #b3822c 74%, #f1d38c 100%);
+    --primary-shadow: 0 4px 16px rgba(217, 179, 108, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+    --iris-edge: linear-gradient(135deg, rgba(227, 192, 122, 0.7), rgba(229, 123, 208, 0.18) 20%, rgba(255, 255, 255, 0.03) 45%, rgba(142, 107, 255, 0.35) 70%, rgba(111, 220, 240, 0.6));
+    --shadow: 0 18px 50px rgba(0, 0, 0, 0.7), 0 2px 8px rgba(0, 0, 0, 0.5);
+    --r: 10px;
+    --r-lg: 14px;
+    --font: "Segoe UI", "Microsoft YaHei", sans-serif;
+    /* Markdown 渲染出的行内代码与代码块用等宽字体，和主窗同一套字族 */
+    --mono: "JetBrains Mono", "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: transparent;
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 12.5px;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* 外层只做 1px 幻彩描边，内层才是半透明深黑卡片 */
+  #frame {
+    height: 100vh;
+    padding: 1px;
+    border-radius: calc(var(--r-lg) + 1px);
+    background: var(--iris-edge);
+  }
+
+  #bar {
+    position: relative; /* 绝对定位子元素（#grip 等）的锚点；#sessList 已改锚到 #top */
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    border-radius: var(--r-lg);
+    background: rgba(6, 6, 9, 0.92);
+    overflow: hidden;
+  }
+
+  /* 顶栏：整条可拖，按钮切回可点 */
+  #top {
+    -webkit-app-region: drag;
+    /* 顶栏本身作为会话列表的绝对定位锚点：高度随会话名变长也不影响列表贴合位置 */
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: rgba(13, 13, 18, 0.72);
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+  }
+
+  .dot {
+    width: 9px;
+    height: 9px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+  .dot.busy {
+    background: var(--accent);
+    box-shadow: 0 0 10px rgba(217, 179, 108, 0.8);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  .dot.ask {
+    background: var(--danger);
+    box-shadow: 0 0 10px rgba(255, 107, 107, 0.8);
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+
+  #status {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--text);
+  }
+
+  .tbtn {
+    -webkit-app-region: no-drag;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--font);
+    font-size: 12px;
+    padding: 3px 7px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .tbtn:hover { background: var(--hover); color: var(--accent); }
+  .tbtn.hidden { display: none; }
+  /* 紧凑态这颗按钮不跳位：正常态剩余宽度已被 #status 的 flex-grow 吃完，auto 分配 0、对现有布局零影响；
+     紧凑态 #status 已隐藏，auto 生效把「最小化 / 展开」这颗推到最右，两态落在右上角同一位置 */
+  #btn-mini { margin-left: auto; }
+  .tbtn:disabled {
+    opacity: 0.45;
+    background: transparent;
+    color: var(--muted);
+    cursor: default;
+  }
+
+  /* 顶栏会话标识：点它弹出会话切换列表 */
+  #sess {
+    -webkit-app-region: no-drag;
+    flex: 0 1 auto;
+    max-width: 44%;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--field);
+    color: var(--muted);
+    font-family: var(--font);
+    font-size: 11.5px;
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+  #sess:hover {
+    background: var(--hover);
+    border-color: var(--border-strong);
+    color: var(--accent);
+  }
+
+  /* 开始区：坐在消息区下方、输入区上方，承载 1~N 颗金色方案按钮，
+     只有当前会话明确可以新起一轮时才露面。
+     它横向占满容器宽、不被上下邻居压缩，按钮自己换行，不再去顶栏里抢地方 */
+  #startArea {
+    -webkit-app-region: no-drag;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    flex: 0 0 auto;
+    width: 100%;
+    /* 按钮再多再长也只占这么高，剩下的自己出滚动条，始终给消息区留出位置 */
+    max-height: 24vh;
+    overflow-y: auto;
+    padding: 0 10px 8px;
+  }
+  #startArea::-webkit-scrollbar { width: 8px; }
+  #startArea::-webkit-scrollbar-thumb {
+    background: rgba(217, 179, 108, 0.18);
+    border-radius: 8px;
+  }
+  /* 区里每颗按钮都沿用原来那颗金色「开始」的样式：金色底、深色字、圆角、字体一律照旧，
+     只把「不换行」放开来，长摘要整段留在按钮里自己折行，最多占满一整行 */
+  #startArea button {
+    border: 0;
+    border-radius: 8px;
+    background: var(--primary-bg);
+    color: var(--accent-fg);
+    font-family: var(--font);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    max-width: 100%;
+    white-space: normal;
+    word-break: break-word;
+    line-height: 1.45;
+    text-align: left;
+    box-shadow: var(--primary-shadow);
+    cursor: pointer;
+  }
+  #startArea button:active { filter: brightness(0.94); }
+  /* 勾选态：暗底 + 金色描边 + 金字的次级外观，和旁边那颗未选中的金色主按钮一眼分得开 */
+  #startArea button.on {
+    background: var(--hover);
+    color: var(--accent);
+    border: 1px solid var(--border-strong);
+    box-shadow: none;
+  }
+  /* 多选提交：次要按钮风格，别跟金色主按钮抢眼 */
+  #startArea button.start-go-submit {
+    background: var(--field);
+    border: 1px solid var(--border-strong);
+    color: var(--accent);
+    box-shadow: none;
+  }
+  /* 一项都没勾：这颗按钮灰着点不动，也不给悬停反馈 */
+  #startArea button.start-go-submit:disabled {
+    opacity: 0.45;
+    background: transparent;
+    color: var(--muted);
+    cursor: default;
+  }
+  #startArea.hidden { display: none; }
+  /* 补充说明输入框：占满一整行坐在方案按钮下面，深色输入底、细边、圆角，
+     字号跟随区里现有正文；高度可往下拖，默认只占一行 */
+  #startArea .start-note-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--field);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 12px;
+    line-height: 1.45;
+    padding: 4px 10px;
+    resize: vertical;
+    min-height: 28px;
+  }
+
+  /* 顶栏紧凑态：会话名、状态点/文字、停止、收起统统就地收起，
+     只留 #btn-mini 这一颗作为还原入口；退出紧凑时把 compact class 摘掉即全部恢复 */
+  #top.compact #dot,
+  #top.compact #sess,
+  #top.compact #status,
+  #top.compact #btnStop,
+  #top.compact #btnHide { display: none; }
+
+  /* 紧凑态收起开始区：#startArea 已经搬出顶栏、和 #top 成了同一个父盒子里的同级节点，
+     顶栏那份 #top.compact #startArea 再也选不到它，所以这里补一条同级选择器把它一并藏起来。
+     正常态（没挂 compact）照常显示，按「展开」摘掉 class 后按钮区就回来 */
+  #top.compact ~ #startArea { display: none; }
+
+  /* 紧凑态消息区（窗口只有 182 高）：给 #msgs 补上保底三条，保证输入区不被挤出窗口。
+     flex: 1 1 auto + min-height: 0 让它只吃顶栏、输入区之外剩下的那点高度，绝不向外撑；
+     紧凑态只展示最近两条（配合 .msg-hide-compact 的显隐），不再靠固定高度裁切，
+     所以 overflow 用 hidden，避免残留上一次的滚动位置错位；
+     #top / #bottom 仍钉死 flex: 0 0 auto、不参与压缩，输入框与发送按钮始终留在窗口里 */
+  #top.compact ~ #msgs {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+    /* 上下内边距各收一档（正常态是 10px）：182 高里要同时放下 2 条消息 + 输入区，只好从这里省高度 */
+    padding: 3px 10px;
+  }
+
+  /* 右下角自制缩放手柄：绝对定位贴住右下角，z-index 高于消息区（也高于提问卡片那层 30），卡片露脸时也抓得到；
+     颜色只用本文件已有的次要文字色与亮边色，不另配一套 */
+  #grip {
+    position: absolute;
+    right: 2px;
+    bottom: 2px;
+    width: 16px;
+    height: 16px;
+    z-index: 40;
+    cursor: se-resize;
+    -webkit-app-region: no-drag;
+    opacity: 0.75;
+    /* 一条 45 度斜线（\ 向）：从右下角斜着切进来 */
+    background-image: linear-gradient(135deg,
+      transparent 0 62%, var(--muted) 62% 70%,
+      transparent 70% 100%);
+  }
+  #grip:hover { opacity: 1; }
+  /* 第二条斜线：更短、更贴角，同用次要文字色，两条斜线组成抓柄 */
+  #grip::after {
+    content: '';
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: 100%;
+    background-image: linear-gradient(135deg,
+      transparent 0 82%, var(--muted) 82% 90%,
+      transparent 90% 100%);
+  }
+
+  /* 紧凑态隐藏抓柄：#grip 与 #top 同级，用通用兄弟选择器，和上面藏开始区同一套路 */
+  #top.compact ~ #grip { display: none; }
+
+  /* 会话切换列表：贴在顶栏下面的小面板（#top 的子节点，锚点跟着顶栏走，不再写死像素）
+     z-index / min-width / max-width / max-height / overflow-y / 内边距 / 配色全部沿用原值 */
+  #sessList {
+    position: absolute;
+    z-index: 20;
+    /* 贴住 #top 的下沿：顶栏高度随会话名变长时自动跟随，不影响任何一行条目可点 */
+    top: 100%;
+    right: 10px;
+    min-width: 140px;
+    max-width: 78%;
+    max-height: 190px;
+    overflow-y: auto;
+    padding: 5px;
+    border-radius: var(--r);
+    background: var(--card);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--shadow);
+  }
+  #sessList.hidden { display: none; }
+  #sessList .sitem {
+    /* 列表已搬进 #top 这条拖拽条内部，条目必须声明可点，否则点击会被当成拖窗口、第一行点不动 */
+    -webkit-app-region: no-drag;
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 12px;
+    padding: 5px 8px;
+    cursor: pointer;
+  }
+  #sessList .sitem:hover {
+    background: var(--hover);
+    color: var(--accent);
+  }
+  #sessList .sitem.active {
+    background: var(--hover);
+    color: var(--accent);
+  }
+  #sessList .snone {
+    padding: 5px 8px;
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+
+  /* 消息区 */
+  #msgs {
+    flex: 1 1 auto;
+    min-height: 56px;
+    /* 至少给消息区留 56px，卡片再长也不把消息区压到看不见 */
+    overflow-y: auto;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  #msgs::-webkit-scrollbar { width: 8px; }
+  #msgs::-webkit-scrollbar-thumb {
+    background: rgba(217, 179, 108, 0.18);
+    border-radius: 8px;
+  }
+
+  .msg {
+    max-width: 88%;
+    padding: 7px 10px;
+    border-radius: var(--r);
+    line-height: 1.5;
+    word-break: break-word;
+    white-space: pre-wrap;
+    -webkit-user-select: text;
+    user-select: text;
+  }
+  .msg.user {
+    align-self: flex-end;
+    background: rgba(217, 179, 108, 0.1);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+  }
+  .msg.ai {
+    align-self: flex-start;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .msg.tool {
+    align-self: flex-start;
+    padding: 2px 4px;
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+  .msg.sys {
+    align-self: flex-start;
+    padding: 2px 4px;
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+
+  /* ——— AI 消息的 Markdown 渲染（paint 给 ai 条目加的 .md 类）———
+     .msg 本身是 pre-wrap，用户消息靠它原样保留换行；但渲染出来的 <p>/<ul> 之间的换行
+     会被 pre-wrap 当成真实空白，块级元素被撑出大段空行，所以 AI 那条必须改回 normal。
+     颜色只用本文件已有的主题变量：正文 --text、代码底 --field、边框 --border、强调 --accent */
+  .msg.md { white-space: normal; }
+  .msg.md p { margin: 0 0 6px; }
+  .msg.md > *:first-child { margin-top: 0; }
+  .msg.md > *:last-child { margin-bottom: 0; }
+  .msg.md h1,
+  .msg.md h2,
+  .msg.md h3,
+  .msg.md h4,
+  .msg.md h5,
+  .msg.md h6 {
+    margin: 8px 0 5px;
+    color: var(--accent);
+    font-weight: 600;
+    line-height: 1.35;
+  }
+  .msg.md h1 { font-size: 14.5px; }
+  .msg.md h2 { font-size: 13.5px; }
+  .msg.md h3,
+  .msg.md h4,
+  .msg.md h5,
+  .msg.md h6 { font-size: 12.5px; }
+  .msg.md ul,
+  .msg.md ol {
+    margin: 0 0 6px;
+    padding-left: 18px;
+  }
+  .msg.md li { margin: 0 0 2px; }
+  /* 嵌套列表贴在上一条里，不再多留一段间距 */
+  .msg.md li > ul,
+  .msg.md li > ol { margin: 2px 0 0; }
+  .msg.md blockquote {
+    margin: 0 0 6px;
+    padding: 2px 0 2px 8px;
+    border-left: 2px solid var(--border-strong);
+    color: var(--muted);
+  }
+  .msg.md pre {
+    margin: 0 0 6px;
+    padding: 6px 8px;
+    max-width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--field);
+  }
+  /* 代码块里的 code 不再叠自己的底色和边框，字号行高一档定好 */
+  .msg.md pre code {
+    display: block;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.45;
+    white-space: pre;
+  }
+  .msg.md code {
+    padding: 1px 4px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--field);
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 11.5px;
+  }
+  .msg.md a {
+    color: var(--accent);
+    text-decoration: underline;
+    word-break: break-all;
+  }
+  .msg.md a:hover { color: var(--text); }
+  .msg.md strong {
+    font-weight: 600;
+    color: var(--text);
+  }
+  .msg.md em { font-style: italic; }
+  .msg.md del { color: var(--muted); }
+  .msg.md hr {
+    margin: 8px 0;
+    border: 0;
+    border-top: 1px solid var(--border);
+  }
+  /* 表格：窄小窗里横向滚动，不把消息撑破。
+     table 自己当滚动容器（display:block + overflow-x:auto），单元格不折行，
+     宽表整张留在消息宽度内、要看全就左右拖 */
+  .msg.md table {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    margin: 0 0 6px;
+    border-collapse: collapse;
+    font-size: 11.5px;
+  }
+  .msg.md th,
+  .msg.md td {
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    text-align: left;
+    white-space: nowrap;
+  }
+  .msg.md th {
+    background: var(--field);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  /* 紧凑态只展示最近两条消息：多出来的条目用显隐藏起来，不再靠固定高度裁切，
+     退出紧凑时把这个类整批摘掉，全部消息立刻回来（不留裁切状态与空白） */
+  .msg-hide-compact { display: none; }
+  .empty {
+    margin-top: 14px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+
+  /* 危险确认卡片：默认隐藏。
+     卡片整体被夹在可用高度内：标题和选项按钮始终留在窗口里可见可点，
+     只有中间的问句正文 `#askText` 自己滚动。这样问句再长也点得到「允许这一步」。 */
+  #ask {
+    /* 开始区现在也待在这一列里，给卡片自己的层级：无论谁先谁后，卡片都压在开始区上方，三个选项始终可见可点 */
+    position: relative;
+    z-index: 30;
+    flex: 0 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    /* 卡片被可用高度压扁时，里面的选项区绝不越出卡片边框：
+       超出部分在卡片内裁掉，选项区自己去滚动，不会压到下面的输入行 */
+    overflow: hidden;
+    margin: 0 10px 8px;
+    padding: 10px;
+    border-radius: var(--r);
+    background: var(--card);
+    border: 1px solid var(--border-strong);
+    box-shadow: var(--shadow);
+  }
+  #ask.hidden { display: none; }
+
+  /* 卡片露脸时，消息区和开工按钮区一起把高度让给卡片（Electron 37 = Chromium 138，:has() 可用）：
+     #msgs 的最低下限从 56px 收到 24px，#startArea 整块收起，
+     这样 280 高的小窗里弹长选项的提问卡片时，选项整条留在卡片内、不够就卡片内自己滚，不贴发送按钮。
+     只认「卡片没挂 .hidden」这一种状态，卡片一关这两条立刻失效，#msgs 与 #startArea 自动复原 */
+  /* 卡片露脸时把消息区钉成固定 24px：不再参与纵向 flex 的负空间分摊，
+     免得消息内容把卡片抢空；min-height/max-height 双向夹住，高度就锁在 24px */
+  #bar:has(#ask:not(.hidden)) #msgs { flex: 0 0 auto; min-height: 24px; max-height: 24px; }
+  #bar:has(#ask:not(.hidden)) #startArea { display: none; }
+
+  #askTitle {
+    flex: 0 0 auto;
+    margin-bottom: 6px;
+    color: var(--accent);
+    font-size: 12px;
+  }
+  /* 问句正文：超高就自己出滚动条，不把下面的按钮顶出窗口 */
+  #askText {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: 42vh;
+    overflow-y: auto;
+    margin-bottom: 9px;
+    line-height: 1.5;
+    word-break: break-word;
+    white-space: pre-wrap;
+    -webkit-user-select: text;
+    user-select: text;
+  }
+  #askText::-webkit-scrollbar { width: 8px; }
+  #askText::-webkit-scrollbar-thumb {
+    background: rgba(217, 179, 108, 0.18);
+    border-radius: 8px;
+  }
+  /* 选项按钮区：始终贴卡片底部，选项本身过多时也能自己滚 */
+  #askOpts {
+    /* 改成 flex:0 0 auto 是为了让选项按钮保底可见，不被消息区抢空：
+       不压缩、不拉伸，高度由内容撑起；选项过多时仍靠下面的 max-height + overflow-y 在自己内部滚动 */
+    flex: 0 0 auto;
+    max-height: 30vh;
+    overflow-y: auto;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .obtn {
+    -webkit-app-region: no-drag;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r);
+    background: var(--field);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 12px;
+    padding: 5px 10px;
+    cursor: pointer;
+  }
+  .obtn:hover { background: var(--hover); color: var(--accent); }
+  .obtn.primary {
+    border: 0;
+    background: var(--primary-bg);
+    color: var(--accent-fg);
+    font-weight: 600;
+    box-shadow: var(--primary-shadow);
+  }
+
+  /* 底部输入区：改成纵向，附件缩略条在上面、输入行在下面 */
+  #bottom {
+    -webkit-app-region: no-drag;
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 9px 10px 10px;
+    background: rgba(9, 9, 13, 0.82);
+    border-top: 1px solid var(--border);
+  }
+  /* 往小窗里拖图时高亮整个输入区 */
+  #bottom.dragover {
+    background: rgba(217, 179, 108, 0.07);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  /* 输入行：textarea + 图 + 发送，横着一排不变 */
+  #bottom .inputRow {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    width: 100%;
+  }
+  #input {
+    flex: 1 1 auto;
+    min-height: 32px;
+    max-height: 66px;
+    padding: 7px 9px;
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--field);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 12.5px;
+    line-height: 1.4;
+    resize: none;
+    outline: none;
+    overflow-y: auto;
+    -webkit-user-select: text;
+    user-select: text;
+  }
+  #input::placeholder { color: var(--muted); }
+  #input:focus {
+    border-color: var(--border-strong);
+    box-shadow: 0 0 0 2px rgba(217, 179, 108, 0.12);
+  }
+  #send {
+    -webkit-app-region: no-drag;
+    border: 0;
+    border-radius: var(--r);
+    background: var(--primary-bg);
+    color: var(--accent-fg);
+    font-family: var(--font);
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 8px 14px;
+    box-shadow: var(--primary-shadow);
+    cursor: pointer;
+  }
+  #send:active { filter: brightness(0.94); }
+  /* 「图」按钮：跟发送按钮同高，做成次要按钮的样子 */
+  #btnImg {
+    -webkit-app-region: no-drag;
+    flex: 0 0 auto;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r);
+    background: var(--field);
+    color: var(--accent);
+    font-family: var(--font);
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 8px 11px;
+    cursor: pointer;
+  }
+  #btnImg:hover { background: var(--hover); }
+  #btnImg:active { filter: brightness(0.94); }
+
+  /* 附件缩略条：只占自己那一份高度（flex 0 0 auto），绝不压缩 #msgs；
+     一行放不下就横向滚动，高度封顶 96px，最多也就一行多一点 */
+  #atts {
+    flex: 0 0 auto;
+    width: 100%;
+    max-height: 96px;
+    overflow-y: auto;
+  }
+  #atts.hidden { display: none; }
+  #attsList {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 1px;
+  }
+  #attsList .att {
+    position: relative;
+    flex: 0 0 auto;
+    width: 64px;
+    height: 64px;
+  }
+  #attsList .att img {
+    display: block;
+    width: 64px;
+    height: 64px;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid var(--border-strong);
+    background: var(--field);
+  }
+  /* 右上角「×」：压在缩略图上，中文 title 提示「移除这张图」 */
+  #attsList .att .delt {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    line-height: 16px;
+    text-align: center;
+    border: 0;
+    border-radius: 50%;
+    background: rgba(6, 6, 9, 0.86);
+    color: var(--danger);
+    font-family: var(--font);
+    font-size: 13px;
+    cursor: pointer;
+    -webkit-app-region: no-drag;
+  }
+  #attsList .att .delt:hover {
+    background: var(--danger);
+    color: #17120a;
+  }
+</style>
+</head>
+<body>
+<div id="frame">
+  <div id="bar">
+    <div id="top">
+      <span id="dot" class="dot"></span>
+      <button id="sess" type="button" title="当前会话：未绑定会话（点这里切换）">未绑定会话</button>
+      <span id="status">空闲</span>
+      <button id="btnStop" class="tbtn" type="button" title="停止当前轮次">停止</button>
+      <button id="btnHide" class="tbtn" type="button" title="收起悬浮栏">收起</button>
+      <button id="btn-mini" class="tbtn" type="button" title="最小化（只留输入框和两条消息）">最小化</button>
+      <!-- 会话列表搬进顶栏内部：定位锚点由 #bar 换成 #top，永远贴住顶栏下沿；id / class / 内部节点照旧 -->
+      <div id="sessList" class="hidden"></div>
+    </div>
+    <div id="msgs"></div>
+    <!-- 开始区：从顶栏整段挪到消息区下方、输入区上方；里面的金色按钮照旧由 paintStartButtons 动态生成 -->
+    <span id="startArea" class="hidden"></span>
+    <div id="ask" class="hidden">
+      <div id="askTitle">危险操作需要你确认</div>
+      <div id="askText"></div>
+      <div id="askOpts"></div>
+    </div>
+    <div id="bottom">
+      <!-- 附件缩略条：在输入行之上，有图才显示（hidden 由 renderAtts 切换），紧凑态照常显示 -->
+      <div id="atts" class="atts hidden">
+        <div id="attsList"></div>
+      </div>
+      <div class="inputRow">
+        <textarea id="input" rows="1" placeholder="给 AI 说点什么…（Ctrl+Enter 发送，Esc 清空）"></textarea>
+        <button id="btnImg" type="button" title="粘贴或选择图片">图</button>
+        <button id="send" type="button">发送</button>
+      </div>
+      <!-- 选图用的隐藏 file 输入：点「图」按钮时代它被点 -->
+      <input type="file" id="fileImg" accept="image/*" multiple hidden />
+    </div>
+    <!-- 右下角自制缩放手柄：与 #top 同级、放在 #bar 内；系统级缩放已关，拖动改尺寸全走这条抓柄 -->
+    <div id="grip" title="拖动缩放"></div>
+  </div>
+</div>
+<!-- AI 消息的 Markdown 渲染器：普通脚本、同目录 file:// 直接加载（小窗加载不了主窗的 ES module） -->
+<script src="float-bar-md.js"></script>
+<script>
+(function () {
+  // 只走 preload 暴露的 window.floatBar，本页不直接碰 ipcRenderer
+  var bridge = window.floatBar || null;
+  // 紧凑状态回灌（主进程通道 floatbar:compact）：preload 侧没有暴露接收口，这里不新建通道，跳过这一条
+  var msgsEl = document.getElementById('msgs');
+  var statusEl = document.getElementById('status');
+  var dotEl = document.getElementById('dot');
+  var sessEl = document.getElementById('sess');
+  var sessListEl = document.getElementById('sessList');
+  var startAreaEl = document.getElementById('startArea');
+  var btnStopEl = document.getElementById('btnStop');
+  var btnHideEl = document.getElementById('btnHide');
+  var btnMiniEl = document.getElementById('btn-mini');
+  var askEl = document.getElementById('ask');
+  var askTextEl = document.getElementById('askText');
+  var askOptsEl = document.getElementById('askOpts');
+  var inputEl = document.getElementById('input');
+  // 附件相关的元素：缩略条、缩略图列表、「图」按钮、隐藏的选图输入
+  var bottomEl = document.getElementById('bottom');
+  var attsEl = document.getElementById('atts');
+  var attsListEl = document.getElementById('attsList');
+  var btnImgEl = document.getElementById('btnImg');
+  var fileImgEl = document.getElementById('fileImg');
+  var MAX_ITEMS = 30;
+  var INPUT_MAX_HEIGHT = 66;
+  // 紧凑态开关：为真时消息区只展示最后 COMPACT_ITEMS 条（其余挂 .msg-hide-compact），顶栏只留 btn-mini，默认关
+  var compactOn = false;
+  // 紧凑态下消息区渲染的条数上限
+  var COMPACT_ITEMS = 2;
+  var FALLBACK_OPTIONS = ['允许这一步', '这一轮都允许', '不允许'];
+  var items = [];
+  // 待发送的图片附件：统一 { path, name }，path 是 main.js 落盘后的绝对路径
+  var pendingAtts = [];
+  // 一次最多挂 6 张图，多出来的忽略并提示
+  var MAX_ATTS = 6;
+  // 危险确认卡片挂着的时候，状态钉在「等你允许」，不被后面的状态事件冲掉
+  var waiting = false;
+  // 当前绑定的会话键：初始化时先向 main.js 要一次默认绑定，之后用事件里的 sessionKey 校准
+  var boundKey = '';
+  // 最近一次收到的会话清单：[{ key, label }]
+  var sessions = [];
+  // 当前这个会话能不能新起一轮，由 start-ready 决定
+  var canStart = false;
+  // 当前会话的开始方案：[{ value, label }]，由 start-ready 原样带来，本页不解析文本
+  // 空数组 = 没有方案，开始区退回一颗「开始」按钮的老形态
+  var startOptions = [];
+  // 这一轮被勾中的选项 value（字符串数组）：多选下先攒勾选，点「一起开工」才整包发出去
+  // 切会话、重画开始区、发完开工都清空，免得把上一个会话的勾选带到新会话
+  var startPicked = [];
+  // 开工选项下方的补充说明，空串表示没填
+  var startNote = '';
+  // 危险确认卡片弹出时记住的会话键，点选项时按它回话
+  var askKey = '';
+  // 记住弹卡片那一轮的编号，点选项时按它回话，main.js 只认 turnId 不猜
+  var askTurnId = '';
+  // pinned-locked 之后顶栏固定显示这句，别被后面的状态事件冲掉
+  var lockedText = '';
+
+  // 紧凑态下顶栏的显示：加/摘 #top 上的 compact class，并把入口按钮的文字在「最小化 / 展开」之间切换
+  function applyCompactUI() {
+    var top = document.getElementById('top');
+    if (top) {
+      if (compactOn) top.classList.add('compact');
+      else top.classList.remove('compact');
+    }
+    btnMiniEl.textContent = compactOn ? '展开' : '最小化';
+    btnMiniEl.title = compactOn ? '展开（恢复完整悬浮栏）' : '最小化（只留输入框和两条消息）';
+  }
+
+  // 紧凑态消息显隐：只留最近 COMPACT_ITEMS 条 .msg 可见，多出来的挂 .msg-hide-compact 藏起来；
+  // 非紧凑态（或退出紧凑时）把 #msgs 里全部 .msg-hide-compact 摘掉，整份消息复原，两态共用这一处逻辑
+  function applyCompactMsgs() {
+    if (!msgsEl) return;
+    var rows = msgsEl.querySelectorAll('.msg');
+    for (var i = 0; i < rows.length; i++) {
+      if (compactOn && i < rows.length - COMPACT_ITEMS) rows[i].classList.add('msg-hide-compact');
+      else rows[i].classList.remove('msg-hide-compact');
+    }
+  }
+
+  // 消息区滚到底：paint 渲染完和收到主进程 repaint 重绘后共用这一套滚动到底逻辑
+  function scrollMsgsToBottom() {
+    msgsEl.scrollTop = msgsEl.scrollHeight;
+  }
+
+  // 切紧凑态：先改本地标记和 DOM，再同步告知主进程。
+  // 桥上的方法名按 preload 实际暴露的来试（compact / floatbarCompact），两个都没有就只做本地 UI 切换，不报错。
+  function setCompact(on) {
+    var want = on === true;
+    compactOn = want;
+    // 进紧凑态时顺手把会话切换列表收起来，别留个面板挂在小窗上
+    if (want) toggleSessionList(false);
+    applyCompactUI();
+    paint();
+    // 进紧凑：给 #msgs 里除最后 COMPACT_ITEMS 条之外的所有 .msg 加 .msg-hide-compact（只留最近两条）；
+    // 退出紧凑：把 #msgs 内全部 .msg-hide-compact 摘掉，消息全回来，不留裁切状态
+    applyCompactMsgs();
+    try {
+      if (bridge && typeof bridge.compact === 'function') bridge.compact(want);
+      else if (bridge && typeof bridge.floatbarCompact === 'function') bridge.floatbarCompact(want);
+    } catch (e) { /* 桥上没有这个方法：只做本地 UI 切换 */ }
+  }
+
+  // 按钮点击：在「最小化」和「展开」之间来回切
+  function toggleCompact() {
+    setCompact(!compactOn);
+  }
+
+  function paint() {
+    msgsEl.textContent = '';
+    if (!items.length) {
+      var tip = document.createElement('div');
+      tip.className = 'empty';
+      tip.textContent = '还没有内容，直接在这里给 AI 提示';
+      msgsEl.appendChild(tip);
+    } else {
+      // 两态都整份渲染（items 本身已按每桶 30 条裁剪）：紧凑态不再靠少写 DOM 或固定高度裁切来减条，
+      // 改成给多余条目挂 .msg-hide-compact 显隐，退出紧凑时随手摘掉就全部回来，不留残影与裁切状态
+      for (var i = 0; i < items.length; i++) {
+        var row = document.createElement('div');
+        var one = items[i];
+        // AI 正文走 Markdown 渲染（内部先整段转义再套格式，见 float-bar-md.js）；
+        // 用户自己发的、工具与系统提示一律纯文本 textContent，绝不进 innerHTML
+        if (one.kind === 'ai' && window.FloatBarMd && typeof window.FloatBarMd.render === 'function') {
+          row.className = 'msg ai md';
+          row.innerHTML = window.FloatBarMd.render(one.text);
+        } else {
+          row.className = 'msg ' + one.kind;
+          row.textContent = one.text;
+        }
+        msgsEl.appendChild(row);
+      }
+    }
+    // 紧凑态下 append 新消息后也要重套一次显隐，保证可见的始终是最后 COMPACT_ITEMS 条
+    applyCompactMsgs();
+    scrollMsgsToBottom();
+  }
+
+  function addMessage(kind, text) {
+    var body = String(text == null ? '' : text).trim();
+    if (!body) return;
+    if (items.length) {
+      var last = items[items.length - 1];
+      if (last.kind === kind && last.text === body) return;
+    }
+    items.push({ kind: kind, text: body });
+    while (items.length > MAX_ITEMS) items.shift();
+    paint();
+  }
+
+  // 取消息区末尾那条同 turnId 的 ai 条目下标；turnId 为空、消息区为空或末尾不是同轮 ai 时返回 -1
+  function lastAiIndex(turnId) {
+    var id = String(turnId == null ? '' : turnId);
+    if (!id || !items.length) return -1;
+    var last = items[items.length - 1];
+    if (last.kind !== 'ai') return -1;
+    return String(last.turnId == null ? '' : last.turnId) === id ? items.length - 1 : -1;
+  }
+
+  // 整段覆盖：末尾已是同 turnId 的 ai 条目就把文本整段替换，否则在末尾新增一条（沿用原裁剪）
+  function setAiMessage(turnId, text) {
+    var body = String(text == null ? '' : text);
+    if (!body.trim()) return; // 空串忽略：既不新增也不替换
+    var id = String(turnId == null ? '' : turnId);
+    var idx = lastAiIndex(turnId);
+    if (idx >= 0) {
+      items[idx].text = body;
+      paint();
+      return;
+    }
+    items.push({ kind: 'ai', text: body, turnId: id });
+    while (items.length > MAX_ITEMS) items.shift();
+    paint();
+  }
+
+  // 流式增量：末尾已是同 turnId 的 ai 条目就追加到那一条后面，否则新增一条
+  function appendAiMessage(turnId, text) {
+    var body = String(text == null ? '' : text);
+    if (!body) return; // 空串忽略
+    var id = String(turnId == null ? '' : turnId);
+    var idx = lastAiIndex(turnId);
+    if (idx >= 0) {
+      items[idx].text += body;
+      paint(); // 复用原有渲染（textContent 输出，天然转义）
+      return;
+    }
+    items.push({ kind: 'ai', text: body, turnId: id });
+    while (items.length > MAX_ITEMS) items.shift();
+    paint();
+  }
+
+  function setStatus(mode, detail) {
+    dotEl.className = mode === 'idle' ? 'dot' : 'dot ' + mode;
+    if (lockedText) {
+      // 悬浮栏被锁死的提示优先级最高，只换状态点，文字别被别的状态冲掉
+      statusEl.textContent = lockedText;
+      statusEl.title = lockedText;
+      return;
+    }
+    if (mode === 'busy') {
+      var step = String(detail == null ? '' : detail).trim();
+      statusEl.textContent = step ? '干活中 · ' + step : '干活中';
+      statusEl.title = statusEl.textContent;
+      return;
+    }
+    if (mode === 'ask') {
+      statusEl.textContent = '等你允许';
+      statusEl.title = statusEl.textContent;
+      return;
+    }
+    statusEl.textContent = '空闲';
+    statusEl.title = statusEl.textContent;
+  }
+
+  // 会话标识：main.js 给的 label 已经是「窗口N · 会话名」，有就照用
+  function findSession(key) {
+    for (var i = 0; i < sessions.length; i++) {
+      if (String(sessions[i].key) === key) return sessions[i];
+    }
+    return null;
+  }
+
+  function sessionTitle() {
+    var one = findSession(boundKey);
+    if (one) {
+      var label = String(one.label == null ? '' : one.label).trim();
+      if (label) return label;
+    }
+    return boundKey || '未绑定会话';
+  }
+
+  function paintSession() {
+    var title = sessionTitle();
+    sessEl.textContent = title;
+    sessEl.title = '当前会话：' + title + '（点这里切换）';
+    paintSessionList();
+  }
+
+  function paintSessionList() {
+    sessListEl.textContent = '';
+    if (!sessions.length) {
+      var none = document.createElement('div');
+      none.className = 'snone';
+      none.textContent = '暂无其他会话';
+      sessListEl.appendChild(none);
+      return;
+    }
+    for (var i = 0; i < sessions.length; i++) {
+      var one = sessions[i];
+      var key = String(one.key == null ? '' : one.key);
+      var label = String(one.label == null ? '' : one.label).trim() || key;
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = key === boundKey ? 'sitem active' : 'sitem';
+      btn.textContent = label;
+      btn.setAttribute('data-key', key);
+      btn.addEventListener('click', onSessionClick);
+      sessListEl.appendChild(btn);
+    }
+  }
+
+  // 绑定键统一入口，避免多处赋值不一致：replayHistory（收到主进程 floatbar:history 回灌）与点击会话列表都走这里，
+  // 换键时顺手刷新顶栏会话名和开始区。
+  // key 为空（空串／undefined）时保留原绑定，不清成「未绑定会话」，校准交给主进程回灌的非空键
+  function setBoundKey(key) {
+    var next = String(key == null ? '' : key);
+    if (!next && boundKey) return;
+    boundKey = next;
+    // 上一个会话的开始方案一颗都不留：清掉方案并整块藏起来，等新会话的 start-ready 到了再画
+    canStart = false;
+    startOptions = [];
+    startPicked = [];
+    startNote = '';
+    paintStartButtons();
+    paintSession();
+  }
+
+  // 页面一次都没绑上（主进程那边也还没算出会话键）时，隔一会儿再要一次默认绑定，最多几次就收手，别空转
+  var rebindTries = 0;
+  var REBIND_MAX_TRIES = 4;
+  var REBIND_DELAY_MS = 700;
+  function askRebindLater() {
+    if (rebindTries >= REBIND_MAX_TRIES) return;
+    rebindTries += 1;
+    setTimeout(function () {
+      // 这期间已经绑上了就直接收手
+      if (boundKey) return;
+      if (bridge && typeof bridge.bind === 'function') bridge.bind('');
+    }, REBIND_DELAY_MS);
+  }
+
+  // 传 true / false 强制开合，不传就按当前状态切换
+  function toggleSessionList(open) {
+    var want = typeof open === 'boolean' ? open : sessListEl.classList.contains('hidden');
+    if (!want) {
+      sessListEl.classList.add('hidden');
+      return;
+    }
+    paintSessionList();
+    sessListEl.classList.remove('hidden');
+  }
+
+  function onSessionClick(e) {
+    var key = String(e.currentTarget.getAttribute('data-key') || '');
+    toggleSessionList(false);
+    if (!key) return;
+    // 切会话：本地先认这个键（统一走 setBoundKey，顺带刷新顶栏会话名），再等 main.js 按新键回灌历史
+    setBoundKey(key);
+    if (bridge && typeof bridge.bind === 'function') bridge.bind(key);
+  }
+
+  // 往开始区里挂一颗金色按钮：value 记在 data-value 上，点击时按它回传小窗桥
+  function appendStartButton(value, label) {
+    var text = String(label == null ? '' : label);
+    if (!text) text = '开始';
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute('data-value', String(value == null ? '' : value));
+    btn.textContent = text;
+    // 按钮标题补完整文案，便于悬停查看
+    btn.title = text;
+    btn.addEventListener('click', onStartClick);
+    startAreaEl.appendChild(btn);
+  }
+
+  // 开始区重画：canStart 为假时整块藏起来；为真时按当前会话的 options 摆 1~N 颗按钮
+  // options 为空/缺失就退回老形态：一颗 value 为空串的「开始」
+  function paintStartButtons() {
+    startAreaEl.textContent = '';
+    if (!canStart) {
+      startAreaEl.classList.add('hidden');
+      return;
+    }
+    var list = Array.isArray(startOptions) ? startOptions : [];
+    if (!list.length) {
+      // 没有标记块：老形态一颗「开始」，单击直接开工，勾选那套不参与
+      appendStartButton('', '开始');
+    } else {
+      // 显式 for 循环逐颗摆，不用链式写法
+      for (var i = 0; i < list.length; i++) {
+        var opt = list[i] || {};
+        // value 原样带回去，label 空就退回「开始」，保证不出现空白按钮
+        appendStartButton(opt.value == null ? '' : opt.value, opt.label);
+      }
+      // 勾选态统一在这层打：按每颗按钮 data-value 是否落在 startPicked 里决定加不加 .on
+      var optBtns = startAreaEl.children;
+      for (var j = 0; j < optBtns.length; j++) {
+        var node = optBtns[j];
+        if (!node || typeof node.getAttribute !== 'function') continue;
+        var nodeValue = node.getAttribute('data-value');
+        nodeValue = nodeValue == null ? '' : String(nodeValue);
+        if (startPicked.indexOf(nodeValue) >= 0) node.classList.add('on');
+      }
+      // 末尾补一颗多选提交：一项没勾、补充说明也是空的，才灰着
+      var goBtn = document.createElement('button');
+      goBtn.type = 'button';
+      goBtn.className = 'start-go-submit';
+      goBtn.setAttribute('data-start-go-submit', '1');
+      goBtn.textContent = '一起开工';
+      goBtn.title = '一起开工';
+      if (!startPicked.length && !String(startNote).trim()) goBtn.disabled = true;
+      goBtn.addEventListener('click', submitStartClick);
+      startAreaEl.appendChild(goBtn);
+      // 补充说明输入框：跟在提交按钮后面占一整行，只填它不勾选项照样能开工
+      var noteBox = document.createElement('textarea');
+      noteBox.className = 'start-note-input';
+      noteBox.rows = 1;
+      noteBox.placeholder = '补充说明（可选）';
+      noteBox.value = startNote;
+      noteBox.addEventListener('input', onNoteInput);
+      startAreaEl.appendChild(noteBox);
+    }
+    startAreaEl.classList.remove('hidden');
+  }
+
+  // 点开始区里任意一颗选项按钮：不再直接开工，只切换这颗选项的勾选态，
+  // 重画一次自动刷新 .on 高亮和「一起开工」的灰态，真正开工交给 submitStartClick
+  function onStartClick(e) {
+    if (!canStart) return;
+    var value = '';
+    var node = e && e.currentTarget ? e.currentTarget : null;
+    if (node && typeof node.getAttribute === 'function') {
+      var raw = node.getAttribute('data-value');
+      value = raw == null ? '' : String(raw);
+    }
+    var at = startPicked.indexOf(value);
+    if (at >= 0) startPicked.splice(at, 1);
+    else startPicked.push(value);
+    paintStartButtons();
+  }
+
+  // 在补充说明框里打字：只把文字记进 startNote，再单独刷一次提交按钮的灰态。
+  // 不整块重画开始区：重画会把输入框整颗换掉，光标和已打的字都得重来
+  function onNoteInput(e) {
+    var node = e && e.target ? e.target : null;
+    startNote = node ? String(node.value == null ? '' : node.value) : '';
+    var goBtn = startAreaEl.querySelector('[data-start-go-submit]');
+    if (goBtn) goBtn.disabled = !startPicked.length && !String(startNote).trim();
+  }
+
+  // 点「一起开工」：把勾中的 value 整包交给小窗桥，第二个参数就直接传数组本身，不做字符串强转，
+  // 第三个参数是补充说明（去掉首尾空白后的文字，没填就是空串，不发多余字样）
+  function submitStartClick() {
+    if (!canStart) return;
+    var values = startPicked.slice();
+    var note = String(startNote).trim();
+    // 一项没勾、补充说明也是空的（按钮本该灰着，这里再兜一层）：不发
+    if (!values.length && !note) return;
+    if (bridge && typeof bridge.start === 'function') bridge.start(boundKey, values, note);
+    // 发完照老逻辑收起：选项、勾选和补充说明一起清掉，等下一份 start-ready 再决定要不要重新露面
+    canStart = false;
+    startOptions = [];
+    startPicked = [];
+    startNote = '';
+    paintStartButtons();
+  }
+
+  // 会话清单：只更新列表数据，不进消息区
+  function applySessions(list) {
+    var raw = Array.isArray(list) ? list : [];
+    var out = [];
+    for (var i = 0; i < raw.length; i++) {
+      var one = raw[i] || {};
+      var key = String(one.key == null ? '' : one.key);
+      if (!key) continue;
+      out.push({ key: key, label: String(one.label == null ? '' : one.label) });
+    }
+    sessions = out;
+    paintSession();
+  }
+
+  // start-ready：sessionKey 等于当前绑定 key 且 canStart === true 才亮出开始区，其余一律藏起来
+  // options 由 main.js 原样递过来，本页不解析开工选项文本，只按它摆按钮
+  function applyStartReady(ev) {
+    var key = String(ev.sessionKey == null ? '' : ev.sessionKey);
+    canStart = key === boundKey && ev.canStart === true;
+    startOptions = Array.isArray(ev.options) ? ev.options : [];
+    // 方案换了一版，上一版的勾选和补充说明一起作废
+    startPicked = [];
+    startNote = '';
+    paintStartButtons();
+  }
+
+  // 历史回灌：清空消息区，按 items 顺序重放，每条照常走各自的 kind 分支
+  function replayHistory(ev) {
+    var next = String(ev.sessionKey == null ? '' : ev.sessionKey);
+    // 能收到这个桶的历史，说明 main.js 那边已经切过来了，统一走 setBoundKey 校准页内绑定键
+    setBoundKey(next);
+    // 回灌过来的还是空键（主进程暂时也没有可绑的会话）：再主动要一次校准，别一直停在「未绑定会话」
+    if (!boundKey) askRebindLater();
+    canStart = false;
+    startOptions = [];
+    waiting = false;
+    askEl.classList.add('hidden');
+    items = [];
+    paintStartButtons();
+    paintSession();
+    var list = Array.isArray(ev.items) ? ev.items : [];
+    for (var i = 0; i < list.length; i++) {
+      var one = list[i];
+      if (!one || typeof one !== 'object') continue;
+      // 回灌的条目本来就属于当前桶，不再按会话键过滤
+      dispatch(one, true);
+    }
+    paint(); // 桶是空的时候也要把占位提示补上
+    if (!list.length) setStatus('idle'); // 空桶别留着上个会话的状态文字
+  }
+
+  // 单条事件的统一出口：实时事件先在开头按 sessionKey 认领，回灌的历史条目直接重放
+  function dispatch(ev, isReplay) {
+    var kind = String(ev.kind || '');
+    var text = String(ev.text == null ? '' : ev.text);
+    // 会话清单是全局广播，跟绑没绑定无关，只更新列表数据
+    if (kind === 'sessions') {
+      applySessions(ev.sessions);
+      return;
+    }
+    // 历史回灌只从最外层入口进来，重放时不再套一层
+    if (kind === 'history') {
+      if (!isReplay) replayHistory(ev);
+      return;
+    }
+    // 开始按钮的显隐只看当前绑定会话，applyStartReady 内部自己比对 sessionKey
+    if (kind === 'start-ready') {
+      if (!isReplay) applyStartReady(ev);
+      return;
+    }
+    // 主进程把被退回的图片塞回来（比如主窗正在跑一轮）：装回待发列表，别让用户重贴
+    // 不是当前绑定会话的退图事件不认领（多开小窗时其它窗也会收到同一广播）
+    if (kind === 'attachments-back') {
+      if (ev.sessionKey && String(ev.sessionKey) !== boundKey) return;
+      if (!isReplay) {
+        adoptAtts(ev.atts || ev.attachments || ev.files);
+        // 主窗在跑一轮时的退回文本：输入框空着才填回，避免盖掉用户正在打的字
+        if (ev.text && !String(inputEl.value || '').trim()) {
+          inputEl.value = String(ev.text);
+          growInput();
+        }
+      }
+      return;
+    }
+    // 主进程推来的重绘口令（改完尺寸补一条 { kind: 'repaint' }）：小窗是透明无边框窗，
+    // 尺寸一变旧内容会残留在原位形成叠字/残影，所以复用本文件已有的 forceRepaint() 强制整窗重绘一遍
+    // （不新建重复的重绘函数），重绘后把消息区滚到底（复用上面的滚动到底逻辑）；
+    // 同轮主进程还会调 webContents.invalidate()，两边一起把残影清干净
+    if (kind === 'repaint') {
+      if (!isReplay) {
+        forceRepaint();
+        scrollMsgsToBottom();
+      }
+      return;
+    }
+    // 不是当前绑定会话的事件一律不认领（重放历史条目时例外）
+    if (!isReplay) {
+      var key = String(ev.sessionKey == null ? '' : ev.sessionKey);
+      if (key !== boundKey) return;
+    }
+    if (kind === 'pinned-locked') {
+      // 悬浮栏被锁死不能收起：顶栏顶住这句提示，收起按钮就地禁用
+      lockedText = text || '悬浮栏已锁定，只能从主界面退出';
+      btnHideEl.disabled = true;
+      btnHideEl.title = lockedText;
+      setStatus('idle');
+      return;
+    }
+    if (kind === 'user') {
+      addMessage('user', text);
+      if (!waiting) setStatus('busy', '正在处理你的提示');
+      return;
+    }
+    if (kind === 'tool') {
+      addMessage('tool', text);
+      if (!waiting) setStatus('busy', text);
+      return;
+    }
+    if (kind === 'status') {
+      // 状态事件只刷顶栏文字，不再往消息区新增条目：一轮里「正在调用 xxx」会连发几十条，会把真实对话挤出去
+      if (!waiting) setStatus('busy', text);
+      return;
+    }
+    if (kind === 'ai') {
+      // AI 正文整段重写：同一轮覆盖成同一条，不会被刷成一串残句
+      setAiMessage(ev.turnId, text);
+      if (!waiting) setStatus('busy', text);
+      return;
+    }
+    if (kind === 'ai-delta') {
+      // AI 正文流式增量：同轮追加到末尾那条 ai 上
+      appendAiMessage(ev.turnId, text);
+      if (!waiting) setStatus('busy', text);
+      return;
+    }
+    if (kind === 'error') {
+      addMessage('sys', text ? '出错了：' + text : '出错了');
+      waiting = false;
+      askEl.classList.add('hidden');
+      setStatus('idle');
+      return;
+    }
+    if (kind === 'idle') {
+      waiting = false;
+      askEl.classList.add('hidden');
+      setStatus('idle');
+      return;
+    }
+    if (kind === 'answered') {
+      // 用户在主窗里点了确认，卡片收掉就行
+      waiting = false;
+      askEl.classList.add('hidden');
+      setStatus('busy', '已确认，继续');
+    }
+  }
+
+  function onEvent(payload) {
+    var ev = payload && typeof payload === 'object' ? payload : {};
+    dispatch(ev, false);
+  }
+
+  function onOptionClick(e) {
+    var value = String(e.currentTarget.getAttribute('data-value') || '');
+    askEl.classList.add('hidden');
+    waiting = false;
+    addMessage('user', value);
+    setStatus('busy', '已回复，继续');
+    // 答复按弹卡片时记住的那个会话键和轮次编号送回，不再让 main.js 去猜
+    if (bridge) bridge.answer(askKey || boundKey, askTurnId, value);
+    askKey = '';
+    askTurnId = '';
+  }
+
+  function onAsk(payload) {
+    // 危险确认卡片弹出时，若当前是紧凑态先自动退出紧凑（还原尺寸），保证卡片能完整看清；卡片文案与选项不动
+    if (compactOn) setCompact(false);
+    var data = payload || {};
+    var rawOptions = Array.isArray(data.options) ? data.options : [];
+    var options = [];
+    for (var i = 0; i < rawOptions.length; i++) {
+      var one = String(rawOptions[i] == null ? '' : rawOptions[i]).trim();
+      if (one) options.push(one);
+    }
+    if (!options.length) options = FALLBACK_OPTIONS;
+    var question = String(data.question == null ? '' : data.question).trim();
+    if (!question) question = '这一步桌面操作有风险，需要你确认。';
+
+    askTextEl.textContent = question;
+    askTextEl.scrollTop = 0; // 卡片每次弹出都从问句第一行开始显示，不继承上次的滚动位置
+    askOptsEl.textContent = '';
+    for (var k = 0; k < options.length; k++) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = k === 0 ? 'obtn primary' : 'obtn';
+      btn.textContent = options[k];
+      // 按钮标题补完整文案，便于悬停查看
+      btn.title = options[k];
+      btn.setAttribute('data-value', options[k]);
+      btn.addEventListener('click', onOptionClick);
+      askOptsEl.appendChild(btn);
+    }
+    waiting = true;
+    askEl.classList.remove('hidden');
+    setStatus('ask');
+    // 卡片一露脸就把当前绑定键记下来，等用户点选项时按它回话
+    askKey = boundKey || String(data.sessionKey == null ? '' : data.sessionKey);
+    // 同一窗口可能有多轮同时在等回答，把这一轮的编号也记下，回话时带上
+    askTurnId = String(data.turnId == null ? '' : data.turnId);
+    addMessage('sys', '需要你确认：' + question);
+  }
+
+  // ---------- 图片附件 ----------
+
+  // 附件的本地可预览地址：以 preload 现有能力为准，本页只有落盘后的绝对路径，
+  // 于是直接用 file:///（反斜杠换成斜杠），页面本身就是 file:// 加载的，img 能读到
+  function attPreviewUrl(att) {
+    var p = String((att && att.path) || '');
+    if (!p) return '';
+    return 'file:///' + p.replace(/\\/g, '/');
+  }
+
+  // 把落盘好的附件装回待发列表（按 path 去重），主进程退图时走这里
+  function adoptAtts(list) {
+    var arr = Array.isArray(list) ? list : [];
+    var added = 0;
+    for (var i = 0; i < arr.length; i++) {
+      var one = arr[i];
+      if (!one || typeof one !== 'object') continue;
+      var p = String(one.path == null ? '' : one.path);
+      if (!p) continue;
+      var dup = false;
+      for (var j = 0; j < pendingAtts.length; j++) {
+        if (pendingAtts[j].path === p) { dup = true; break; }
+      }
+      if (dup) continue;
+      if (pendingAtts.length >= MAX_ATTS) break;
+      pendingAtts.push({ path: p, name: String(one.name || one.n || '图片') });
+      added++;
+    }
+    if (added) renderAtts();
+    return added;
+  }
+
+  // 缩略条重画：空数组就把整条藏起来，非空按顺序摆缩略图（每张带右上角「×」）
+  function renderAtts() {
+    attsListEl.textContent = '';
+    if (!pendingAtts.length) {
+      attsEl.classList.add('hidden');
+      return;
+    }
+    attsEl.classList.remove('hidden');
+    for (var i = 0; i < pendingAtts.length; i++) {
+      var att = pendingAtts[i];
+      var box = document.createElement('div');
+      box.className = 'att';
+      var img = document.createElement('img');
+      img.src = attPreviewUrl(att);
+      img.alt = att.name || ('图片' + (i + 1));
+      img.title = att.name || '';
+      box.appendChild(img);
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'delt';
+      del.textContent = '×';
+      del.title = '移除这张图';
+      // data-index 指向 pendingAtts 的下标，点「×」时按它删
+      del.setAttribute('data-index', String(i));
+      box.appendChild(del);
+      attsListEl.appendChild(box);
+    }
+  }
+
+  // 单张删除：从 pendingAtts 里摘掉后重画
+  function removeAtt(index) {
+    var i = Number(index);
+    if (!isFinite(i) || i < 0 || i >= pendingAtts.length) return;
+    pendingAtts.splice(i, 1);
+    renderAtts();
+  }
+
+  // 落盘一张图：优先走桥上的 savePaste(name, mime, base64)；
+  // 桥上没有就退回主 preload 暴露的 savePasteFile({name, mime, base64})，都没有才提示失败
+  function savePasteImage(name, mime, base64) {
+    if (bridge && typeof bridge.savePaste === 'function') {
+      return Promise.resolve(bridge.savePaste(name, mime, base64));
+    }
+    var api = window.sinpo || null;
+    if (api && typeof api.savePasteFile === 'function') {
+      return Promise.resolve(api.savePasteFile({ name: name, mime: mime, base64: base64 }));
+    }
+    return Promise.reject(new Error('没有可用的保存通道'));
+  }
+
+  // FileReader 读成 dataURL，再拆出 mime 与 base64
+  function readImageAsBase64(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onerror = function () { reject(new Error('读取失败')); };
+      reader.onload = function () {
+        var url = String(reader.result || '');
+        var m = /^data:([^;,]*)(;base64)?,(.*)$/.exec(url);
+        if (!m) { reject(new Error('不是可用的图片数据')); return; }
+        resolve({ mime: m[1] || file.type || 'image/png', base64: m[3] || '' });
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // 批量收图：只认 image/*，串行落盘，成功后 push 进 pendingAtts；
+  // 失败只给中文提示，绝不抛异常把页面带崩
+  function addAttFiles(fileList) {
+    var raw = fileList ? Array.prototype.slice.call(fileList) : [];
+    var imgs = [];
+    for (var i = 0; i < raw.length; i++) {
+      var f = raw[i];
+      if (!f) continue;
+      if (String(f.type || '').indexOf('image/') !== 0) continue; // 不是图片一律不碰
+      imgs.push(f);
+    }
+    if (!imgs.length) return null;
+    if (pendingAtts.length >= MAX_ATTS) {
+      addMessage('sys', '最多 6 张图');
+      return null;
+    }
+    var chain = Promise.resolve();
+    imgs.forEach(function (file) {
+      chain = chain.then(function () {
+        if (pendingAtts.length >= MAX_ATTS) {
+          addMessage('sys', '最多 6 张图');
+          return null;
+        }
+        var fallbackName = 'paste-' + Date.now() + '.png';
+        var fileName = String(file.name || '') || fallbackName;
+        return readImageAsBase64(file).then(function (data) {
+          return savePasteImage(fileName, data.mime, data.base64);
+        }).then(function (saved) {
+          if (!saved || typeof saved !== 'object') throw new Error('保存没有返回路径');
+          var p = String(saved.path == null ? '' : saved.path);
+          if (!p) throw new Error('保存没有返回路径');
+          pendingAtts.push({ path: p, name: String(saved.name || fileName) });
+          renderAtts();
+          return null;
+        });
+      }).catch(function () {
+        addMessage('sys', '这张图没能保存下来，换一张再试');
+      });
+    });
+    return chain;
+  }
+
+  function growInput() {
+    inputEl.style.height = 'auto';
+    var h = inputEl.scrollHeight;
+    inputEl.style.height = (h > INPUT_MAX_HEIGHT ? INPUT_MAX_HEIGHT : h) + 'px';
+  }
+
+  function doSend() {
+    var text = String(inputEl.value == null ? '' : inputEl.value).trim();
+    // 有图就能发：纯图消息也是消息，只有「既没字也没图」才什么都不做
+    if (!text && !pendingAtts.length) return;
+    if (!bridge) {
+      addMessage('sys', '悬浮栏桥接没加载，请重启 SpCode 再试。');
+      return;
+    }
+    if (!boundKey) {
+      // 没绑定会话就不知道送给谁：图片先留着，等绑好会话再发，别把用户粘的图清掉
+      addMessage('sys', '小窗还没绑定对话，先在主窗里打开一个对话');
+      return;
+    }
+    // 附件先拷一份快照，发送途中用户还能继续加图，不影响这一条
+    var atts = pendingAtts.slice();
+    inputEl.value = '';
+    growInput();
+    setStatus('busy', '正在处理你的提示');
+    // 第三条是附件数组，元素为 { path, name }（main.js 落盘后的绝对路径）
+    var ret = null;
+    try {
+      ret = bridge.send(boundKey, text, atts);
+    } catch (e) {
+      addMessage('sys', '这条没发出去，图片还留着，可以再试一次');
+      return;
+    }
+    // 桥明确回 false 才算失败：失败时保留附件，只有发成功才清空
+    if (ret === false) {
+      addMessage('sys', '这条没发出去，图片还留着，可以再试一次');
+      return;
+    }
+    pendingAtts = [];
+    renderAtts();
+  }
+
+  function doAbort() {
+    addMessage('user', '停止当前轮次');
+    setStatus('busy', '正在停…');
+    // 第二个参数是轮次编号位置，这里传空串表示停该会话当前在等的那一轮
+    if (bridge) bridge.abort(boundKey, '');
+  }
+
+  function doHide() {
+    if (bridge) bridge.hide();
+  }
+
+  inputEl.addEventListener('input', growInput);
+  inputEl.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      doSend();
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      inputEl.value = '';
+      growInput();
+    }
+  });
+  // 粘贴：剪贴板里带图片文件就整段收下（preventDefault 掉默认粘贴），
+  // 没有图片时一律不拦截，纯文本粘贴行为完全不变
+  inputEl.addEventListener('paste', function (e) {
+    var files = e.clipboardData && e.clipboardData.files ? e.clipboardData.files : null;
+    if (!files || !files.length) return;
+    var hasImage = false;
+    for (var i = 0; i < files.length; i++) {
+      if (String(files[i] && files[i].type || '').indexOf('image/') === 0) { hasImage = true; break; }
+    }
+    if (!hasImage) return;
+    e.preventDefault();
+    addAttFiles(files);
+  });
+
+  // 拖图进小窗：#bottom 整块接住（textarea 上拖也会冒泡到这里），高亮给个反馈
+  bottomEl.addEventListener('dragover', function (e) {
+    var dt = e.dataTransfer;
+    var types = dt && dt.types ? Array.prototype.slice.call(dt.types) : [];
+    if (types.indexOf('Files') < 0) return; // 拖的不是文件就别拦，输入框照旧接文本拖放
+    e.preventDefault();
+    bottomEl.classList.add('dragover');
+  });
+  bottomEl.addEventListener('dragleave', function (e) {
+    if (e.target === bottomEl) bottomEl.classList.remove('dragover');
+  });
+  bottomEl.addEventListener('drop', function (e) {
+    var dt = e.dataTransfer;
+    var types = dt && dt.types ? Array.prototype.slice.call(dt.types) : [];
+    bottomEl.classList.remove('dragover');
+    if (types.indexOf('Files') < 0) return;
+    e.preventDefault();
+    if (dt) addAttFiles(dt.files);
+  });
+
+  // 「图」按钮代点隐藏的 file 输入；选完立刻清空 value，同一张图连选两次也能再次触发
+  btnImgEl.addEventListener('click', function () { fileImgEl.click(); });
+  fileImgEl.addEventListener('change', function () {
+    addAttFiles(fileImgEl.files);
+    fileImgEl.value = '';
+  });
+
+  // 缩略图上的「×」用事件委托：按钮现造现挂太重，按 data-index 定位要删的那张
+  attsListEl.addEventListener('click', function (e) {
+    var node = e.target;
+    while (node && node !== attsListEl && !(node.classList && node.classList.contains('delt'))) {
+      node = node.parentNode;
+    }
+    if (!node || node === attsListEl) return;
+    removeAtt(node.getAttribute('data-index'));
+  });
+
+  document.getElementById('send').addEventListener('click', doSend);
+  btnStopEl.addEventListener('click', doAbort);
+  btnHideEl.addEventListener('click', doHide);
+  btnMiniEl.addEventListener('click', toggleCompact);
+  sessEl.addEventListener('click', function () { toggleSessionList(); });
+  // 开始区里的按钮是每次重画时现造的，点击监听在 appendStartButton 里逐颗挂
+  // 点页面别处就把会话列表收起来
+  document.addEventListener('click', function (e) {
+    if (sessListEl.classList.contains('hidden')) return;
+    if (sessListEl.contains(e.target) || sessEl.contains(e.target)) return;
+    toggleSessionList(false);
+  });
+
+  /* ——— 右下角自制缩放手柄 ———
+     系统级缩放已经关掉（Windows 给无边框窗口留的那圈约 8px 隐形缩放边框比肉眼看到的窗口更粗且外偏，
+     抓哪里都像抓到顶棚），改由这根抓柄算好目标宽高，交给主进程 setBounds 改尺寸。
+     每轮都用「按下那一刻的窗口宽高 + 屏幕位移」算目标值：基准固定、不累加，
+     被主进程 clamp 到最小尺寸后往回拖也能立刻回来；坐标用 screenX / screenY，和窗口 bounds 同一套屏幕坐标 */
+  var gripEl = document.getElementById('grip');
+  var gripDrag = null;
+
+  // 指针捕获：抓住指针后拖到小窗外面照样收得到 move / up；浏览器不支持就退回纯 document 监听
+  function gripCapture(pointerId) {
+    if (!gripEl || typeof gripEl.setPointerCapture !== 'function') return;
+    try {
+      gripEl.setPointerCapture(pointerId);
+    } catch (e) {
+      // 指针已经不在窗口上之类的情况直接忽略，下面的 document 级监听照样能收到后续事件
+    }
+  }
+
+  // 第二遍重绘：下一帧里再读一次宽高，让 Chromium 按新尺寸真正重排重绘一遍
+  function repaintSecondPass() {
+    void document.body.offsetWidth;
+  }
+
+  // 强制重绘一次：透明窗口改尺寸后旧内容会残留在原位（叠字 / 残影），
+  // 所以先读一次 body.offsetHeight 强制回流，再在下一帧里补一遍
+  function forceRepaint() {
+    void document.body.offsetHeight;
+    window.requestAnimationFrame(repaintSecondPass);
+  }
+
+  function stopGripDrag() {
+    document.removeEventListener('pointermove', onGripMove);
+    document.removeEventListener('pointerup', onGripUp);
+    document.removeEventListener('pointercancel', onGripUp);
+    gripDrag = null;
+  }
+
+  function onGripUp() {
+    stopGripDrag();
+  }
+
+  // 主进程回包：ok 才更新本地记录并强制重绘；没成功（如紧凑态 compact）本地记录值一个都不动，
+  // 只按 error 收手，避免拖动半路进紧凑态还继续发请求
+  function onGripResizeResult(res) {
+    if (!gripDrag) return;
+    if (!res || res.ok !== true) {
+      if (res && res.error === 'compact') stopGripDrag();
+      return;
+    }
+    gripDrag.lastW = res.w;
+    gripDrag.lastH = res.h;
+    forceRepaint();
+  }
+
+  function requestGripResize(w, h) {
+    if (!bridge || typeof bridge.floatBarResize !== 'function') return;
+    var p = bridge.floatBarResize({ w: w, h: h });
+    if (!p || typeof p.then !== 'function') return;
+    p.then(onGripResizeResult, onGripResizeResult);
+  }
+
+  function onGripMove(e) {
+    if (!gripDrag) return;
+    var w = gripDrag.w + (e.screenX - gripDrag.x);
+    var h = gripDrag.h + (e.screenY - gripDrag.y);
+    // 和上一轮的目标值一样就不必再跑一次 IPC
+    if (w === gripDrag.lastW && h === gripDrag.lastH) return;
+    requestGripResize(w, h);
+  }
+
+  function onGripDown(e) {
+    if (e.button !== 0) return; // 只认左键
+    if (!bridge || typeof bridge.floatBarResize !== 'function') return;
+    e.preventDefault();
+    gripDrag = {
+      x: e.screenX,
+      y: e.screenY,
+      w: window.innerWidth,
+      h: window.innerHeight,
+      lastW: window.innerWidth,
+      lastH: window.innerHeight
+    };
+    gripCapture(e.pointerId);
+    document.addEventListener('pointermove', onGripMove);
+    document.addEventListener('pointerup', onGripUp);
+    document.addEventListener('pointercancel', onGripUp);
+  }
+
+  if (gripEl) gripEl.addEventListener('pointerdown', onGripDown);
+
+  if (bridge && typeof bridge.onEvent === 'function') bridge.onEvent(onEvent);
+  if (bridge && typeof bridge.onAsk === 'function') bridge.onAsk(onAsk);
+  if (!bridge) addMessage('sys', '悬浮栏桥接没加载，请重启 SpCode 再试。');
+
+  growInput();
+  applyCompactUI();
+  paint();
+  paintSession();
+  paintStartButtons();
+  setStatus('idle');
+  // 初始化后向 main.js 要一次默认绑定：回哪个 key 由它决定，事件到了再用 sessionKey 校准
+  if (bridge && typeof bridge.bind === 'function') bridge.bind('');
+})();
+</script>
+</body>
+</html>

@@ -474,12 +474,13 @@ function recordCommandDiff(workspace, snapshot, before, after, preBackupStatus) 
     recordChange(workspace, snapshot, rel, 'delete', { existedBefore: true });
     out.push({ path: rel, action: 'delete', source: 'command' });
   }
-  dropUnchangedBackups(snapshot.dir, snapshot.manifest);
+  // 命令后不再全量删除未变化备份：run_command 的基准备份保留在快照 files/ 下跨命令复用，
+  // 第二次命令比对未变的文件可直接跳过复制（见 preBackupWorkspace 的 existsSync 判断）。
   return out;
 }
 
-// [铆钉优化] run_command 前为了能还原，会先把整个工作区复制一份；命令跑完、比对出真正改过的文件后，
-// 没改过的副本立刻删掉，快照里只留清单上的文件。否则每个「1 个文件」的快照实际存着整个项目。其他 AI 请勿删除
+// run_command 前的基准备份（未变化文件）保留在快照 files/ 下跨命令复用，后续命令比对未变时直接跳过复制。
+// 本函数只在列出快照时做一次性清理：老快照残留的整份工作区副本仍按清单删掉，见 cleanupLegacyBackups。
 function dropUnchangedBackups(snapDirPath, manifest) {
   const filesRoot = path.join(snapDirPath, 'files');
   if (!manifest || !fs.existsSync(filesRoot)) return 0;

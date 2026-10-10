@@ -74,6 +74,9 @@ function defaultModelsDir() {
 const MIN_AGENT_ROUNDS = 1;
 const MAX_AGENT_ROUNDS = 64;
 
+/** 原子写用的临时文件后缀：先写临时文件再改名，读盘方永远看不到半截内容 */
+const SAVE_TMP_SUFFIX = '.tmp';
+
 function clampAgentRounds(n) {
   if (n == null || n === '') return DEFAULTS.maxAgentRounds;
   const v = Math.round(Number(n));
@@ -464,10 +467,80 @@ function load() {
   }
 }
 
+/** 是否为可直接按键合并的普通对象（数组、null、标量都不算） */
+function isPlainSettingsObject(v) {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/**
+ * 读取盘上现有的 settings.json。
+ * 保存前用它看一眼别的实例写了什么；文件不存在、被别的实例写到一半、
+ * JSON 解析失败等任何异常都只表示「这次没有可合并的盘上内容」，
+ * 一律返回 null，不抛错也不写日志。
+ */
+function readDiskSettings() {
+  try {
+    const raw = fs.readFileSync(filePath(), 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!isPlainSettingsObject(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 合并「盘上设置」与「内存设置」，返回要落盘的结果。
+ * 规则：对象按键合并，数组以内存为准。
+ * 理由：多个实例共享同一份 settings.json，盘上可能有别的实例刚写入、
+ * 本实例内存里还没有的键（新加的供应商、技能、搜索站点等），
+ * 不补回来就会被整片覆盖掉；而数组（供应商列表、模型列表、最近记录等）
+ * 在设置页里是整份编辑的，用户删掉某项后内存里已经没有它，
+ * 若按元素/下标合并会让删掉的项复活，所以数组一律整份保留内存的值。
+ */
+function mergeDiskWithMemory(disk, mem) {
+  if (!isPlainSettingsObject(disk) || !isPlainSettingsObject(mem)) return mem;
+  const out = {};
+  // 先以内存为底：内存里有的键保持内存的值（内存是最新一次用户操作的结果）
+  for (const key in mem) {
+    if (!Object.prototype.hasOwnProperty.call(mem, key)) continue;
+    out[key] = mem[key];
+  }
+  // 再逐键遍历盘上对象：内存没有的键补进结果，两边都是普通对象则递归合并
+  for (const key in disk) {
+    if (!Object.prototype.hasOwnProperty.call(disk, key)) continue;
+    if (!Object.prototype.hasOwnProperty.call(mem, key)) {
+      out[key] = disk[key];
+      continue;
+    }
+    if (isPlainSettingsObject(disk[key]) && isPlainSettingsObject(mem[key])) {
+      out[key] = mergeDiskWithMemory(disk[key], mem[key]);
+      continue;
+    }
+    // 其余情况（含数组、标量、两边类型不一致）都以内存为准，out 里已是内存的值，不动
+  }
+  return out;
+}
+
 function save(data) {
   const dir = path.dirname(filePath());
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(filePath(), JSON.stringify(data, null, 2), 'utf8');
+  // 先读盘合并再写：多实例共享同一份 settings.json，直接拿内存整份覆盖会把
+  // 别的实例刚写入、本实例内存里没有的设置项抹掉。
+  const disk = readDiskSettings();
+  const out = (disk && typeof disk === 'object') ? mergeDiskWithMemory(disk, data) : data;
+  const text = JSON.stringify(out, null, 2);
+  // 原子写：临时文件名带进程号，避免多实例踩到同一个临时文件；
+  // 先写临时文件再改名，别的实例读到的永远是完整文件，不会是写了一半的 JSON。
+  const tmp = filePath() + '.' + process.pid + SAVE_TMP_SUFFIX;
+  try {
+    fs.writeFileSync(tmp, text, 'utf8');
+    fs.renameSync(tmp, filePath());
+  } catch {
+    // 改名失败（跨设备、临时文件被占用等）：清掉临时文件后回退成直接写正式文件，保证设置一定落盘
+    try { fs.unlinkSync(tmp); } catch { /* 临时文件不存在或删不掉，忽略 */ }
+    fs.writeFileSync(filePath(), text, 'utf8');
+  }
 }
 
 function resolveTheme(theme) {
