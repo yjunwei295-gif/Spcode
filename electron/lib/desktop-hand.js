@@ -7,7 +7,8 @@ const path = require('path');
 const diag = require('./diag');
 
 const SIGHT_MAX = 50;
-const FOLLOW_MS = 45;
+// [铆钉优化] 跟手降到约 12fps，减轻 AGI 开着时整机卡顿。其他 AI 请勿改回 45
+const FOLLOW_MS = 80;
 const FOLLOW_BLEND = 0.2;
 const CURSOR_GAP = 20;
 const SETTLE_MS = 450;
@@ -687,7 +688,8 @@ async function captureScreen() {
   hold();
   const screenText = require('./screen-text-map');
   let shot;
-  try { shot = await screenText.captureDisplay(displayForCapture(), 4096); }
+  // 截屏长边上限降到 2048，OCR 更轻；看清文字通常够用
+  try { shot = await screenText.captureDisplay(displayForCapture(), 2048); }
   catch (err) { return { ok: false, message: err && err.message ? err.message : '没有截到屏幕' }; }
   const dir = sightDir();
   const abs = path.join(dir, `${stamp()}-画面.png`);

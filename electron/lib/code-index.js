@@ -16,7 +16,12 @@ const MAX_FILE_BYTES = 400 * 1024;
 const MAX_FILES = 4000;
 const DEFAULT_TOP = 12;
 const MAX_TOP = 30;
+// 单次模型归纳的方法条数（大文件分多批，见 summarizeFileMethods）
 const SUMMARY_MAX_METHODS = 40;
+// 单文件最多补嚼多少个方法名，避免超大 C# 永远只填前 40
+const SUMMARY_MAX_METHODS_TOTAL = 120;
+// 后台缺口补嚼：每轮最多啃几个「方法多、摘要少」的文件
+const GAP_FILL_MAX_FILES = 8;
 // map_lookup 单次返回的方法条数上限与模块条数上限（控制返回体 token）
 const LOOKUP_MAX_METHODS = 30;
 const LOOKUP_MAX_MODULES = 10;
@@ -576,11 +581,98 @@ function symbolKind(ext) {
   if (ext === ".r") return "r";
   return "";
 }
-function pushSymbol(out, seen, name, line) {
+function pushSymbol(out, seen, name, line, endLine) {
   const n = String(name || "").trim();
   if (!isSymbolName(n) || seen.has(n) || out.length >= MAX_SYMBOLS_PER_FILE) return;
   seen.add(n);
-  out.push({ name: n, line: line || 1 });
+  const start = line || 1;
+  out.push({ name: n, line: start, endLine: endLine && endLine >= start ? endLine : start });
+}
+// 去掉行内字符串与注释，方便数 { }（不追求完整词法，够估方法边界）
+function stripLineNoise(line) {
+  let out = "";
+  let inStr = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    const n = line[i + 1];
+    if (inStr) {
+      if (c === "\\") { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") { inStr = c; continue; }
+    if (c === "/" && n === "/") break;
+    if (c === "/" && n === "*") {
+      const end = line.indexOf("*/", i + 2);
+      if (end < 0) break;
+      i = end + 1;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+function isIndentLang(ext) {
+  const lang = langOf(ext);
+  const kind = symbolKind(ext);
+  return lang === "py" || kind === "yaml" || kind === "yml";
+}
+// 括号语言：从符号行起找配对 }，单次最多跨 SPAN_MAX_LINES 行
+const SPAN_MAX_LINES = 800;
+function findBraceBlockEnd(lines, startIdx) {
+  let depth = 0;
+  let seen = false;
+  const limit = Math.min(lines.length, startIdx + SPAN_MAX_LINES);
+  for (let i = startIdx; i < limit; i++) {
+    const raw = stripLineNoise(lines[i] || "");
+    if (i === startIdx && /;\s*$/.test(raw.trim()) && raw.indexOf("{") < 0) return startIdx;
+    for (let j = 0; j < raw.length; j++) {
+      const ch = raw[j];
+      if (ch === "{") { depth++; seen = true; }
+      else if (ch === "}" && seen) {
+        depth--;
+        if (depth <= 0) return i;
+      }
+    }
+  }
+  if (!seen) return startIdx;
+  return null;
+}
+// Python / YAML：按缩进估块尾
+function findIndentBlockEnd(lines, startIdx) {
+  const base = ((lines[startIdx] || "").match(/^(\s*)/) || ["", ""])[1].length;
+  let end = startIdx;
+  let sawBody = false;
+  const limit = Math.min(lines.length, startIdx + SPAN_MAX_LINES);
+  for (let i = startIdx + 1; i < limit; i++) {
+    const s = lines[i] || "";
+    if (!s.trim()) { end = i; continue; }
+    if (/^\s*#/.test(s) && !sawBody) { end = i; continue; }
+    const ind = (s.match(/^(\s*)/) || ["", ""])[1].length;
+    if (ind > base) { sawBody = true; end = i; continue; }
+    break;
+  }
+  return end;
+}
+// 给已抽出的符号补 endLine：代码边界为准，供 AI 按段 read_file，禁止整文件通读
+function attachSymbolSpans(text, symbols, ext) {
+  if (!symbols || !symbols.length || !text) return symbols || [];
+  const lines = text.split(/\r?\n/);
+  const ordered = symbols.slice().sort((a, b) => (a.line || 1) - (b.line || 1));
+  const indent = isIndentLang(ext);
+  for (let i = 0; i < ordered.length; i++) {
+    const s = ordered[i];
+    const startIdx = Math.max(0, (s.line || 1) - 1);
+    const nextIdx = i + 1 < ordered.length
+      ? Math.max(0, (ordered[i + 1].line || lines.length + 1) - 1)
+      : lines.length;
+    let endIdx = indent ? findIndentBlockEnd(lines, startIdx) : findBraceBlockEnd(lines, startIdx);
+    if (endIdx == null || endIdx < startIdx) endIdx = Math.max(startIdx, nextIdx - 1);
+    // 同级下一个符号更近时，以更近者为界（避免类方法误吞到下一个方法）
+    if (nextIdx > startIdx && endIdx >= nextIdx) endIdx = nextIdx - 1;
+    s.endLine = Math.min(lines.length, Math.max(s.line || 1, endIdx + 1));
+  }
+  return symbols;
 }
 function lineOfKey(lines, name) {
   const re = new RegExp('"' + String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"\\s*:');
@@ -619,6 +711,11 @@ function extractMdHeadings(text) {
     const name = m[2].replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").trim().slice(0, 80);
     pushSymbol(out, seen, name, i + 1);
   }
+  // 标题块：到下一个同级/更高级标题前一行
+  for (let i = 0; i < out.length; i++) {
+    const next = i + 1 < out.length ? out[i + 1].line - 1 : lines.length;
+    out[i].endLine = Math.max(out[i].line, next);
+  }
   return out;
 }
 // 单独成行、后面可以跟正文的短标题。长句子和带句号的行不抽
@@ -638,9 +735,13 @@ function extractTxtTitles(text) {
 function extractSymbols(text, ext) {
   const kind = symbolKind(ext);
   if (!text) return [];
-  if (kind === "json") return extractJsonSymbols(text);
+  if (kind === "json") return attachSymbolSpans(text, extractJsonSymbols(text), ext);
   if (kind === "md") return extractMdHeadings(text);
-  if (kind === "txt") return extractTxtTitles(text);
+  if (kind === "txt") {
+    const t = extractTxtTitles(text);
+    for (const s of t) s.endLine = s.endLine || s.line;
+    return t;
+  }
   const rules = SYMBOL_RULES[kind || langOf(ext)];
   if (!rules) return [];
   const lines = text.split(/\r?\n/);
@@ -661,11 +762,11 @@ function extractSymbols(text, ext) {
         const name = String(m[1] || "").trim();
         if (!isSymbolName(name) || seen.has(name)) continue;
         seen.add(name);
-        out.push({ name, line: i + 1 });
+        out.push({ name, line: i + 1, endLine: i + 1 });
       }
     }
   }
-  return out;
+  return attachSymbolSpans(text, out, ext);
 }
 function resolveDepToFile(workspace, dir, dep) {
   if (!dep.startsWith(".")) return null;
@@ -851,6 +952,9 @@ async function buildMap(workspace, extra, opts, signal) {
     summarizeIncludes(workspace, inc.includes, cfg).catch((e) => {
       diag.log("map", "绘制后方法归纳失败", { message: e && e.message });
     });
+  } else {
+    // 未勾选 include 时仍尝试对已有地图做缺口补嚼（有模型才跑）
+    try { scheduleGapFill(workspace); } catch (_) { /* ignore */ }
   }
   return mapData;
 }
@@ -903,14 +1007,52 @@ function reverseDeps(mapData) {
   }
   return rev;
 }
+// 展示起止行；跨度过大时提示先读前 120 行，避免一次吞整类
 function fmtMethod(m) {
-  const line = m.line ? " :" + m.line : "";
+  const start = Number(m.line) || 0;
+  const end = Number(m.endLine) || start;
+  let line = "";
+  if (start && end && end > start) {
+    line = " :" + start + "-" + end;
+    if (end - start + 1 > 200) {
+      const tip = start + 119;
+      line += "（跨度" + (end - start + 1) + "行，先 read_file " + start + "-" + Math.min(end, tip) + "）";
+    }
+  } else if (start) {
+    line = " :" + start;
+  }
   const kv = m.keyValues ? "（" + m.keyValues + "）" : "";
-  const desc = m.desc ? " — " + m.desc : "";
+  // 归纳可能不准，标成旁证
+  const desc = m.desc ? " — 〔归纳·仅供参考〕" + m.desc : "";
   return "  - " + (m.name || "") + line + kv + desc;
+}
+// 旧地图只有起始行时，现场补 endLine（读该文件估边界），不必等用户重绘
+// [铆钉优化] 按 mtime+size 缓存，避免每轮对话对同一批模块反复读全文。其他 AI 请勿去掉缓存
+function ensureSymbolSpans(n) {
+  if (!n || !Array.isArray(n.symbols) || !n.symbols.length) return;
+  if (!n.abs) {
+    for (const s of n.symbols) s.endLine = s.endLine || s.line || 1;
+    return;
+  }
+  let st = null;
+  try { st = fs.statSync(n.abs); } catch {
+    for (const s of n.symbols) s.endLine = s.endLine || s.line || 1;
+    return;
+  }
+  const stamp = String(fileStamp(st)) + ":" + String(st.size);
+  const missing = n.symbols.some((s) => !s.endLine || s.endLine < (s.line || 1));
+  if (!missing && n._spanKey === stamp) return;
+  try {
+    const text = fs.readFileSync(n.abs, "utf8");
+    attachSymbolSpans(text, n.symbols, n.ext || path.extname(n.path || n.abs || ""));
+    n._spanKey = stamp;
+  } catch {
+    for (const s of n.symbols) s.endLine = s.endLine || s.line || 1;
+  }
 }
 // 方法名和行号只认当前源码抽出的符号。AI 归纳只给还存在的符号补说明，名字已经不在文件里的条目直接丢掉
 function nodeMethods(n) {
+  ensureSymbolSpans(n);
   const sym = Array.isArray(n.symbols) ? n.symbols : [];
   if (!sym.length) return [];
   const aiByName = new Map();
@@ -922,19 +1064,33 @@ function nodeMethods(n) {
   const trust = n.methodsMtime != null && n.methodsMtime === n.mtime;
   return sym.map((s) => {
     const extra = trust ? aiByName.get(String(s.name || "").toLowerCase()) : null;
+    const start = s.line || 1;
+    const end = s.endLine && s.endLine >= start ? s.endLine : start;
     return {
       name: s.name,
-      line: s.line,
+      line: start,
+      endLine: end,
       keyValues: extra ? String(extra.keyValues || "") : "",
       desc: extra ? String(extra.desc || "") : ""
     };
   });
 }
-// 没有方法，或有名字但作用和关键值都空，命中后必须带上全文，否则模型看不到文件内容
+// 没有方法，或有名字但作用和关键值都空：只给路径与方法名行号，不塞全文。全文每轮进提示词会爆 token。其他 AI 请勿改回自动附全文
 function needsFullRead(n) {
   const methods = nodeMethods(n);
   if (!methods.length) return true;
   return !methods.some((m) => String(m.desc || "").trim() || String(m.keyValues || "").trim());
+}
+function appendChewedOnly(lines, n, hit) {
+  const shown = hit && hit.length ? hit : nodeMethods(n);
+  if (shown.length) {
+    lines.push("  方法（" + shown.length + "，起止行为源码边界，未附全文）：");
+    for (const m of shown.slice(0, PROMPT_MAX_METHODS)) lines.push(fmtMethod(m));
+    if (shown.length > PROMPT_MAX_METHODS) lines.push("  … 还有 " + (shown.length - PROMPT_MAX_METHODS) + " 个方法");
+  } else {
+    lines.push("  （该模块未解析出方法，也未附全文）");
+  }
+  lines.push("  有 :起-止 时用 read_file 的 startLine/endLine 只读该段（代码为准）；归纳可能不准，禁止整文件通读。");
 }
 const bodyCache = new Map();
 const BODY_CACHE_MAX = 32;
@@ -964,24 +1120,18 @@ function appendFullFile(lines, n) {
   lines.push(fileBodyForNode(n));
   lines.push("【全文结束】" + label);
 }
-// 单模块完整摘要：方法全列 + 依赖 + 被依赖。没有归纳时附上全文
+// 单模块完整摘要：方法全列 + 依赖 + 被依赖。没有归纳时只给名字行号，不附全文
 function moduleText(mapData, n, rev) {
   const lines = [];
-  lines.push("`" + n.path + "`" + (n.desc ? " — " + n.desc : ""));
-  if (n.deps && n.deps.length) lines.push("  依赖：" + n.deps.slice(0, 12).join(", ") + (n.deps.length > 12 ? " …" : ""));
+  lines.push("`" + n.path + "`" + (n.desc ? " — 〔归纳·仅供参考〕" + n.desc : ""));
+  if (n.deps && n.deps.length) lines.push("  关联脚本：" + n.deps.slice(0, 12).join(", ") + (n.deps.length > 12 ? " …" : ""));
   const by = rev.get(n.id) || [];
   if (by.length) lines.push("  被依赖：" + by.slice(0, 12).join(", ") + (by.length > 12 ? " …" : ""));
   const all = nodeMethods(n);
   if (needsFullRead(n)) {
-    if (all.length) {
-      lines.push("  方法（" + all.length + "，尚无作用与关键值）：");
-      for (const m of all) lines.push(fmtMethod(m));
-    } else {
-      lines.push("  （该模块未解析出方法，正文如下）");
-    }
-    appendFullFile(lines, n);
+    appendChewedOnly(lines, n, all);
   } else if (all.length) {
-    lines.push("  方法（" + all.length + "）：");
+    lines.push("  方法（" + all.length + "，起止行为源码边界）：");
     for (const m of all.slice(0, LOOKUP_MAX_METHODS)) lines.push(fmtMethod(m));
     if (all.length > LOOKUP_MAX_METHODS) lines.push("  … 还有 " + (all.length - LOOKUP_MAX_METHODS) + " 个方法");
   }
@@ -1093,10 +1243,7 @@ function mapTextForQuery(workspace, extra, mapData, query, opts) {
     const head = "`" + n.path + "`" + (n.desc ? " — " + n.desc : "");
     if (needsFullRead(n)) {
       const parts = [head];
-      if (hit.length) parts.push(hit.map(fmtMethod).join("\n"));
-      parts.push("【全文】" + n.path);
-      parts.push(fileBodyForNode(n));
-      parts.push("【全文结束】" + n.path);
+      appendChewedOnly(parts, n, hit);
       return parts.join("\n");
     }
     if (!hit.length) return head;
@@ -1106,7 +1253,7 @@ function mapTextForQuery(workspace, extra, mapData, query, opts) {
     const tail = total > hit.length ? "\n  （共 " + total + " 个方法，传 module=\"" + n.path + "\" 查看全部）" : "";
     return head + "\n" + ms + tail;
   });
-  return "项目地图匹配到 " + top.total + " 个模块，这是第一批，不是全部。没有作用和关键值的已附【全文】，以全文为准。作用和关键值看得懂又够用时，才用 :行号 去读要改的那一个方法。看不懂归纳，或里面没有要改的文案、数字、字段时，read_file 读原本代码，不准猜。这批对不上就换关键字继续查：\n\n" + lines.join("\n");
+  return "项目地图匹配到 " + top.total + " 个模块，这是第一批，不是全部。方法带 :起-止 源码行号；归纳仅供参考。用 read_file(startLine,endLine) 只读命中段，禁止整文件通读。这批对不上先换关键字再 map_lookup，仍不够再用 search_text：\n\n" + lines.join("\n");
 }
 // 按模块路径精确/后缀匹配取单模块摘要
 function findModule(mapData, id) {
@@ -1137,20 +1284,20 @@ function loadMapCached(workspace) {
   return data;
 }
 function appendModuleLines(lines, n, hit, rev) {
-  lines.push("`" + n.path + "`" + (n.desc ? " — " + n.desc : ""));
-  const deps = (n.deps || []).slice(0, 6);
-  if (deps.length) lines.push("  依赖：" + deps.join(", "));
+  lines.push("`" + n.path + "`" + (n.desc ? " — 〔归纳·仅供参考〕" + n.desc : ""));
+  const deps = (n.deps || []).slice(0, 8);
+  if (deps.length) lines.push("  关联脚本：" + deps.join(", "));
   const by = (rev.get(n.id) || []).slice(0, 6);
   if (by.length) lines.push("  被依赖：" + by.join(", "));
   if (needsFullRead(n)) {
-    const shown = hit.length ? hit : nodeMethods(n);
-    for (const m of shown) lines.push(fmtMethod(m));
-    appendFullFile(lines, n);
+    appendChewedOnly(lines, n, hit);
   } else {
+    lines.push("  方法（起止行为源码边界；归纳仅供参考，改前按区间读代码）：");
     for (const m of (hit.length ? hit : nodeMethods(n)).slice(0, PROMPT_MAX_METHODS)) lines.push(fmtMethod(m));
   }
 }
-const MAP_BATCH_HEAD = "【项目地图】下列是按问题打分的第一批模块，不是全部。作用和关键值看得懂、又够用时，靠总结跳过无关代码，要改某一个方法再用 :行号 读那一段。看不懂这句归纳有什么用，或者里面没有要改的文案、数字、字段时，read_file 读原本代码，不准猜。只有方法名、或作用和关键值是空的、或未解析出方法的，已附【全文】的以全文为准，不要再读一遍；没附全文的必须 read_file 整文件。这批对不上就用 map_lookup 或 search_text 继续查后面的模块。";
+// [铆钉优化] 先 map_lookup，按起止行读段；归纳仅旁证。其他 AI 请勿改回整文件通读
+const MAP_BATCH_HEAD = "【项目地图】下列是按问题打分的第一批模块，不是全部。每条方法带源码起止行（:起-止），这是定位依据。归纳文字可能不准，只能当旁证：改代码前必须用 read_file 的 startLine/endLine 只读该段核对原文，禁止整文件通读几千/几万行。关联脚本是依赖路径，需要对口时再按同样方式读对应模块的命中方法段。这批对不上时先换关键字 map_lookup；仍不够再用 search_text。同一路径本轮已读过的段不要重复整读。";
 // 每轮对话的提示词注入：本地打分取命中模块与方法行号，不调模型、不做向量，毫秒级
 // 上一轮写过的文件单独标成地图已更新，打分规则不变
 function buildPromptBlock(workspace, query, extra) {
@@ -1185,6 +1332,8 @@ function buildPromptBlock(workspace, query, extra) {
   }
   if (lines.length) parts.push(MAP_BATCH_HEAD + "\n\n" + lines.join("\n"));
   else if (!parts.length) return "";
+  // 对话用到地图时，后台排队补嚼方法多、摘要少的模块（限量，不阻塞本轮）
+  try { scheduleGapFill(workspace); } catch (_) { /* ignore */ }
   return parts.join("\n\n");
 }
 async function search(workspace, extra, q) {
@@ -1660,31 +1809,69 @@ function attachLines(methods, text) {
   }
   return methods;
 }
+// 大文件分批补作用/关键值：每批 SUMMARY_MAX_METHODS，合计不超过 SUMMARY_MAX_METHODS_TOTAL
 async function summarizeFileMethods(modelCfg, fileInfo, signal) {
-  const names = Array.isArray(fileInfo.symbols)
-    ? fileInfo.symbols.map((s) => s && s.name).filter(Boolean).slice(0, SUMMARY_MAX_METHODS)
+  const allNames = Array.isArray(fileInfo.symbols)
+    ? fileInfo.symbols.map((s) => s && s.name).filter(Boolean).slice(0, SUMMARY_MAX_METHODS_TOTAL)
     : [];
-  const nameHint = names.length
-    ? ("\n已抽出的名字，name 必须从中原样选取，不要新造：\n" + names.join("、") + "\n")
-    : "";
+  if (!allNames.length) return [];
   const sys = "你是代码分析助手。分析给定源码文件，为已有名字补上作用和关键值。只输出 JSON 数组，不要任何额外说明文字。";
-  const user =
-    "文件：" + fileInfo.path + "\n语言扩展：" + (fileInfo.ext || "") + "\n" + nameHint +
-    "\n源码：\n```\n" + fileInfo.text + "\n```\n\n" +
-    "请输出 JSON 数组，每个元素格式：{\"name\":\"方法名\",\"keyValues\":\"关键值，一行\",\"desc\":\"作用，一句话\"}。" +
-    "只输出 JSON，不要代码围栏或解释。";
-  const messages = [
-    { role: "system", content: sys },
-    { role: "user", content: user }
-  ];
-  let text = "";
-  try {
-    text = await callModelForText(modelCfg, messages, signal);
-  } catch (e) {
-    diag.log("map", "调用模型归纳失败", { message: e && e.message });
-    return [];
+  const merged = [];
+  const seen = new Set();
+  for (let i = 0; i < allNames.length; i += SUMMARY_MAX_METHODS) {
+    if (signal && signal.aborted) break;
+    const names = allNames.slice(i, i + SUMMARY_MAX_METHODS);
+    const nameHint = "\n已抽出的名字，name 必须从中原样选取，不要新造：\n" + names.join("、") + "\n";
+    const user =
+      "文件：" + fileInfo.path + "\n语言扩展：" + (fileInfo.ext || "") + "\n" + nameHint +
+      "\n源码：\n```\n" + fileInfo.text + "\n```\n\n" +
+      "请输出 JSON 数组，每个元素格式：{\"name\":\"方法名\",\"keyValues\":\"关键值，一行\",\"desc\":\"作用，一句话\"}。" +
+      "只输出 JSON，不要代码围栏或解释。本批只处理上面列出的名字。";
+    const messages = [
+      { role: "system", content: sys },
+      { role: "user", content: user }
+    ];
+    let text = "";
+    try {
+      text = await callModelForText(modelCfg, messages, signal);
+    } catch (e) {
+      diag.log("map", "调用模型归纳失败", { message: e && e.message, batch: i / SUMMARY_MAX_METHODS });
+      break;
+    }
+    for (const m of parseMethodsJson(text)) {
+      const key = String(m.name || "").toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      merged.push(m);
+    }
   }
-  return attachLines(parseMethodsJson(text), fileInfo.text);
+  return attachLines(merged, fileInfo.text);
+}
+
+// 统计节点方法摘要填充度（对齐当前符号）
+function methodFillStats(n) {
+  const methods = nodeMethods(n);
+  const sym = Array.isArray(n.symbols) ? n.symbols.length : 0;
+  let filled = 0;
+  for (const m of methods) {
+    if (String(m.desc || "").trim() || String(m.keyValues || "").trim()) filled++;
+  }
+  const total = Math.max(methods.length, sym);
+  return { total, filled, sym, ratio: total ? filled / total : 0 };
+}
+// 方法多但摘要少、或被旧上限截断：需要后台再嚼
+function needsGapSummary(n) {
+  if (!n || !n.abs) return false;
+  if (!Array.isArray(n.methods)) return true;
+  if (n.methodsMtime != null && n.mtime != null && n.methodsMtime !== n.mtime) return true;
+  const st = methodFillStats(n);
+  if (st.sym >= 8 && st.filled < Math.ceil(st.sym * 0.7)) return true;
+  if (st.sym > SUMMARY_MAX_METHODS && st.filled < Math.min(st.sym, SUMMARY_MAX_METHODS_TOTAL)) return true;
+  return false;
+}
+function gapPriority(n) {
+  const st = methodFillStats(n);
+  return (st.sym - st.filled) * 10 + st.sym;
 }
 
 function chatModelCfg() {
@@ -1751,12 +1938,22 @@ async function summarizeIncludes(workspace, includes, modelCfg, signal) {
   const map = loadJson(jsonPath(workspace), null);
   if (!map || !Array.isArray(map.nodes)) return;
   const byId = new Map(map.nodes.map((n) => [n.id, n]));
-  // 只归纳勾选且尚未归纳过的节点，已有 methods 的跳过，省 token
-  const targets = includes.map((id) => byId.get(id)).filter((n) => n && n.abs && !Array.isArray(n.methods));
+  // 未归纳 + 方法多但摘要少的缺口节点；缺口按「差多少」优先
+  const fresh = [];
+  const gaps = [];
+  for (const id of includes) {
+    const n = byId.get(id);
+    if (!n || !n.abs) continue;
+    if (!Array.isArray(n.methods)) fresh.push(n);
+    else if (needsGapSummary(n)) gaps.push(n);
+  }
+  gaps.sort((a, b) => gapPriority(b) - gapPriority(a));
+  const targets = fresh.concat(gaps);
   if (!targets.length) {
     emitStatus(workspace, { running: false, summarizing: false, summarizeDone: true, nodes: map.nodes.length, files: map.nodes.length });
     return;
   }
+  diag.log("map", "开始方法归纳", { fresh: fresh.length, gaps: gaps.length, total: targets.length });
   emitStatus(workspace, { running: true, summarizing: true, done: 0, total: targets.length, nodes: map.nodes.length, files: map.nodes.length });
   let done = 0;
   for (const n of targets) {
@@ -1787,6 +1984,46 @@ async function summarizeIncludes(workspace, includes, modelCfg, signal) {
   } finally {
     summaryJobs.delete(jobKey);
   }
+}
+
+// 对话空闲时补嚼：优先方法多、desc 少的热文件，每轮限量，不和正在改代码的模型抢接口
+const gapFillTimers = new Map();
+const GAP_FILL_DELAY_MS = 4000;
+function scheduleGapFill(workspace) {
+  if (!workspace) return;
+  const k = hashPath(workspace);
+  const old = gapFillTimers.get(k);
+  if (old) clearTimeout(old);
+  gapFillTimers.set(k, setTimeout(() => {
+    gapFillTimers.delete(k);
+    gapFillNow(workspace);
+  }, GAP_FILL_DELAY_MS));
+}
+function gapFillNow(workspace) {
+  if (!workspace) return;
+  const jobKey = hashPath(workspace);
+  if (summaryJobs.has(jobKey)) return;
+  const cfg = chatModelCfg();
+  if (!cfg) return;
+  const map = loadJson(jsonPath(workspace), null);
+  if (!map || !Array.isArray(map.nodes)) return;
+  const byId = new Map(map.nodes.map((n) => [n.id, n]));
+  const inc = loadInclude(workspace);
+  let pool = [];
+  if (inc && inc.initialized && Array.isArray(inc.includes) && inc.includes.length) {
+    pool = inc.includes.map((id) => byId.get(id)).filter(Boolean);
+  } else {
+    // 未勾选 include 时也啃缺口最大的几个，避免小项目永远半空
+    pool = map.nodes.slice();
+  }
+  const gaps = pool.filter(needsGapSummary)
+    .sort((a, b) => gapPriority(b) - gapPriority(a))
+    .slice(0, GAP_FILL_MAX_FILES);
+  if (!gaps.length) return;
+  diag.log("map", "缺口补嚼排队", { count: gaps.length, top: gaps.slice(0, 3).map((n) => n.path) });
+  summarizeIncludes(workspace, gaps.map((n) => n.id), cfg).catch((e) => {
+    diag.log("map", "缺口补嚼失败", { message: e && e.message });
+  });
 }
 
 // 点开一个节点时只归纳这一个文件，把作用和关键值补进弹窗
@@ -1849,19 +2086,28 @@ function gotoDefinition(workspace, extra, symbol) {
     const nAbs = n.abs || path.join(workspace, n.path || "");
     if (isForeignAiSkill(nAbs)) continue;
     for (const s of n.symbols || []) {
-      if (s && s.name === name) hits.push({ path: n.path, abs: n.abs, line: s.line });
+      if (s && s.name === name) {
+        ensureSymbolSpans(n);
+        hits.push({ path: n.path, abs: n.abs, line: s.line, endLine: s.endLine || s.line });
+      }
     }
   }
   if (!hits.length) return `项目地图里没有 ${name} 的定义。精确文本用 search_text。`;
   return hits.slice(0, 12).map((h) => {
     let snippet = "";
+    const from = h.line || 1;
+    const to = h.endLine && h.endLine >= from ? h.endLine : from;
     try {
       const lines = fs.readFileSync(h.abs, "utf8").split(/\r?\n/);
-      const start = Math.max(0, (h.line || 1) - 3);
-      const end = Math.min(lines.length, (h.line || 1) + 8);
+      // 定义跳转：优先展示符号起止段，过长则截前 40 行并提示按区间再读
+      const start = Math.max(0, from - 1);
+      let end = Math.min(lines.length, to);
+      let clipped = false;
+      if (end - start > 40) { end = start + 40; clipped = true; }
       snippet = lines.slice(start, end).map((ln, i) => `${start + i + 1}|${ln}`).join("\n");
+      if (clipped) snippet += `\n… 完整范围 ${from}-${to}，用 read_file startLine=${from} endLine=${to} 读全段`;
     } catch { snippet = ""; }
-    return `${h.path}:${h.line}\n${snippet}`;
+    return `${h.path}:${from}-${to}\n${snippet}`;
   }).join("\n\n");
 }
 
@@ -1870,5 +2116,5 @@ module.exports = {
   noteDiskChange, noteWatching,
   hashPath, fileKey, sameWorkspace, isIgnored, parseIgnoreLines, jsonPath, mdPath,
   getExcludes: loadExcludes, setExcludes: saveExcludes,
-  getInclude: loadInclude, setInclude, summarizeIncludes, summarizeOne
+  getInclude: loadInclude, setInclude, summarizeIncludes, summarizeOne, scheduleGapFill
 };

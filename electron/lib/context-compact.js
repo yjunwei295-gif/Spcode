@@ -174,6 +174,60 @@ function collapseDuplicateFullText(history, currentText) {
   return list;
 }
 
+// 按路径和文件版本折叠重复整读，避免重复正文占用历史上下文。
+function collapseRepeatReads(history) {
+  const list = history || [];
+  const seen = new Set();
+  let changed = false;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const item = list[i];
+    if (!item || typeof item.content !== 'string') continue;
+    const content = item.content;
+    const fileTag = '【文件】';
+    const fileAt = content.indexOf(fileTag);
+    if (fileAt < 0 || content.indexOf('全文', fileAt) < 0) continue;
+    const lineEnd = content.indexOf('\n', fileAt);
+    const header = content.slice(fileAt, lineEnd < 0 ? content.length : lineEnd);
+    if (header.indexOf('全文') < 0) continue;
+    const mtimeLabel = 'mtimeMs';
+    const bytesLabel = 'bytes';
+    const mtimeAt = header.indexOf(mtimeLabel);
+    const bytesAt = header.indexOf(bytesLabel);
+    if (mtimeAt < 0 || bytesAt < 0) continue;
+
+    let pathEnd = header.length;
+    if (mtimeAt < pathEnd) pathEnd = mtimeAt;
+    if (bytesAt < pathEnd) pathEnd = bytesAt;
+    const fullTextAt = header.indexOf('全文');
+    if (fullTextAt >= 0 && fullTextAt < pathEnd) pathEnd = fullTextAt;
+    let filePath = header.slice(fileTag.length, pathEnd).trim();
+    while (filePath && ' ：:|，,;；-'.indexOf(filePath[filePath.length - 1]) >= 0) {
+      filePath = filePath.slice(0, -1).trim();
+    }
+    if (!filePath) continue;
+
+    function readNumber(labelAt, label) {
+      let pos = labelAt + label.length;
+      while (pos < header.length && (' ：:=|，,;；'.indexOf(header[pos]) >= 0 || header.charCodeAt(pos) <= 32)) pos++;
+      const start = pos;
+      while (pos < header.length && header.charCodeAt(pos) >= 48 && header.charCodeAt(pos) <= 57) pos++;
+      return pos > start ? header.slice(start, pos) : '';
+    }
+
+    const mtimeMs = readNumber(mtimeAt, mtimeLabel);
+    const byteCount = readNumber(bytesAt, bytesLabel);
+    if (!mtimeMs || !byteCount) continue;
+    const key = filePath + '|' + mtimeMs + '|' + byteCount;
+    if (seen.has(key)) {
+      item.content = '【同一版本，未改动】' + filePath + ' 的整读结果已在新一轮出现，内容同上';
+      changed = true;
+    } else {
+      seen.add(key);
+    }
+  }
+  return changed;
+}
+
 function toolResultKey(name, args) {
   const n = String(name || '');
   const a = args || {};
@@ -338,6 +392,11 @@ function splitToolWaves(calls, readArgs) {
   for (const tc of calls || []) {
     const name = tc?.function?.name || tc?.name || '';
     if (isParallelTool(name)) {
+      // search / semantic_search 单独串行：两路同时扫盘最容易把电脑卡死
+      if (name === 'search_text' || name === 'semantic_search') {
+        waves.push({ parallel: false, kind: 'serial', calls: [tc] });
+        continue;
+      }
       const last = waves[waves.length - 1];
       if (last && last.kind === 'read') last.calls.push(tc);
       else waves.push({ parallel: true, kind: 'read', calls: [tc] });
@@ -465,6 +524,7 @@ module.exports = {
   splitHistory,
   trimHistoryLocal,
   collapseDuplicateFullText,
+  collapseRepeatReads,
   toolResultKey,
   clipToolResult,
   shrinkOlderToolMessages,

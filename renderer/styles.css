@@ -901,6 +901,95 @@ input, textarea, select, [contenteditable="true"] {
   color: var(--muted);
   user-select: none;
 }
+
+/* 预览区 Markdown 文档：与聊天气泡 md 同级排版，略加大边距便于阅读 */
+.md-doc {
+  padding: 16px 20px 28px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--text);
+}
+.md-doc > *:first-child { margin-top: 0; }
+.md-doc > *:last-child { margin-bottom: 0; }
+.md-doc p { margin: 0 0 12px; }
+.md-doc h1,
+.md-doc h2,
+.md-doc h3,
+.md-doc h4,
+.md-doc h5,
+.md-doc h6 {
+  margin: 20px 0 10px;
+  line-height: 1.35;
+  font-weight: 600;
+}
+.md-doc h1 { font-size: 22px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+.md-doc h2 { font-size: 18px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+.md-doc h3 { font-size: 16px; }
+.md-doc h4,
+.md-doc h5,
+.md-doc h6 { font-size: 14px; }
+.md-doc ul,
+.md-doc ol { margin: 0 0 12px; padding-left: 24px; }
+.md-doc li { margin: 4px 0; }
+.md-doc code {
+  font-family: Consolas, "Cascadia Mono", "Microsoft YaHei", monospace;
+  font-size: 12.5px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.md-doc pre {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.md-doc pre code {
+  display: block;
+  white-space: pre;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  line-height: 1.5;
+}
+.md-doc blockquote {
+  margin: 0 0 12px;
+  padding: 4px 0 4px 14px;
+  border-left: 3px solid var(--accent, var(--border));
+  color: var(--muted);
+}
+.md-doc table {
+  margin: 0 0 12px;
+  border-collapse: collapse;
+  font-size: 13px;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.md-doc th,
+.md-doc td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+}
+.md-doc th { background: var(--hover); font-weight: 600; }
+.md-doc hr {
+  margin: 16px 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+.md-doc a { color: var(--accent, #3b82f6); text-decoration: none; }
+.md-doc a:hover { text-decoration: underline; }
+.md-doc img { max-width: 100%; border-radius: 6px; margin: 8px 0; }
+
 .tree-row.on { background: var(--hover); }
 
 .ctx-menu {

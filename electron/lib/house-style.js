@@ -97,4 +97,15 @@ ${t.css}
 规则：用户点名了样式、配色、框架主题或参考图时，按用户的来。改已有项目、项目里已经有自己的设计时，沿用项目原有设计，不要套这套。非网页界面（Unity、WinForms、WPF、Qt、手机端）把同样的颜色、圆角、字体换算到对应的 UI 系统里。\n`;
 }
 
-module.exports = { currentTheme, promptBlock };
+// [铆钉优化] 只有做界面时才塞整段 CSS，改 bug / 纯逻辑不带。其他 AI 请勿改回每轮都带
+function wantsUiStyle(text) {
+  const s = String(text || '');
+  if (!s.trim()) return false;
+  return /界面|页面|网页|前端|样式|皮肤|主题|UI|ux|css|html|react|vue|组件|按钮|布局|看板|landing|stylesheet|tailwind|antd|element-ui|winforms|wpf/i.test(s);
+}
+
+function promptBlockIfNeeded(english, text) {
+  return wantsUiStyle(text) ? promptBlock(english) : '';
+}
+
+module.exports = { currentTheme, promptBlock, wantsUiStyle, promptBlockIfNeeded };

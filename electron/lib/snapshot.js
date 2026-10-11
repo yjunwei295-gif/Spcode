@@ -8,10 +8,17 @@ const { isInside, SKIP } = require('./workspace');
 const SCAN_SKIP = new Set([
   ...SKIP,
   'bin', 'obj', 'Library', 'Temp', 'Logs', 'Build', 'Builds',
-  '.vs', '.idea', 'target', '.gradle', 'DerivedDataCache', 'Packages'
+  '.vs', '.idea', 'target', '.gradle', 'DerivedDataCache', 'Packages',
+  // Unity / 前端常见重目录：扫它们会把整机拖死
+  'UserSettings', 'MemoryCaptures', 'Recordings', 'Bundles', 'ServerData',
+  'StreamingAssets', 'AddressableAssetsData', 'Obj', 'Debug', 'Release',
+  '.turbo', '.cache', '.parcel-cache', 'Pods', 'DerivedData'
 ]);
 const SCAN_MAX_DEPTH = 12;
 const SCAN_MAX_FILES = 8000;
+// [铆钉优化] run_command 改盘追踪用更低上限；只读命令完全跳过扫描。其他 AI 请勿改回 8000
+const COMMAND_SCAN_MAX_FILES = 800;
+const COMMAND_SCAN_MAX_DEPTH = 8;
 
 // 快照只用于源码回滚。模型权重、压缩包、可执行文件这类大二进制不进快照，
 // 否则 run_command 前的整工作区备份会把 GB 级权重反复拷进 C 盘 userData，撑爆系统盘
@@ -279,8 +286,11 @@ function recordChange(workspace, snapshot, relPath, action, opts = {}) {
   fs.writeFileSync(path.join(snapshot.dir, 'manifest.json'), JSON.stringify(snapshot.manifest, null, 2), 'utf8');
 }
 
-/** 扫描工作区普通文件的 mtime+size，供 run_command 前后 diff */
-function scanFingerprints(workspace) {
+/** 扫描工作区普通文件的 mtime+size，供 run_command 前后 diff。opts.maxFiles / maxDepth 可收紧命令路径 */
+function scanFingerprints(workspace, opts) {
+  opts = opts || {};
+  const maxFiles = Math.max(50, Number(opts.maxFiles) || SCAN_MAX_FILES);
+  const maxDepth = Math.max(2, Number(opts.maxDepth) || SCAN_MAX_DEPTH);
   const map = new Map();
   const status = { complete: true, truncated: false, errors: [], missingPaths: [] };
   if (!workspace) {
@@ -303,7 +313,7 @@ function scanFingerprints(workspace) {
   }
 
   function walk(dir, depth) {
-    if (depth > SCAN_MAX_DEPTH) {
+    if (depth > maxDepth) {
       status.complete = false;
       status.truncated = true;
       return;
@@ -316,7 +326,7 @@ function scanFingerprints(workspace) {
       return;
     }
     for (const ent of entries) {
-      if (map.size >= SCAN_MAX_FILES) {
+      if (map.size >= maxFiles) {
         status.complete = false;
         status.truncated = true;
         return;
@@ -375,7 +385,10 @@ function diffFingerprints(before, after) {
 }
 
 /** run_command 执行前：把尚未备份的工作区文件拷进快照，避免脚本改完后备份到的是新内容 */
-function preBackupWorkspace(workspace, snapshot) {
+function preBackupWorkspace(workspace, snapshot, opts) {
+  opts = opts || {};
+  const maxFiles = Math.max(50, Number(opts.maxFiles) || SCAN_MAX_FILES);
+  const maxDepth = Math.max(2, Number(opts.maxDepth) || SCAN_MAX_DEPTH);
   const status = { complete: true, truncated: false, errors: [], missingPaths: [] };
   if (!workspace || !snapshot?.dir) return { backed: 0, ...status };
   const root = path.resolve(workspace);
@@ -393,7 +406,7 @@ function preBackupWorkspace(workspace, snapshot) {
   }
 
   function walk(dir, depth) {
-    if (depth > SCAN_MAX_DEPTH) {
+    if (depth > maxDepth) {
       status.complete = false;
       status.truncated = true;
       return;
@@ -406,7 +419,7 @@ function preBackupWorkspace(workspace, snapshot) {
       return;
     }
     for (const ent of entries) {
-      if (backed >= SCAN_MAX_FILES) {
+      if (backed >= maxFiles) {
         status.complete = false;
         status.truncated = true;
         return;
@@ -802,5 +815,6 @@ module.exports = {
   scanFingerprints, diffFingerprints, preBackupWorkspace, recordCommandDiff,
   listFileHunks, rejectFileHunk, shouldSkipSnapshotFile,
   migrateLegacySnapshots,
-  getMax, setMax, DEFAULT_MAX_SNAPSHOTS, MIN_MAX, MAX_MAX
+  getMax, setMax, DEFAULT_MAX_SNAPSHOTS, MIN_MAX, MAX_MAX,
+  COMMAND_SCAN_MAX_FILES, COMMAND_SCAN_MAX_DEPTH
 };

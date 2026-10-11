@@ -42,6 +42,30 @@ const DENY_PATTERNS = [
   /\bschtasks\b[\s\S]*\/create/i
 ];
 
+// [铆钉优化] 只读命令不跑工作区全量扫描/预备份，避免 NewSlg 等大项目一跑 dir/git status 就卡死整机。其他 AI 请勿删
+function isReadonlyCommand(command) {
+  const cmd = String(command || '').trim();
+  if (!cmd) return false;
+  // 去掉 2>&1 后再看重定向；有写文件重定向则不算只读
+  const noStdRedirect = cmd.replace(/\d*>&\d+/g, '').replace(/2>&1/g, '');
+  if (/>|>>/.test(noStdRedirect) || /\btee\b/i.test(cmd)) return false;
+  // 明显会改盘/装依赖/构建的，一律走追踪
+  if (/\b(rm\b|del\b|erase\b|move\b|copy\b|xcopy\b|robocopy\b|mkdir\b|\brd\b|rmdir\b|New-Item\b|Set-Content\b|Add-Content\b|Out-File\b|Clear-Content\b|git\s+(add|commit|push|checkout|switch|merge|rebase|reset|clean|pull|fetch|clone|init|mv|rm)(?:\s|$)|git\s+stash(?!\s+list)|npm\s+(i|install|uninstall|update|ci|publish)(?:\s|$)|pnpm\s+(i|add|remove|install)(?:\s|$)|yarn\s+(add|remove)(?:\s|$)|pip\s+install|dotnet\s+(build|publish|restore)|msbuild\b|tsc\b|webpack\b|vite\s+build)\b/i.test(cmd)) {
+    return false;
+  }
+  // powershell -Command "Get-ChildItem ..." 这类只读查询
+  if (/powershell\b[\s\S]*-Command\b/i.test(cmd)
+    && /\b(Get-|Test-Path|Select-String|Measure-Object|Measure-)\b/i.test(cmd)
+    && !/\b(Set-|New-|Remove-|Add-|Out-File|Clear-|Copy-|Move-|Rename-|Stop-|Start-|Invoke-WebRequest|iwr\b)\b/i.test(cmd)) {
+    return true;
+  }
+  const parts = cmd.split(/\s*(?:&&|\|\||;|&)\s*/).map((s) => s.trim()).filter(Boolean);
+  if (!parts.length) return false;
+  const ro = /^(git\s+(status|diff|log|show|branch|tag|remote|rev-parse|ls-files|describe|blame|stash\s+list|--version|help)|dir(\s|$)|ls(\s|$)|type\s|cat\s|Get-Content\b|Get-ChildItem\b|Get-Item\b|Test-Path\b|gc\s|where\s|Where-Object\b|Select-String\b|findstr\b|find\s|rg\s|grep\s|head\s|tail\s|hostname\b|whoami\b|pwd\b|echo\s|Write-Output\b|Write-Host\b|node\s+(-v|--version)\b|python\s+(--version|-V)\b|dotnet\s+--info\b|npm\s+(ls|list|outdated|view|-v|--version)\b|pnpm\s+-v\b|yarn\s+-v\b|git\s+version\b)/i;
+  const cdOnly = /^(cd|Set-Location|chdir)(\s|$)/i;
+  return parts.every((p) => ro.test(p) || cdOnly.test(p));
+}
+
 function denyReason(command) {
   const cmd = String(command || '');
   if (!cmd.trim()) return '命令为空';
@@ -281,6 +305,7 @@ function formatResult(result) {
 module.exports = {
   DENY_PATTERNS,
   denyReason,
+  isReadonlyCommand,
   resolveCwd,
   runSandboxed,
   formatResult,

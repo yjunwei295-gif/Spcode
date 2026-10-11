@@ -63,6 +63,8 @@ const state = {
   treeCache: {},
   treeOpen: new Set(),
   previewPath: '',
+  previewMdText: '',
+  previewMdRaw: false,
   ctxRel: '',
   ctxJustOpened: false,
   livePaintTimer: null,
@@ -2723,11 +2725,32 @@ function persistSession() {
   return persistTab(activeSession());
 }
 
+function isMarkdownPath(filePath) {
+  return /\.(md|mdc|markdown)$/i.test(String(filePath || ''));
+}
+
+function paintPreviewMarkdown() {
+  const text = state.previewMdText || '';
+  const btn = $('btn-preview-md');
+  if (state.previewMdRaw) {
+    const lines = text.split('\n');
+    $('preview-body').innerHTML = `<ol class="code-ol">${lines.map((line) => `<li>${escapeHtml(line) || ' '}</li>`).join('')}</ol>`;
+    if (btn) btn.textContent = t('mdPreview');
+  } else {
+    $('preview-body').innerHTML = `<div class="md-doc">${renderMarkdown(text)}</div>`;
+    if (btn) btn.textContent = t('mdSource');
+  }
+}
+
 function closeCodePreview() {
   const preview = $('code-preview');
   releaseFocus(preview);
   state.previewPath = '';
+  state.previewMdText = '';
+  state.previewMdRaw = false;
   preview.classList.add('hidden');
+  const mdBtn = $('btn-preview-md');
+  if (mdBtn) mdBtn.classList.add('hidden');
   $('preview-path').textContent = t('noFile');
   $('preview-body').innerHTML = '';
   renderFileTree();
@@ -2738,6 +2761,10 @@ async function openCodePreview(rel) {
   const filePath = String(rel || '').replace(/\\/g, '/');
   if (!filePath) return;
   state.previewPath = filePath;
+  state.previewMdText = '';
+  state.previewMdRaw = false;
+  const mdBtn = $('btn-preview-md');
+  if (mdBtn) mdBtn.classList.add('hidden');
   $('code-preview').classList.remove('hidden');
   $('preview-path').textContent = filePath;
   $('preview-path').title = filePath;
@@ -2759,6 +2786,13 @@ async function openCodePreview(rel) {
     }
     if (data.kind === 'binary') {
       $('preview-body').innerHTML = `<div class="hint" style="padding:12px">${t('binaryNoPreview')}</div>`;
+      return;
+    }
+    // Markdown：默认按样式渲染，可切回源码行号视图
+    if (isMarkdownPath(filePath) || data.kind === 'markdown') {
+      state.previewMdText = String(data.content || '');
+      if (mdBtn) mdBtn.classList.remove('hidden');
+      paintPreviewMarkdown();
       return;
     }
     const lines = String(data.content || '').split('\n');
@@ -6217,6 +6251,15 @@ function bind() {
   });
   dontStealFocus($('btn-preview-close'));
   $('btn-preview-close').onclick = () => closeCodePreview();
+  const btnPreviewMd = $('btn-preview-md');
+  if (btnPreviewMd) {
+    dontStealFocus(btnPreviewMd);
+    btnPreviewMd.onclick = () => {
+      if (!isMarkdownPath(state.previewPath)) return;
+      state.previewMdRaw = !state.previewMdRaw;
+      paintPreviewMarkdown();
+    };
+  }
   $('btn-preview-at').onclick = () => {
     if (state.previewPath) addContextPath(state.previewPath);
   };
