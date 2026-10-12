@@ -3529,10 +3529,18 @@ function implementationDiffText(workspace, snap, changes) {
       } else if (snap?.current?.id) {
         const hunks = snapshot.listFileHunks(workspace, snap.current.id, rel);
         const lines = [];
-        // 只看前几处差异时，总结会漏掉主要改动，把「一致」判成无；放宽到 10 处，总长仍受 budget 限制
-        for (const hunk of (hunks.hunks || []).slice(0, 10)) {
-          for (const line of (hunk.removed || []).slice(0, 12)) lines.push(`- ${line}`);
-          for (const line of (hunk.added || []).slice(0, 30)) lines.push(`+ ${line}`);
+        // 大文件已按改动块对齐；多取几块，避免只看见文件头字段声明
+        for (const hunk of (hunks.hunks || []).slice(0, 12)) {
+          const loc = hunk.startAfter || hunk.startBefore;
+          if (loc) lines.push(`@@ ~L${loc} @@`);
+          for (const line of (hunk.removed || []).slice(0, 16)) lines.push(`- ${line}`);
+          for (const line of (hunk.added || []).slice(0, 40)) lines.push(`+ ${line}`);
+          if (hunk.removedMore || hunk.addedMore) {
+            lines.push(`… 本块另有 -${hunk.removedMore || 0}/+${hunk.addedMore || 0} 行未展开`);
+          }
+        }
+        if ((hunks.hunks || []).some((h) => h.truncated)) {
+          lines.push('（大文件差异已按改动块截取，未改前缀已跳过）');
         }
         body += lines.length ? `\n${lines.join('\n')}` : '\n（没有可展示的文本差异）';
       }

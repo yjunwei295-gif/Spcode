@@ -674,14 +674,97 @@ function lcsTable(a, b) {
   return dp;
 }
 
+// 大文件不用 O(n*m) LCS：跳过未改前缀/后缀，用窗口对齐找真正改动块（总结才能看到后面加的探针）
+const LARGE_DIFF_LINES = 1200;
+const CHEAP_SYNC_WINDOW = 64;
+const CHEAP_MAX_HUNKS = 24;
+const CHEAP_SIDE_CAP = 80;
+
+function findCheapSync(a, i, b, j, window) {
+  for (let di = 0; di <= window; di++) {
+    for (let dj = 0; dj <= window; dj++) {
+      if (di === 0 && dj === 0) continue;
+      const ai = i + di;
+      const bj = j + dj;
+      if (ai >= a.length || bj >= b.length) continue;
+      if (a[ai] !== b[bj]) continue;
+      if (a[ai] === '' && (di > 0 || dj > 0)) continue;
+      if (ai + 1 < a.length && bj + 1 < b.length && a[ai + 1] === b[bj + 1]) {
+        return { di, dj };
+      }
+      if (String(a[ai]).length >= 12 && di <= 8 && dj <= 8) return { di, dj };
+    }
+  }
+  return null;
+}
+
+function listChangeHunksCheap(beforeLines, afterLines) {
+  const a = beforeLines;
+  const b = afterLines;
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length && a[i] === b[j]) { i++; j++; }
+  let ae = a.length - 1;
+  let be = b.length - 1;
+  while (ae >= i && be >= j && a[ae] === b[be]) { ae--; be--; }
+  const endI = ae + 1;
+  const endJ = be + 1;
+  const hunks = [];
+  let truncated = false;
+  let ii = i;
+  let jj = j;
+  while (ii < endI || jj < endJ) {
+    if (hunks.length >= CHEAP_MAX_HUNKS) {
+      truncated = true;
+      break;
+    }
+    if (ii < endI && jj < endJ && a[ii] === b[jj]) {
+      ii++;
+      jj++;
+      continue;
+    }
+    const sync = (ii < endI && jj < endJ) ? findCheapSync(a, ii, b, jj, CHEAP_SYNC_WINDOW) : null;
+    let removed;
+    let added;
+    let nextI;
+    let nextJ;
+    if (!sync) {
+      removed = a.slice(ii, endI);
+      added = b.slice(jj, endJ);
+      nextI = endI;
+      nextJ = endJ;
+    } else {
+      removed = a.slice(ii, ii + sync.di);
+      added = b.slice(jj, jj + sync.dj);
+      nextI = ii + sync.di;
+      nextJ = jj + sync.dj;
+    }
+    if (removed.length || added.length) {
+      if (removed.length > CHEAP_SIDE_CAP || added.length > CHEAP_SIDE_CAP) truncated = true;
+      hunks.push({
+        removed: removed.slice(0, CHEAP_SIDE_CAP),
+        added: added.slice(0, CHEAP_SIDE_CAP),
+        startBefore: ii + 1,
+        startAfter: jj + 1
+      });
+    }
+    ii = nextI;
+    jj = nextJ;
+  }
+  return hunks.map((h, index) => ({
+    index,
+    removed: h.removed,
+    added: h.added,
+    startBefore: h.startBefore,
+    startAfter: h.startAfter,
+    truncated
+  }));
+}
+
 function listChangeHunks(beforeLines, afterLines) {
-  if (beforeLines.length > 1200 || afterLines.length > 1200) {
-    return [{
-      index: 0,
-      removed: beforeLines.slice(0, 40),
-      added: afterLines.slice(0, 40),
-      truncated: true
-    }];
+  // 大文件：廉价分段 diff，禁止再只截开头 40 行（会把后面真正改动丢掉）
+  if (beforeLines.length > LARGE_DIFF_LINES || afterLines.length > LARGE_DIFF_LINES) {
+    return listChangeHunksCheap(beforeLines, afterLines);
   }
   const dp = lcsTable(beforeLines, afterLines);
   const hunks = [];
@@ -786,7 +869,9 @@ function listFileHunks(workspace, snapshotId, relPath) {
     added: h.added.slice(0, 40),
     removedMore: Math.max(0, h.removed.length - 40),
     addedMore: Math.max(0, h.added.length - 40),
-    truncated: !!h.truncated
+    truncated: !!h.truncated,
+    startBefore: h.startBefore || 0,
+    startAfter: h.startAfter || 0
   }));
   return { path: change.path, hunks };
 }
