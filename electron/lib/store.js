@@ -157,6 +157,29 @@ function ensureLocalSlot(models) {
   return kept;
 }
 
+const ZABING_GGUF = path.join('D:', 'Ai', 'zabingAI', 'models', 'qwen2.5-coder-7b-instruct-q4_k_m.gguf');
+
+function ensureZabingAISlot(models) {
+  const kept = models || [];
+  let row = kept.find((m) => m?.id === 'zabingAI' || m?.type === 'zabingAI');
+  if (!row) {
+    row = { id: 'zabingAI' };
+    kept.push(row);
+  }
+  row.id = 'zabingAI';
+  row.type = 'zabingAI';
+  row.name = 'zabingAI';
+  row.enabled = row.enabled !== false;
+  row.model = row.model || 'qwen2.5-coder-7b-instruct-q4_k_m.gguf';
+  row.modelPath = row.modelPath || ZABING_GGUF;
+  row.vision = false;
+  delete row.providerId;
+  delete row.baseUrl;
+  delete row.apiKey;
+  delete row.protocol;
+  return kept;
+}
+
 function ensureZbaingSlot(models) {
   const kept = models || [];
   const zb = kept.find((m) => m?.id === 'zbaingAi' || m?.type === 'zbaingAi');
@@ -186,10 +209,12 @@ function migrateProvidersAndModels(data) {
     : [];
   let models = ensureLocalSlot(data.models && data.models.length ? data.models : DEFAULTS.models);
   models = ensureZbaingSlot(models);
+  models = ensureZabingAISlot(models);
 
   for (const m of models) {
     if (!m || m.type === 'local' || m.id === 'local-gguf') continue;
     if (m.type === 'zbaingAi' || m.id === 'zbaingAi') continue;
+    if (m.type === 'zabingAI' || m.id === 'zabingAI') continue;
     m.type = 'api';
     m.enabled = m.enabled !== false;
     if (m.vision == null) m.vision = false;
@@ -237,6 +262,7 @@ function migrateProvidersAndModels(data) {
     if (!m) return false;
     if (m.type === 'local' || m.id === 'local-gguf') return true;
     if (m.type === 'zbaingAi' || m.id === 'zbaingAi') return true;
+    if (m.type === 'zabingAI' || m.id === 'zabingAI') return true;
     return !!(m.providerId && m.model);
   });
 
@@ -265,6 +291,17 @@ function resolveModelCfg(modelOrId, settings) {
       name: m.name || 'zbaingAi',
       type: 'zbaingAi',
       zbaingRoot: m.zbaingRoot || '',
+      enabled: m.enabled !== false
+    };
+  }
+  if (m.id === 'zabingAI' || m.type === 'zabingAI') {
+    return {
+      id: 'zabingAI',
+      name: 'zabingAI',
+      type: 'local',
+      model: m.model || 'qwen2.5-coder-7b-instruct-q4_k_m.gguf',
+      modelPath: m.modelPath || ZABING_GGUF,
+      vision: false,
       enabled: m.enabled !== false
     };
   }

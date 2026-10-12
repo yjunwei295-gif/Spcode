@@ -49,20 +49,22 @@ function queryFromText(userText) {
 }
 
 /**
- * 本地改代码/看附件不搜网；时事、文档、明确要查、事实问答才搜。
+ * 本地改代码/看附件不搜网；时事、文档、明确要查、公开信息/外网事实问答才搜。
  */
 function needsWebSearch(userText, { contextChars, hasImages } = {}) {
   const t = String(userText || '').trim();
   if (t.length < 2) return false;
   if (/https?:\/\//i.test(t)) return true;
-  if (/(搜索|搜一下|上网查|网上查|查一下网上|联网搜|google|bing)/i.test(t)) return true;
+  if (/(搜索|搜一下|上网查|网上查|查一下网上|联网搜|查一下|查一查|找一下|google|bing)/i.test(t)) return true;
   if (/(最新|今天|今日|实时|新闻|天气|股价|汇率|油价|比分|赛况)/.test(t)) return true;
   if (/(官网|官方文档|api\s*文档|changelog|release notes|cve-\d)/i.test(t)) return true;
+  // 外网事实 / 公开信息（游戏私服、有哪些服等），不是本地改代码
+  if (/(公开信息|网上有没有|外网|私服|服务器列表|有哪些服|哪些.*(?:私服|服务器)|look\s*up|publicly available)/i.test(t)) return true;
   const localJob = /(帮我(改|写|修)|改(一下|这个|成)|重构|实现|这段代码|这个文件|工作目录|当前项目)/.test(t);
   if (localJob && ((contextChars || 0) > 80 || hasImages)) return false;
   // 本地代码/项目任务：没有明确查网意图时直接跳过，避免日常词误触发搜索
   const codeJob = /(代码|函数|脚本|模块|项目|文件|编译|构建|报错|bug|重构|接口|数据库)/i.test(t);
-  const netAsk = /(搜索|搜一下|上网查|网上查|查一下网上|联网搜|google|bing|官网|官方文档|changelog|release notes|cve-\d|最新|新闻|天气|股价|汇率|油价|比分|赛况|什么是|如何安装|如何配置|下载地址|哪个版本|https?:\/\/)/i.test(t);
+  const netAsk = /(搜索|搜一下|上网查|网上查|查一下网上|联网搜|查一下|查一查|找一下|google|bing|官网|官方文档|changelog|release notes|cve-\d|最新|新闻|天气|股价|汇率|油价|比分|赛况|公开信息|私服|服务器列表|什么是|如何安装|如何配置|下载地址|哪个版本|https?:\/\/)/i.test(t);
   if (codeJob && !netAsk) return false;
   if (/\.(js|ts|tsx|jsx|py|go|java|cs|vue)\b/.test(t) && !/(官网|文档|下载|安装)/.test(t)) return false;
   if (/(什么是|怎么安装|如何安装|如何配置|下载地址|哪个版本)/.test(t)) return true;

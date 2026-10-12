@@ -2,6 +2,98 @@
   "version": 1,
   "entries": [
     {
+      "id": "mem-mv3fiyb3-4kj7bt",
+      "createdAt": "2026-10-11T06:15:39.573Z",
+      "updatedAt": "2026-10-11T06:15:39.573Z",
+      "kind": "invariant",
+      "summary": "dist/run-dist.cmd、dist/run-dist-icon.cmd、dist/run-publish.cmd 是脱离沙盒的打包/上传入口，不应纳入版本库。",
+      "paths": [
+        "dist/run-dist.cmd",
+        "dist/run-dist-icon.cmd",
+        "dist/run-publish.cmd"
+      ],
+      "tags": [
+        "打包",
+        "脚本",
+        "不入库"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv3fiyb3-9y0ejh",
+      "createdAt": "2026-10-11T06:15:39.573Z",
+      "updatedAt": "2026-10-11T06:15:39.573Z",
+      "kind": "invariant",
+      "summary": "发布验收需核对 GitHub Release 资产中的 exe 与本地 dist 下新包一致，避免上传旧包。",
+      "paths": [
+        "dist/SimpleCode Setup 1.0.0.exe"
+      ],
+      "tags": [
+        "验收",
+        "发布",
+        "exe"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv3fiyb3-a1kkc8",
+      "createdAt": "2026-10-11T06:15:39.572Z",
+      "updatedAt": "2026-10-11T06:15:39.572Z",
+      "kind": "decision",
+      "summary": "发布说明统一维护在 scripts/release-notes.md，并同步到 GitHub Release 正文，确保发布信息一处更新。",
+      "paths": [
+        "scripts/release-notes.md"
+      ],
+      "tags": [
+        "发布说明",
+        "GitHub"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv3fiyb3-a2md6q",
+      "createdAt": "2026-10-11T06:15:39.572Z",
+      "updatedAt": "2026-10-11T06:15:39.572Z",
+      "kind": "decision",
+      "summary": "打包遇到 icon-tool.js 的 wasm 内存失败时，直接使用已生成的 dist/.icon-ico/icon.ico 作为 win.icon，跳过图标转换。",
+      "paths": [
+        "dist/.icon-ico/icon.ico"
+      ],
+      "tags": [
+        "打包",
+        "electron-builder",
+        "图标"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
+      "id": "mem-mv3fiyb3-nwpv6s",
+      "createdAt": "2026-10-11T06:15:39.570Z",
+      "updatedAt": "2026-10-11T06:15:39.570Z",
+      "kind": "invariant",
+      "summary": "发布 exe 后必须同步更新 GitHub Release 附件，否则 GitHub 上的 exe 会与本地新包不一致。",
+      "paths": [
+        "scripts/release-notes.md",
+        "dist/SimpleCode Setup 1.0.0.exe"
+      ],
+      "tags": [
+        "发布",
+        "GitHub",
+        "exe"
+      ],
+      "source": "auto",
+      "pinned": false,
+      "superseded": false
+    },
+    {
       "id": "mem-mv2h0rou-p1iej1",
       "createdAt": "2026-10-10T14:09:44.240Z",
       "updatedAt": "2026-10-10T14:09:44.240Z",
@@ -1594,94 +1686,6 @@
       ],
       "source": "user",
       "pinned": true,
-      "superseded": false
-    },
-    {
-      "id": "mem-muz4vtqa-qdigo5",
-      "createdAt": "2026-10-08T06:06:39.686Z",
-      "updatedAt": "2026-10-08T06:06:39.686Z",
-      "kind": "invariant",
-      "summary": "紧凑高度 182 下必须让 2 条消息和输入区都可见可点，因此 #top.compact ~ #msgs 要保持 flex:1 1 auto、min-height:0、overflow:hidden 等布局约束。",
-      "paths": [
-        "electron/lib/float-bar.html"
-      ],
-      "tags": [
-        "紧凑态",
-        "布局",
-        "输入区"
-      ],
-      "source": "auto",
-      "pinned": false,
-      "superseded": false
-    },
-    {
-      "id": "mem-muz4vtqa-bm9qqo",
-      "createdAt": "2026-10-08T06:06:39.686Z",
-      "updatedAt": "2026-10-08T06:06:39.686Z",
-      "kind": "decision",
-      "summary": "滚动到底抽成具名 scrollMsgsToBottom() 供 paint 与 repaint 复用，避免再建第二个重绘或滚动函数。",
-      "paths": [
-        "electron/lib/float-bar.html"
-      ],
-      "tags": [
-        "scrollMsgsToBottom",
-        "paint",
-        "repaint"
-      ],
-      "source": "auto",
-      "pinned": false,
-      "superseded": false
-    },
-    {
-      "id": "mem-muz4vtqa-hzk2vd",
-      "createdAt": "2026-10-08T06:06:39.686Z",
-      "updatedAt": "2026-10-08T06:06:39.686Z",
-      "kind": "decision",
-      "summary": "窗口关闭时 repaint 通知要 try/catch 静默失败，避免对已销毁 webContents 调用抛错。",
-      "paths": [
-        "electron/lib/float-bar.js"
-      ],
-      "tags": [
-        "重绘",
-        "销毁"
-      ],
-      "source": "auto",
-      "pinned": false,
-      "superseded": false
-    },
-    {
-      "id": "mem-muz4vtqa-0qs86k",
-      "createdAt": "2026-10-08T06:06:39.686Z",
-      "updatedAt": "2026-10-08T06:06:39.686Z",
-      "kind": "invariant",
-      "summary": "改小窗相关功能时不得改变 savedBottomY/savedHeight 语义与落盘换算、COMPACT_HEIGHT=182、resizeBy、setWinResizable=false 等既有窗口状态约定。",
-      "paths": [
-        "electron/lib/float-bar.js",
-        "electron/lib/float-bar.html"
-      ],
-      "tags": [
-        "窗口状态",
-        "兼容"
-      ],
-      "source": "auto",
-      "pinned": false,
-      "superseded": false
-    },
-    {
-      "id": "mem-muz4vtqa-xbz85s",
-      "createdAt": "2026-10-08T06:06:39.686Z",
-      "updatedAt": "2026-10-08T06:06:39.686Z",
-      "kind": "invariant",
-      "summary": "扭柄 #grip、#btn-mini 不跳位、#ask/#askOpts/#askText、开始按钮区位置和插话链路是既有交互约束，非专门需求不要顺手改。",
-      "paths": [
-        "electron/lib/float-bar.html"
-      ],
-      "tags": [
-        "交互",
-        "兼容"
-      ],
-      "source": "auto",
-      "pinned": false,
       "superseded": false
     },
     {
