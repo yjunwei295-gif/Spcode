@@ -64,7 +64,8 @@ input, textarea, select, [contenteditable="true"] {
   display: grid;
   grid-template-columns: auto 1fr auto;
   align-items: center;
-  height: 38px;
+  min-height: 38px;
+  height: auto;
   background: var(--titlebar);
   border-bottom: 1px solid var(--border);
   padding: 0 6px;
@@ -79,8 +80,8 @@ input, textarea, select, [contenteditable="true"] {
   position: relative;
   z-index: 1;
 }
-/* [铆钉优化] 顶栏里所有可点的东西都必须 no-drag，否则点击会被窗口拖动区吞掉（中英文切换就是这样点不了的）。其他 AI 请勿删除 */
-.menubar, .win-btns, .menu-drop, .title-right, .lang-switch, .lang-switch button, .quota-bar {
+/* 顶栏里可交互的控件必须 no-drag；余额栏只是文本，保留拖动区命中。 */
+.menubar, .win-btns, .menu-drop, .title-right, .lang-switch, .lang-switch button {
   -webkit-app-region: no-drag;
 }
 .menubar, .win-btns, .title-right { display: flex; align-items: center; }
@@ -104,7 +105,9 @@ input, textarea, select, [contenteditable="true"] {
   display: flex;
   justify-content: center;
   align-items: center;
+  width: 100%;
   min-width: 0;
+  padding: 4px 8px;
   font-size: 12px;
   color: var(--muted);
   text-align: center;
@@ -114,16 +117,17 @@ input, textarea, select, [contenteditable="true"] {
 .quota-bar {
   display: flex;
   align-items: center;
-  max-width: 280px;
+  justify-content: center;
+  width: 100%;
   min-width: 0;
 }
 .quota-bar[hidden], .title-app-name[hidden] { display: none !important; }
 .quota-text {
   font-size: 12px;
   color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
 }
 .win-btns { justify-content: flex-end; }
 .win-btns button {
@@ -686,6 +690,7 @@ input, textarea, select, [contenteditable="true"] {
   color: var(--muted); cursor: pointer;
 }
 .msg-ctx-view:hover { color: var(--accent); border-color: var(--accent); }
+.msg-usage > .msg-ctx-view:first-child { margin-left: 0; }
 .ctx-list { max-height: 62vh; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
 .ctx-item { border: 1px solid var(--border); border-radius: 6px; }
 .ctx-item summary {
@@ -1084,11 +1089,13 @@ input, textarea, select, [contenteditable="true"] {
 .rounds-wrap.off { opacity: 0.45; }
 #btn-unlimited.on,
 #btn-alive.on,
-#btn-floatbar.on {
+#btn-floatbar.on,
+#btn-cursor-direct.on {
   background: var(--accent);
   color: var(--accent-fg);
   border-color: transparent;
 }
+#btn-cursor-direct.on:disabled { opacity: 1; }
 .msg-fork {
   border: 0;
   background: none;
@@ -1109,6 +1116,18 @@ input, textarea, select, [contenteditable="true"] {
   padding: 0 4px;
 }
 .msg-refill:hover { text-decoration: underline; }
+.msg-show-earlier {
+  display: block;
+  margin: 4px auto 12px;
+  padding: 4px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+.msg-show-earlier:hover { color: var(--accent); border-color: var(--accent); }
 .msg-zb-retry,
 .msg-zb-correct {
   border: 0;
@@ -1918,7 +1937,7 @@ button:focus-visible, .tab:focus-visible {
   box-shadow: 0 0 8px var(--glow-strong);
   animation: ui-caret 0.9s step-end infinite, fx-flow-v 2s linear infinite;
 }
-.msg .bubble.md-reveal { animation: fx-reveal 0.35s var(--ease-out); }
+.msg .bubble.md-reveal { animation: fx-reveal 0.35s var(--ease-out) forwards; }
 
 /* 等待：思考块描边流光 + 扫光 + 跳动的点 */
 .think-block.live {
@@ -2006,7 +2025,7 @@ button:focus-visible, .tab:focus-visible {
   50% { opacity: 1; transform: translateY(-2px); }
 }
 @keyframes fx-step-in { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
-@keyframes fx-reveal { from { opacity: 0.55; filter: blur(2px); } to { opacity: 1; filter: none; } }
+@keyframes fx-reveal { from { opacity: 1; filter: blur(2px); } to { opacity: 1; filter: none; } }
 @keyframes fx-breathe-red {
   0%, 100% { box-shadow: 0 4px 14px rgba(239, 68, 68, 0.25); }
   50% { box-shadow: 0 4px 24px rgba(239, 68, 68, 0.6); }
@@ -3037,6 +3056,8 @@ html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sig
 }
 .start-go:hover { filter: brightness(1.08); transform: translateY(-1px); }
 .start-go:active { transform: translateY(0) scale(.97); }
+/* 还没写入方案时「开始」点不动 */
+.start-go:disabled, html[data-theme="dark"] .start-go:disabled { opacity: 0.45; cursor: not-allowed; filter: none; transform: none; }
 .start-go-hint { font-size: 12px; color: var(--muted, #888); }
 
 /* [铆钉优化] 开工选项按钮三态：勾选态 / 提交按钮 / 提交禁用态。
@@ -3258,4 +3279,44 @@ html[data-theme="dark"] .start-go-submit:disabled {
 #btn-alive.on::after {
   color: var(--accent);
   background: var(--accent-fg);
+}
+
+/* AI 任务清单卡片（todo_write） */
+.todo-card {
+  margin: 6px 0 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  font-size: 13px;
+}
+.todo-head { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.todo-list { list-style: none; margin: 0; padding: 0; }
+.todo-item { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; line-height: 1.5; }
+.todo-mark {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  margin-top: 4px;
+  border: 1.5px solid var(--muted);
+  border-radius: 50%;
+  box-sizing: border-box;
+}
+.todo-completed .todo-mark {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--panel);
+}
+.todo-completed .todo-text,
+.todo-cancelled .todo-text { color: var(--muted); text-decoration: line-through; }
+.todo-cancelled .todo-mark { border-style: dashed; }
+.todo-in_progress .todo-text { font-weight: 600; }
+.todo-in_progress .todo-mark {
+  border-color: var(--accent);
+  border-right-color: transparent;
+  animation: todo-spin 0.9s linear infinite;
+}
+@keyframes todo-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .todo-in_progress .todo-mark { animation: none; }
 }

@@ -18,6 +18,9 @@
     "electron-builder": "^26.15.3"
   },
   "dependencies": {
+    "@cursor/sdk": "^1.0.37",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@openai/codex-sdk": "^0.163.0",
     "@xenova/transformers": "^2.17.2",
     "jszip": "^3.10.1",
     "mammoth": "^1.9.1",
@@ -78,6 +81,7 @@
       "**/@xenova/**",
       "**/onnxruntime-node/**",
       "**/tesseract.js-core/**",
+      "node_modules/@openai/codex-*/**/*",
       "electron/lib/desktop-hand.ps1"
     ],
     "win": {

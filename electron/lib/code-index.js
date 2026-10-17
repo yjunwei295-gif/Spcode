@@ -10,6 +10,7 @@ const store = require("./store");
 const localLlm = require("./local-llm");
 const apiProtocol = require("./api-protocol");
 const zbaingAi = require("./zbaingAi");
+const jsonSplit = require("./json-split");
 
 const MAP_VERSION = 1;
 const MAX_FILE_BYTES = 400 * 1024;
@@ -20,16 +21,12 @@ const MAX_TOP = 30;
 const SUMMARY_MAX_METHODS = 40;
 // 单文件最多补嚼多少个方法名，避免超大 C# 永远只填前 40
 const SUMMARY_MAX_METHODS_TOTAL = 120;
-// 后台缺口补嚼：每轮最多啃几个「方法多、摘要少」的文件
-const GAP_FILL_MAX_FILES = 8;
-// map_lookup 单次返回的方法条数上限与模块条数上限（控制返回体 token）
-const LOOKUP_MAX_METHODS = 30;
+// map_lookup 单次返回的模块条数上限（方法命中全列全贴，不截条数）
 const LOOKUP_MAX_MODULES = 10;
 // 单文件静态抽取的符号上限，防止超大文件撑爆地图体积（大文件恰恰最需要靠行号定位，别设太小）
 const MAX_SYMBOLS_PER_FILE = 400;
-// 每轮对话注入提示词的模块数与每模块方法数（控制注入 token）
+// 每轮对话注入提示词的模块数（只限先推哪些文件；命中方法全列全贴）
 const PROMPT_MAX_MODULES = 6;
-const PROMPT_MAX_METHODS = 8;
 // 单模块方法命中分上限，避免方法名多的文件靠数量刷分
 const METHOD_SCORE_CAP = 40;
 
@@ -198,6 +195,14 @@ function isIndexableFile(name) {
   const ext = path.extname(name).toLowerCase();
   return TEXT_EXT.has(ext);
 }
+// JSON 只分段不归纳，放宽到 20MB；其他文件仍是 400KB
+function maxBytesOf(name) {
+  return path.extname(name).toLowerCase() === ".json" ? jsonSplit.JSON_MAX_BYTES : MAX_FILE_BYTES;
+}
+// 超过普通上限的大 JSON 不抽标识符，免得几 MB 的数据刷出一堆假引用边
+function identsText(text, ext) {
+  return ext === ".json" && text.length > MAX_FILE_BYTES ? "" : text;
+}
 function yieldTick() { return new Promise((r) => setImmediate(r)); }
 function collectFiles(roots, signal) {
   const files = [];
@@ -218,7 +223,7 @@ function collectFiles(roots, signal) {
       if (!ent.isFile() || !isIndexableFile(ent.name)) continue;
       try {
         const st = fs.statSync(abs);
-        if (st.size <= 0 || st.size > MAX_FILE_BYTES) continue;
+        if (st.size <= 0 || st.size > maxBytesOf(ent.name)) continue;
         files.push({ abs, size: st.size });
       } catch {}
     }
@@ -657,6 +662,7 @@ function findIndentBlockEnd(lines, startIdx) {
 // 给已抽出的符号补 endLine：代码边界为准，供 AI 按段 read_file，禁止整文件通读
 function attachSymbolSpans(text, symbols, ext) {
   if (!symbols || !symbols.length || !text) return symbols || [];
+  if (symbolKind(ext) === "json") return symbols;
   const lines = text.split(/\r?\n/);
   const ordered = symbols.slice().sort((a, b) => (a.line || 1) - (b.line || 1));
   const indent = isIndentLang(ext);
@@ -673,33 +679,6 @@ function attachSymbolSpans(text, symbols, ext) {
     s.endLine = Math.min(lines.length, Math.max(s.line || 1, endIdx + 1));
   }
   return symbols;
-}
-function lineOfKey(lines, name) {
-  const re = new RegExp('"' + String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + '"\\s*:');
-  for (let i = 0; i < lines.length; i++) {
-    if (re.test(lines[i])) return i + 1;
-  }
-  return 1;
-}
-function extractJsonSymbols(text) {
-  let data;
-  try { data = JSON.parse(text); } catch { return []; }
-  const lines = text.split(/\r?\n/);
-  const out = [];
-  const seen = new Set();
-  function walk(obj, depth) {
-    if (out.length >= MAX_SYMBOLS_PER_FILE || depth > 4 || !obj || typeof obj !== "object") return;
-    if (Array.isArray(obj)) {
-      for (const item of obj) walk(item, depth + 1);
-      return;
-    }
-    for (const k of Object.keys(obj)) {
-      pushSymbol(out, seen, k, lineOfKey(lines, k));
-      walk(obj[k], depth + 1);
-    }
-  }
-  walk(data, 0);
-  return out;
 }
 function extractMdHeadings(text) {
   const lines = text.split(/\r?\n/);
@@ -735,7 +714,11 @@ function extractTxtTitles(text) {
 function extractSymbols(text, ext) {
   const kind = symbolKind(ext);
   if (!text) return [];
-  if (kind === "json") return attachSymbolSpans(text, extractJsonSymbols(text), ext);
+  if (kind === "json") {
+    // 按结构分段，每段带 JSON 路径和起止行；压缩的 JSON 行号按格式化视图，read_file 读到的也是同一份视图
+    const seg = jsonSplit.segmentsOfText(text, MAX_SYMBOLS_PER_FILE);
+    return seg ? seg.segments : [];
+  }
   if (kind === "md") return extractMdHeadings(text);
   if (kind === "txt") {
     const t = extractTxtTitles(text);
@@ -879,7 +862,7 @@ async function scanWorkspace(workspace, extra, signal) {
     // symbols 为静态兜底（名字+行号，不花 token）；methods 留空表示尚未 AI 归纳
     const node = { id: key, path: key, abs: f.abs.replace(/\\/g, "/"), ext, size: f.size, mtime, deps: resolved, desc: "", symbols: extractSymbols(text, ext) };
     nodes.push(node);
-    identsById.set(key, collectIdents(text));
+    identsById.set(key, collectIdents(identsText(text, ext)));
     if (inclSet.size) includesById.set(key, inclSet);
     pushLive(true);
     if (processed % 32 === 0) await yieldTick();
@@ -952,9 +935,6 @@ async function buildMap(workspace, extra, opts, signal) {
     summarizeIncludes(workspace, inc.includes, cfg).catch((e) => {
       diag.log("map", "绘制后方法归纳失败", { message: e && e.message });
     });
-  } else {
-    // 未勾选 include 时仍尝试对已有地图做缺口补嚼（有模型才跑）
-    try { scheduleGapFill(workspace); } catch (_) { /* ignore */ }
   }
   return mapData;
 }
@@ -1007,20 +987,13 @@ function reverseDeps(mapData) {
   }
   return rev;
 }
-// 展示起止行；跨度过大时提示先读前 120 行，避免一次吞整类
+// 展示起止行；不截断、不暗示少读
 function fmtMethod(m) {
   const start = Number(m.line) || 0;
   const end = Number(m.endLine) || start;
   let line = "";
-  if (start && end && end > start) {
-    line = " :" + start + "-" + end;
-    if (end - start + 1 > 200) {
-      const tip = start + 119;
-      line += "（跨度" + (end - start + 1) + "行，先 read_file " + start + "-" + Math.min(end, tip) + "）";
-    }
-  } else if (start) {
-    line = " :" + start;
-  }
+  if (start && end && end > start) line = " :" + start + "-" + end;
+  else if (start) line = " :" + start;
   const kv = m.keyValues ? "（" + m.keyValues + "）" : "";
   // 归纳可能不准，标成旁证
   const desc = m.desc ? " — 〔归纳·仅供参考〕" + m.desc : "";
@@ -1081,16 +1054,18 @@ function needsFullRead(n) {
   if (!methods.length) return true;
   return !methods.some((m) => String(m.desc || "").trim() || String(m.keyValues || "").trim());
 }
-function appendChewedOnly(lines, n, hit) {
+function appendChewedOnly(lines, n, hit, { attachBelow = false } = {}) {
   const shown = hit && hit.length ? hit : nodeMethods(n);
   if (shown.length) {
-    lines.push("  方法（" + shown.length + "，起止行为源码边界，未附全文）：");
-    for (const m of shown.slice(0, PROMPT_MAX_METHODS)) lines.push(fmtMethod(m));
-    if (shown.length > PROMPT_MAX_METHODS) lines.push("  … 还有 " + (shown.length - PROMPT_MAX_METHODS) + " 个方法");
+    const note = attachBelow
+      ? "；命中方法完整原文见下方【原文·可直接用】"
+      : "；要看正文用 read_file(startLine,endLine)";
+    lines.push("  方法（" + shown.length + "，起止行为源码边界" + note + "）：");
+    for (const m of shown) lines.push(fmtMethod(m));
   } else {
-    lines.push("  （该模块未解析出方法，也未附全文）");
+    lines.push("  （该模块未解析出方法）");
   }
-  lines.push("  有 :起-止 时用 read_file 的 startLine/endLine 只读该段（代码为准）；归纳可能不准，禁止整文件通读。");
+  lines.push("  有 :起-止 时按区间读代码为准；归纳可能不准，禁止整文件通读。");
 }
 const bodyCache = new Map();
 const BODY_CACHE_MAX = 32;
@@ -1131,9 +1106,8 @@ function moduleText(mapData, n, rev) {
   if (needsFullRead(n)) {
     appendChewedOnly(lines, n, all);
   } else if (all.length) {
-    lines.push("  方法（" + all.length + "，起止行为源码边界）：");
-    for (const m of all.slice(0, LOOKUP_MAX_METHODS)) lines.push(fmtMethod(m));
-    if (all.length > LOOKUP_MAX_METHODS) lines.push("  … 还有 " + (all.length - LOOKUP_MAX_METHODS) + " 个方法");
+    lines.push("  方法（" + all.length + "，起止行为源码边界；要看正文用 read_file(startLine,endLine)）：");
+    for (const m of all) lines.push(fmtMethod(m));
   }
   return lines.join("\n");
 }
@@ -1229,9 +1203,62 @@ function topMatches(workspace, extra, mapData, query, opts) {
   if (!scored.length) return [];
   scored.sort((a, b) => b.score - a.score);
   const limit = Math.max(1, Math.min(MAX_TOP, Number(opts.limit) || LOOKUP_MAX_MODULES));
-  const top = scored.slice(0, limit);
+  // 交出去之前逐个核对磁盘：改过的重抽符号再打分，删掉的移出，保证行号是现在的
+  refreshNodes(workspace, extra, mapData, scored.slice(0, limit).map((x) => x.n));
+  const alive = new Set(mapData.nodes);
+  const top = scored.slice(0, limit).filter((x) => alive.has(x.n)).map((x) => ({ n: x.n, score: x.score, hit: scoreNode(x.n, words).hit }));
   top.total = scored.length;
   return top;
+}
+function methodSpan(m) {
+  const start = Number(m.line) || 0;
+  const end = Number(m.endLine) || start;
+  return { start, end, len: start && end >= start ? end - start + 1 : 0 };
+}
+// 没命中关键字时贴该模块最短的一段，避免只剩路径
+function pickFallbackMethod(n) {
+  const all = nodeMethods(n);
+  if (!all.length) return null;
+  const ranked = all.slice().sort((a, b) => methodSpan(a).len - methodSpan(b).len);
+  for (const m of ranked) {
+    const { start, len } = methodSpan(m);
+    if (start && len) return m;
+  }
+  return null;
+}
+// 列表里列到的命中方法整段贴原文（不截行数、不卡条数），和 :起-止 一致，地图不因贴码失真
+function attachHitCode(top) {
+  const out = [];
+  for (const { n, hit } of top) {
+    let methods = Array.isArray(hit) && hit.length ? hit : [];
+    if (!methods.length) {
+      const fb = pickFallbackMethod(n);
+      if (fb) methods = [fb];
+      else continue; // 模块行里已写「未解析出方法」
+    }
+    const body = fileBodyForNode(n);
+    if (/^（[^\n]*）$/.test(body)) continue;
+    const allLines = body.split(/\r?\n/);
+    for (const m of methods) {
+      const { start, end, len } = methodSpan(m);
+      if (!start || !len) continue;
+      const lines = allLines.slice(start - 1, end);
+      if (!lines.length) continue;
+      out.push("【原文·可直接用】" + String(n.abs || n.path).replace(/\\/g, "/") + " 第 " + start + "-" + (start + lines.length - 1) + " 行（" + (m.name || "") + "）\n"
+        + lines.map((l, i) => (start + i) + ": " + l).join("\n"));
+    }
+  }
+  return out;
+}
+// 地图收录的文件清单：搜代码、列目录都只走这份清单，不在磁盘上翻目录。没有地图返回 null
+function mapFiles(workspace, extra) {
+  if (!workspace) return null;
+  const mapData = loadMapCached(workspace);
+  if (!mapData || !Array.isArray(mapData.nodes) || !mapData.nodes.length) return null;
+  ensureFresh(workspace, extra || [], mapData);
+  return mapData.nodes
+    .filter((n) => n.abs && !isForeignAiSkill(n.abs))
+    .map((n) => ({ abs: String(n.abs).replace(/\\/g, "/"), path: n.path, size: n.size || 0 }));
 }
 function mapTextForQuery(workspace, extra, mapData, query, opts) {
   opts = opts || {};
@@ -1240,20 +1267,22 @@ function mapTextForQuery(workspace, extra, mapData, query, opts) {
   if (!top.length) return "项目地图无匹配模块（可换更具体的关键词，或先重新绘制地图）";
   const rev = reverseDeps(mapData);
   const lines = top.map(({ n, hit }) => {
-    const head = "`" + n.path + "`" + (n.desc ? " — " + n.desc : "");
+    const head = "`" + n.path + "`" + (n.desc ? " — 〔归纳·仅供参考〕" + n.desc : "");
     if (needsFullRead(n)) {
       const parts = [head];
-      appendChewedOnly(parts, n, hit);
+      appendChewedOnly(parts, n, hit, { attachBelow: true });
       return parts.join("\n");
     }
     if (!hit.length) return head;
-    // 只列命中的方法（带行号），要看全部方法请用 module 参数
-    const ms = hit.slice(0, LOOKUP_MAX_METHODS).map(fmtMethod).join("\n");
+    // 命中方法全列（带行号），不截断；要看模块内全部方法传 module
+    const ms = hit.map(fmtMethod).join("\n");
     const total = nodeMethods(n).length;
     const tail = total > hit.length ? "\n  （共 " + total + " 个方法，传 module=\"" + n.path + "\" 查看全部）" : "";
     return head + "\n" + ms + tail;
   });
-  return "项目地图匹配到 " + top.total + " 个模块，这是第一批，不是全部。方法带 :起-止 源码行号；归纳仅供参考。用 read_file(startLine,endLine) 只读命中段，禁止整文件通读。这批对不上先换关键字再 map_lookup，仍不够再用 search_text：\n\n" + lines.join("\n");
+  const code = attachHitCode(top);
+  const codeNote = code.length ? "下列 " + code.length + " 个命中方法已附完整源码（见下方【原文·可直接用】，与 :起-止 一致，刚核对过磁盘，可直接照抄给 edit_file），不用再 read_file；" : "";
+  return "项目地图匹配到 " + top.total + " 个模块，这是第一批，不是全部。方法 :起-止 是刚核对过的源码行号；〔归纳·仅供参考〕。" + codeNote + "未命中的方法要看再用 read_file(startLine,endLine) 或传 module。这批对不上先换关键字再 map_lookup：\n\n" + lines.join("\n") + (code.length ? "\n\n" + code.join("\n\n") : "");
 }
 // 按模块路径精确/后缀匹配取单模块摘要
 function findModule(mapData, id) {
@@ -1290,15 +1319,16 @@ function appendModuleLines(lines, n, hit, rev) {
   const by = (rev.get(n.id) || []).slice(0, 6);
   if (by.length) lines.push("  被依赖：" + by.join(", "));
   if (needsFullRead(n)) {
-    appendChewedOnly(lines, n, hit);
+    appendChewedOnly(lines, n, hit, { attachBelow: true });
   } else {
-    lines.push("  方法（起止行为源码边界；归纳仅供参考，改前按区间读代码）：");
-    for (const m of (hit.length ? hit : nodeMethods(n)).slice(0, PROMPT_MAX_METHODS)) lines.push(fmtMethod(m));
+    const shown = hit.length ? hit : nodeMethods(n);
+    lines.push("  方法（" + shown.length + "，起止行为源码边界；命中方法完整原文见下方【原文·可直接用】）：");
+    for (const m of shown) lines.push(fmtMethod(m));
   }
 }
 // [铆钉优化] 先 map_lookup，按起止行读段；归纳仅旁证。其他 AI 请勿改回整文件通读
-const MAP_BATCH_HEAD = "【项目地图】下列是按问题打分的第一批模块，不是全部。每条方法带源码起止行（:起-止），这是定位依据。归纳文字可能不准，只能当旁证：改代码前必须用 read_file 的 startLine/endLine 只读该段核对原文，禁止整文件通读几千/几万行。关联脚本是依赖路径，需要对口时再按同样方式读对应模块的命中方法段。这批对不上时先换关键字 map_lookup；仍不够再用 search_text。同一路径本轮已读过的段不要重复整读。";
-// 每轮对话的提示词注入：本地打分取命中模块与方法行号，不调模型、不做向量，毫秒级
+const MAP_BATCH_HEAD = "【项目地图】下列是按问题打分的第一批模块，不是全部。每条方法带源码起止行（:起-止），这是定位依据。归纳文字可能不准，只能当旁证。列表里的命中方法均附【原文·可直接用】完整原文（与 :起-止 一致，不截断），可直接照抄给 edit_file；未列出的再用 read_file 的 startLine/endLine 只读该段，禁止整文件通读几千/几万行。关联脚本是依赖路径，需要对口时再按同样方式读对应模块的命中方法段。这批对不上时先换关键字 map_lookup；仍不够再用 search_text。同一路径本轮已读过的段不要重复整读。";
+// 每轮对话的提示词注入：本地打分取命中模块，命中方法全列并整段贴原文，不调模型、不做向量
 // 上一轮写过的文件单独标成地图已更新，打分规则不变
 function buildPromptBlock(workspace, query, extra) {
   if (!workspace || !String(query || "").trim()) return "";
@@ -1318,9 +1348,11 @@ function buildPromptBlock(workspace, query, extra) {
     shown.add(n.id);
   }
   const lines = [];
-  for (const { n, hit } of top) {
-    if (shown.has(n.id)) continue;
-    appendModuleLines(lines, n, hit, rev);
+  const topForCode = [];
+  for (const row of top) {
+    if (shown.has(row.n.id)) continue;
+    appendModuleLines(lines, row.n, row.hit, rev);
+    topForCode.push(row);
   }
   const parts = [];
   if (updatedLines.length || touch.removed.length) {
@@ -1330,10 +1362,12 @@ function buildPromptBlock(workspace, query, extra) {
     parts.push(head);
     if (updatedLines.length) parts.push(updatedLines.join("\n"));
   }
-  if (lines.length) parts.push(MAP_BATCH_HEAD + "\n\n" + lines.join("\n"));
-  else if (!parts.length) return "";
-  // 对话用到地图时，后台排队补嚼方法多、摘要少的模块（限量，不阻塞本轮）
-  try { scheduleGapFill(workspace); } catch (_) { /* ignore */ }
+  if (lines.length) {
+    const code = attachHitCode(topForCode);
+    const nCode = code.filter((s) => s.startsWith("【原文")).length;
+    const codeNote = nCode ? "下列 " + nCode + " 个命中方法已附完整源码（见下方【原文·可直接用】，与 :起-止 一致，不截断）。" : "";
+    parts.push(MAP_BATCH_HEAD + (codeNote ? "\n" + codeNote : "") + "\n\n" + lines.join("\n") + (code.length ? "\n\n" + code.join("\n\n") : ""));
+  } else if (!parts.length) return "";
   return parts.join("\n\n");
 }
 async function search(workspace, extra, q) {
@@ -1366,7 +1400,7 @@ function absOf(node) {
 // 重建某个节点出发的边（含类型），指向它的边保持不动
 function rebuildEdgesFrom(mapData, node, text, inclSet) {
   mapData.edges = (mapData.edges || []).filter((e) => e.from !== node.id);
-  const idents = collectIdents(text);
+  const idents = collectIdents(identsText(text, node.ext));
   const byId = new Map(mapData.nodes.map((n) => [n.id, n]));
   const depSet = new Set(node.deps || []);
   for (const to of node.deps || []) {
@@ -1661,7 +1695,7 @@ function upsertFile(workspace, abs, extra) {
   if (node) {
     if (!refreshNode(workspace, ex, mapData, node)) return false;
   } else {
-    if (st.size <= 0 || st.size > MAX_FILE_BYTES || !isIndexableFile(path.basename(target))) return false;
+    if (st.size <= 0 || st.size > maxBytesOf(target) || !isIndexableFile(path.basename(target))) return false;
     if (loadExcludes(workspace).indexOf(key) >= 0) return false;
     let text = "";
     try { text = fs.readFileSync(target, "utf8"); } catch { return false; }
@@ -1757,6 +1791,9 @@ function callModelForText(modelCfg, messages, signal) {
   const type = modelCfg && modelCfg.type
     ? modelCfg.type
     : (modelCfg && (modelCfg.modelPath || /\.gguf$/i.test(modelCfg.model || "")) ? "local" : "api");
+  if (type === "NewZabingAi" || (modelCfg && modelCfg.id === "NewZabingAi")) {
+    return Promise.reject(new Error("NewZabingAi 只接用户原话，不写项目地图"));
+  }
   if (type === "zbaingAi" || (modelCfg && modelCfg.id === "zbaingAi")) {
     return zbaingAi.complete({ modelCfg, messages, signal, onDelta: noop, onThink: noop, onReason: noop })
       .then((r) => (typeof r === "string" ? r : (r && r.content) || ""));
@@ -1765,6 +1802,12 @@ function callModelForText(modelCfg, messages, signal) {
     const modelsDir = localLlm.ensureDir(store.load().modelsDir);
     return localLlm.complete({ modelCfg, modelsDir, messages, stream: false, onDelta: noop, onReason: noop, signal })
       .then((r) => (typeof r === "string" ? r : (r && r.content) || ""));
+  }
+  // 直通正在占用 Cursor 连接时，再开一个 Agent 会把正在干活的那条连接挤成 Connection stalled
+  if (['cursor', 'codex'].includes(apiProtocol.normalizeProtocol(modelCfg && modelCfg.protocol))
+    && (require('./cursor-direct').busy() || require('./codex-direct').busy())) {
+    diag.log('map', '直通进行中，跳过这次归纳');
+    return Promise.resolve('');
   }
   // API 模型（openai/anthropic/gemini）
   return apiProtocol.complete({ modelCfg, messages, stream: false, tools: null, onDelta: noop, onReason: noop, signal })
@@ -1815,6 +1858,8 @@ async function summarizeFileMethods(modelCfg, fileInfo, signal) {
     ? fileInfo.symbols.map((s) => s && s.name).filter(Boolean).slice(0, SUMMARY_MAX_METHODS_TOTAL)
     : [];
   if (!allNames.length) return [];
+  // 大 JSON 只分段不归纳，整份发给模型太大
+  if (fileInfo.ext === ".json" && String(fileInfo.text || "").length > MAX_FILE_BYTES) return [];
   const sys = "你是代码分析助手。分析给定源码文件，为已有名字补上作用和关键值。只输出 JSON 数组，不要任何额外说明文字。";
   const merged = [];
   const seen = new Set();
@@ -1986,46 +2031,6 @@ async function summarizeIncludes(workspace, includes, modelCfg, signal) {
   }
 }
 
-// 对话空闲时补嚼：优先方法多、desc 少的热文件，每轮限量，不和正在改代码的模型抢接口
-const gapFillTimers = new Map();
-const GAP_FILL_DELAY_MS = 4000;
-function scheduleGapFill(workspace) {
-  if (!workspace) return;
-  const k = hashPath(workspace);
-  const old = gapFillTimers.get(k);
-  if (old) clearTimeout(old);
-  gapFillTimers.set(k, setTimeout(() => {
-    gapFillTimers.delete(k);
-    gapFillNow(workspace);
-  }, GAP_FILL_DELAY_MS));
-}
-function gapFillNow(workspace) {
-  if (!workspace) return;
-  const jobKey = hashPath(workspace);
-  if (summaryJobs.has(jobKey)) return;
-  const cfg = chatModelCfg();
-  if (!cfg) return;
-  const map = loadJson(jsonPath(workspace), null);
-  if (!map || !Array.isArray(map.nodes)) return;
-  const byId = new Map(map.nodes.map((n) => [n.id, n]));
-  const inc = loadInclude(workspace);
-  let pool = [];
-  if (inc && inc.initialized && Array.isArray(inc.includes) && inc.includes.length) {
-    pool = inc.includes.map((id) => byId.get(id)).filter(Boolean);
-  } else {
-    // 未勾选 include 时也啃缺口最大的几个，避免小项目永远半空
-    pool = map.nodes.slice();
-  }
-  const gaps = pool.filter(needsGapSummary)
-    .sort((a, b) => gapPriority(b) - gapPriority(a))
-    .slice(0, GAP_FILL_MAX_FILES);
-  if (!gaps.length) return;
-  diag.log("map", "缺口补嚼排队", { count: gaps.length, top: gaps.slice(0, 3).map((n) => n.path) });
-  summarizeIncludes(workspace, gaps.map((n) => n.id), cfg).catch((e) => {
-    diag.log("map", "缺口补嚼失败", { message: e && e.message });
-  });
-}
-
 // 点开一个节点时只归纳这一个文件，把作用和关键值补进弹窗
 async function summarizeOne(workspace, id, modelCfg) {
   if (!workspace || !id) return { ok: false, reason: "no-id" };
@@ -2112,9 +2117,9 @@ function gotoDefinition(workspace, extra, symbol) {
 }
 
 module.exports = {
-  ensureIndex, kickIndex, abortIndex, deleteIndex, getStatus, onStatus, search, buildPromptBlock, getMap, upsertFile, removeFile, gotoDefinition,
+  ensureIndex, kickIndex, abortIndex, deleteIndex, getStatus, onStatus, search, buildPromptBlock, getMap, mapFiles, upsertFile, removeFile, gotoDefinition,
   noteDiskChange, noteWatching,
   hashPath, fileKey, sameWorkspace, isIgnored, parseIgnoreLines, jsonPath, mdPath,
   getExcludes: loadExcludes, setExcludes: saveExcludes,
-  getInclude: loadInclude, setInclude, summarizeIncludes, summarizeOne, scheduleGapFill
+  getInclude: loadInclude, setInclude, summarizeIncludes, summarizeOne
 };

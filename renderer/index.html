@@ -150,13 +150,6 @@
             <div id="global-pref-list" class="side-list"></div>
           </div>
           <div class="side-sec">
-            <h4><span data-i18n="memory">长期记忆</span>
-              <button class="link" id="btn-new-memory" data-i18n="newItem">新建</button>
-              <button class="link danger" id="btn-clear-memory" data-i18n="memoryClear">清空</button>
-            </h4>
-            <div id="memory-list" class="side-list"></div>
-          </div>
-          <div class="side-sec">
             <h4><span data-i18n="persona">人设</span> <button class="link" id="btn-edit-persona" data-i18n="edit">编辑</button></h4>
             <div id="persona-list" class="side-list"></div>
           </div>
@@ -203,6 +196,7 @@
                   </label>
                   <button type="button" class="pill ghost" id="btn-unlimited" data-i18n="unlimitedRounds" data-i18n-title="unlimitedRoundsTitle" title="打开后不再受轮数限制，直到模型自己收尾或你点停止" aria-pressed="false">全解放</button>
                   <button type="button" class="pill ghost" id="btn-alive" data-i18n="desktopAlive" data-i18n-title="desktopAliveTitle" title="AGI（测试版）：打开后出现虚拟光标，没任务时慢一点跟着你的鼠标；下命令后它自己操作屏幕" aria-pressed="false">AGI</button>
+                  <button type="button" class="pill ghost" id="btn-cursor-direct" data-i18n="cursorDirect" data-i18n-title="cursorDirectTitle" title="大脑、总结、代码、规划有一个用 Cursor 或 Codex 模型时自动打开，都不用时关闭，不能手动切换" aria-pressed="false" disabled>AI 直通</button>
                   <button id="btn-floatbar" class="pill ghost" data-i18n="floatBarToggle" data-i18n-title="floatBarToggleTitle" aria-pressed="true">小窗</button>
                 </div>
                 <div class="right">
@@ -256,6 +250,8 @@
   </div>
 
   <script type="module" src="./project-map.js"></script>
+  <script type="module" src="./dialog-map.js"></script>
+  <script type="module" src="./plan-map.js"></script>
   <script type="module" src="./app.js"></script>
   <script type="module" src="./vision-settings.js"></script>
 </body>

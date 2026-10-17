@@ -11,6 +11,7 @@ const agent = require('./lib/agent');
 const skillsLib = require('./lib/skills');
 const localLlm = require('./lib/local-llm');
 const zbaingAi = require('./lib/zbaingAi');
+const newZabingAi = require('./lib/newZabingAi');
 const diag = require('./lib/diag');
 const downloader = require('./lib/downloader');
 const hardware = require('./lib/hardware');
@@ -19,7 +20,6 @@ const assembly = require('./lib/assembly');
 const { migrateUserData } = require('./lib/migrate-userdata');
 const mmprojLib = require('./lib/mmproj');
 const visionEngine = require('./lib/vision-engine');
-const memory = require('./lib/memory');
 const memoryGlobal = require('./lib/memory-global');
 const apiProtocol = require('./lib/api-protocol');
 const { applyProxy } = require('./lib/http-fetch');
@@ -584,6 +584,14 @@ app.on('quit', (_e, code) => diag.log('app', '已退出 quit', { code }));
 ipcMain.on('log:client', (_e, payload) => {
   diag.log('renderer', (payload && payload.message) || '界面异常', payload && payload.detail);
 });
+ipcMain.on('log:summary-trace', (_e, payload) => {
+  const fields = ['stage', 'tabId', 'turnId', 'msgIndex', 'textLength', 'revealLength', 'finalTextLength', 'incomingLength', 'renderTargetFound', 'renderingMode', 'renderedLength'];
+  const metadata = {};
+  for (const key of fields) {
+    if (payload && Object.prototype.hasOwnProperty.call(payload, key)) metadata[key] = payload[key];
+  }
+  diag.log('summary-render', '总结渲染链路', metadata);
+});
 
 // ── 悬浮栏槽位：多开进程时每个进程占一个，免得两个小窗叠在同一处互相打架 ──
 function floatBarSlotDir() {
@@ -878,6 +886,69 @@ function broadcastFloatBarVisibility(visible) {
   }
 }
 
+// 当前是否还有角色在用 Cursor 模型：大脑是 Cursor 模型，或当前这套组合的槽位指向 Cursor 模型。
+// 都没在用就既不预热、也不留直通会话，免得在 Cursor 那边一直挂着
+function cursorInUse(s) {
+  const models = s.models || [];
+  const isCursorModel = (m) => {
+    if (!m || m.type === 'local') return false;
+    const p = (s.providers || []).find((x) => x && x.id === m.providerId);
+    return !!p && apiProtocol.normalizeProtocol(p.protocol) === 'cursor';
+  };
+  if (isCursorModel(models.find((m) => m && m.id === s.currentModelId))) return true;
+  const slots = assembly.slotsOf(s);
+  for (const slot of slots) {
+    if (!slot) continue;
+    if (apiProtocol.normalizeProtocol(slot.protocol) === 'cursor') return true;
+    if (isCursorModel(models.find((m) => m && m.id === slot.apiId))) return true;
+  }
+  return false;
+}
+
+function codexInUse(s) {
+  const models = s.models || [];
+  const isCodexModel = (m) => {
+    if (!m || m.type === 'local') return false;
+    const p = (s.providers || []).find((x) => x && x.id === m.providerId);
+    return !!p && apiProtocol.normalizeProtocol(p.protocol) === 'codex';
+  };
+  if (isCodexModel(models.find((m) => m && m.id === s.currentModelId))) return true;
+  return assembly.slotsOf(s).some((slot) => slot && (
+    apiProtocol.normalizeProtocol(slot.protocol) === 'codex'
+    || isCodexModel(models.find((m) => m && m.id === slot.apiId))
+  ));
+}
+
+// 配了 Cursor 厂商就在后台预热 SDK，省掉第一次调用的冷启动；等主窗先起来再跑
+function warmUpCursor() {
+  try {
+    const s = store.load();
+    // 这个进程里没人用 Cursor 就不连过去
+    if (!cursorInUse(s)) return;
+    const prov = (s.providers || []).find((p) => p && p.protocol === 'cursor');
+    if (!prov) return;
+    const m = (s.models || []).find((x) => x && x.providerId === prov.id && x.model);
+    setTimeout(() => {
+      require('./lib/cursor-model').warmUp({ apiKey: prov.apiKey, model: m?.model })
+        .then((r) => diag.log('cursor', 'Cursor 预热结束', r));
+    }, 3000);
+  } catch (e) {
+    diag.log('cursor', 'Cursor 预热失败', { message: e && e.message });
+  }
+}
+
+// 模型配置改完立刻对齐：还在用 Cursor 就预热，不用了就把残留的直通会话断掉
+function syncCursorDirect() {
+  try {
+    const s = store.load();
+    if (cursorInUse(s)) warmUpCursor();
+    else require('./lib/cursor-direct').closeIdle();
+    if (!codexInUse(s)) require('./lib/codex-direct').closeIdle();
+  } catch (e) {
+    diag.log('cursor', 'Cursor 直通会话整理失败', { message: e && e.message });
+  }
+}
+
 app.whenReady().then(async () => {
   ensureAppRoot();
   diag.log('app', `诊断日志位置：${diag.logFile()}`);
@@ -895,6 +966,7 @@ app.whenReady().then(async () => {
   // 这些通道只用到模块级的表（floatBars / sessionsByKey / winIdByWin 等），不依赖 mySlot、floatBar、shortcutOk
   registerFloatBarIpc();
   createWindow();
+  warmUpCursor();
   // 先注册快捷键：是否成功决定小窗要不要留「隐藏」入口，所以要在建小窗之前知道
   try {
     shortcutOk = globalShortcut.register('CommandOrControl+Alt+Space', function () {
@@ -1138,6 +1210,36 @@ ipcMain.handle('app:maxAgentRounds', (_e, n) => {
   s.maxAgentRounds = store.clampAgentRounds(n);
   store.save(s);
   return s.maxAgentRounds;
+});
+
+// 用户点「写入方案」：把这条回复里的【方案】段写进本会话的方案文件
+ipcMain.handle('dialog:index', (_e, payload) => agent.makeDialogIndex({
+  userText: String(payload?.userText || ''),
+  assistantText: String(payload?.assistantText || ''),
+  modelId: String(payload?.modelId || '')
+}));
+
+ipcMain.handle('plan:write', (e, payload) => {
+  const ws = String(payload?.workspace || workspaceByWin.get(getWin(e)) || '');
+  return agent.writePlanFromChat({ workspace: ws, tabId: String(payload?.tabId || ''), text: String(payload?.text || '') });
+});
+
+ipcMain.handle('plan:tree', (e, payload) => {
+  const ws = String(payload?.workspace || workspaceByWin.get(getWin(e)) || '');
+  return agent.readPlanTree({ workspace: ws, tabId: String(payload?.tabId || '') });
+});
+
+// 删除方案条目：仅未锁定条目可删除（锁定语义由 agent.removePlanItem 内部判断），删除后返回 {ok, locked/notFound/map}
+ipcMain.handle('plan:remove', (e, payload) => {
+  const ws = String(payload?.workspace || workspaceByWin.get(getWin(e)) || '');
+  return agent.removePlanItem({ workspace: ws, tabId: String(payload?.tabId || ''), no: payload?.no });
+});
+
+ipcMain.handle('app:cursorDirect', (_e, on) => {
+  const s = store.load();
+  s.cursorDirect = !!on;
+  store.save(s);
+  return s.cursorDirect;
 });
 
 ipcMain.handle('desktop:setAlive', (_e, on) => {
@@ -1420,6 +1522,7 @@ ipcMain.handle('models:save', (_e, payload) => {
     s.currentModelId = s.models[0]?.id || 'local-gguf';
   }
   store.save(s);
+  syncCursorDirect();
   return { models: s.models, providers: s.providers, currentModelId: s.currentModelId };
 });
 
@@ -1432,6 +1535,7 @@ ipcMain.handle('models:saveAssembly', (_e, { key, slots }) => {
   s.assemblies[k] = { slots: Array.isArray(slots) ? slots : [] };
   assembly.syncVisionFields(s, s.assemblies[k].slots);
   store.save(s);
+  syncCursorDirect();
   return { key: k, slots: s.assemblies[k].slots };
 });
 
@@ -1439,6 +1543,7 @@ ipcMain.handle('models:saveCapabilityDefaults', (_e, payload) => {
   const s = store.load();
   s.capabilityDefaults = assembly.normalizeCapabilityDefaults(payload || {});
   store.save(s);
+  syncCursorDirect();
   return s.capabilityDefaults;
 });
 
@@ -1524,7 +1629,7 @@ ipcMain.handle('models:test', async (_e, modelCfg) => {
   const s = store.load();
   let cfg = modelCfg;
   if (typeof modelCfg === 'string') cfg = store.resolveModelCfg(modelCfg, s);
-  else if (modelCfg?.id && !modelCfg.baseUrl && modelCfg.type !== 'local' && modelCfg.type !== 'zbaingAi') {
+  else if (modelCfg?.id && !modelCfg.baseUrl && modelCfg.type !== 'local' && modelCfg.type !== 'zbaingAi' && modelCfg.type !== 'NewZabingAi') {
     cfg = store.resolveModelCfg(modelCfg.id, s) || modelCfg;
   } else if (modelCfg?.providerId && !modelCfg.baseUrl) {
     const p = store.findProvider(modelCfg.providerId, s);
@@ -1538,6 +1643,9 @@ ipcMain.handle('models:test', async (_e, modelCfg) => {
   }
   if (cfg?.type === 'zbaingAi' || cfg?.id === 'zbaingAi') {
     return zbaingAi.probe(cfg);
+  }
+  if (cfg?.type === 'NewZabingAi' || cfg?.id === 'NewZabingAi') {
+    return newZabingAi.probe(cfg);
   }
   if (cfg?.type === 'local' || (!cfg?.baseUrl && (cfg?.modelPath || /\.gguf$/i.test(cfg?.model || '')))) {
     const file = localLlm.resolveGgufPath(cfg, modelsDirOf(s));
@@ -1786,41 +1894,6 @@ ipcMain.handle('persona:load', () => skillsLib.loadPersona(APP_ROOT).body);
 ipcMain.handle('persona:save', (_e, body) => {
   skillsLib.savePersona(APP_ROOT, body);
   return true;
-});
-
-ipcMain.handle('memory:list', (e) => {
-  const ws = workspaceByWin.get(getWin(e)) || '';
-  if (!ws) return [];
-  return memory.list(ws);
-});
-
-ipcMain.handle('memory:add', (e, payload) => {
-  const ws = workspaceByWin.get(getWin(e)) || '';
-  if (!ws) throw new Error('请先打开项目');
-  memory.addUserMemory(ws, payload || {});
-  return memory.list(ws);
-});
-
-ipcMain.handle('memory:delete', (e, id) => {
-  const ws = workspaceByWin.get(getWin(e)) || '';
-  if (!ws) throw new Error('请先打开项目');
-  memory.remove(ws, id);
-  return memory.list(ws);
-});
-
-ipcMain.handle('memory:clear', (e, payload) => {
-  const ws = workspaceByWin.get(getWin(e)) || '';
-  if (!ws) throw new Error('请先打开项目');
-  const keepPinned = !!(payload && payload.keepPinned);
-  memory.clearAll(ws, { keepPinned });
-  return memory.list(ws);
-});
-
-ipcMain.handle('memory:pin', (e, { id, pinned }) => {
-  const ws = workspaceByWin.get(getWin(e)) || '';
-  if (!ws) throw new Error('请先打开项目');
-  memory.setPinned(ws, id, pinned);
-  return memory.list(ws);
 });
 
 ipcMain.handle('globalMemory:get', () => memoryGlobal.load());

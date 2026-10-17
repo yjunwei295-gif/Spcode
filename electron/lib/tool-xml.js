@@ -212,7 +212,7 @@ function extractJsonObject(s) {
 function jsonBlobCalls(text) {
   const s = String(text || '');
   const out = [];
-  const startRe = /\{\s*"(?:name|tool|function)"\s*:\s*"(list_dir|read_file|write_file|edit_file|create_dir|mkdir|delete_file|search_text|semantic_search|map_lookup|goto_definition|run_command|generate_media|ask_user|memory_add|memory_list|memory_forget|working_memory_update|call_worker|screen_read|screen_look|clipboard_look|window_list|window_focus|ui_act|agi_note|mouse_move|mouse_click|mouse_drag|mouse_scroll|keyboard_type|keyboard_key)"/g;
+  const startRe = /\{\s*"(?:name|tool|function)"\s*:\s*"(list_dir|read_file|write_file|edit_file|create_dir|mkdir|delete_file|search_text|semantic_search|map_lookup|goto_definition|run_command|generate_media|ask_user|working_memory_update|todo_write|call_worker|screen_read|screen_look|clipboard_look|window_list|window_focus|ui_act|agi_note|mouse_move|mouse_click|mouse_drag|mouse_scroll|keyboard_type|keyboard_key)"/g;
   let m;
   while ((m = startRe.exec(s))) {
     const obj = extractJsonObject(s.slice(m.index));

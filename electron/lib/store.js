@@ -37,6 +37,8 @@ const DEFAULTS = {
   commandSandbox: { enabled: true, timeoutSec: 60 },
   maxAgentRounds: 16,
   desktopAlive: false,
+  // Cursor 模型走直通会话；关掉才回到原来的规划 / 部下流程
+  cursorDirect: true,
   providers: [],
   models: [
     { ...LOCAL_SLOT }
@@ -53,7 +55,11 @@ const PROVIDER_PRESETS = [
   { id: 'deepseek', name: 'DeepSeek', protocol: 'openai', baseUrl: 'https://api.deepseek.com' },
   { id: 'anthropic', name: 'Anthropic', protocol: 'anthropic', baseUrl: 'https://api.anthropic.com' },
   { id: 'gemini', name: 'Google Gemini', protocol: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta' },
-  { id: 'bai', name: 'B.AI', protocol: 'openai', baseUrl: 'https://api.b.ai/v1' }
+  { id: 'bai', name: 'B.AI', protocol: 'openai', baseUrl: 'https://api.b.ai/v1' },
+  // Cursor 走 SDK，不需要真实地址；Key 可空，空时测试连接会打开浏览器登录 Cursor
+  { id: 'cursor', name: 'Cursor', protocol: 'cursor', baseUrl: 'cursor://sdk' },
+  // Codex SDK 复用本机 Codex CLI 登录；也可在 API Key 中填写 OpenAI API Key
+  { id: 'codex', name: 'Codex', protocol: 'codex', baseUrl: 'codex://sdk' }
 ];
 
 function filePath() {
@@ -92,6 +98,8 @@ function normalizeProtocol(raw) {
   const p = String(raw || 'openai').toLowerCase().trim();
   if (p === 'claude' || p === 'anthropic') return 'anthropic';
   if (p === 'google' || p === 'gemini') return 'gemini';
+  if (p === 'cursor') return 'cursor';
+  if (p === 'codex') return 'codex';
   return 'openai';
 }
 
@@ -158,6 +166,29 @@ function ensureLocalSlot(models) {
 }
 
 const ZABING_GGUF = path.join('D:', 'Ai', 'zabingAI', 'models', 'qwen2.5-coder-7b-instruct-q4_k_m.gguf');
+const NEW_ZABING_ROOT = path.join('D:', 'Ai', 'NewZabingAi');
+
+function ensureNewZabingSlot(models) {
+  const kept = models || [];
+  let row = kept.find((m) => m?.id === 'NewZabingAi' || m?.type === 'NewZabingAi');
+  if (!row) {
+    row = { id: 'NewZabingAi' };
+    kept.push(row);
+  }
+  row.id = 'NewZabingAi';
+  row.type = 'NewZabingAi';
+  row.name = 'NewZabingAi';
+  row.model = '欲望嘴';
+  row.enabled = row.enabled !== false;
+  row.newZabingRoot = row.newZabingRoot || NEW_ZABING_ROOT;
+  delete row.providerId;
+  delete row.baseUrl;
+  delete row.apiKey;
+  delete row.protocol;
+  delete row.modelPath;
+  delete row.vision;
+  return kept;
+}
 
 function ensureZabingAISlot(models) {
   const kept = models || [];
@@ -210,11 +241,13 @@ function migrateProvidersAndModels(data) {
   let models = ensureLocalSlot(data.models && data.models.length ? data.models : DEFAULTS.models);
   models = ensureZbaingSlot(models);
   models = ensureZabingAISlot(models);
+  models = ensureNewZabingSlot(models);
 
   for (const m of models) {
     if (!m || m.type === 'local' || m.id === 'local-gguf') continue;
     if (m.type === 'zbaingAi' || m.id === 'zbaingAi') continue;
     if (m.type === 'zabingAI' || m.id === 'zabingAI') continue;
+    if (m.type === 'NewZabingAi' || m.id === 'NewZabingAi') continue;
     m.type = 'api';
     m.enabled = m.enabled !== false;
     if (m.vision == null) m.vision = false;
@@ -263,6 +296,7 @@ function migrateProvidersAndModels(data) {
     if (m.type === 'local' || m.id === 'local-gguf') return true;
     if (m.type === 'zbaingAi' || m.id === 'zbaingAi') return true;
     if (m.type === 'zabingAI' || m.id === 'zabingAI') return true;
+    if (m.type === 'NewZabingAi' || m.id === 'NewZabingAi') return true;
     return !!(m.providerId && m.model);
   });
 
@@ -291,6 +325,15 @@ function resolveModelCfg(modelOrId, settings) {
       name: m.name || 'zbaingAi',
       type: 'zbaingAi',
       zbaingRoot: m.zbaingRoot || '',
+      enabled: m.enabled !== false
+    };
+  }
+  if (m.id === 'NewZabingAi' || m.type === 'NewZabingAi') {
+    return {
+      id: 'NewZabingAi',
+      name: 'NewZabingAi',
+      type: 'NewZabingAi',
+      newZabingRoot: m.newZabingRoot || NEW_ZABING_ROOT,
       enabled: m.enabled !== false
     };
   }
@@ -467,6 +510,7 @@ function load() {
     }
     merged.maxAgentRounds = clampAgentRounds(merged.maxAgentRounds);
     merged.desktopAlive = merged.desktopAlive === true;
+    merged.cursorDirect = merged.cursorDirect !== false;
     if (!merged.capabilityDefaults || typeof merged.capabilityDefaults !== 'object') {
       merged.capabilityDefaults = {};
     }

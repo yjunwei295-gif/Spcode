@@ -10,6 +10,12 @@ const api = {
   saveCommandSandbox: (cfg) => ipcRenderer.invoke('app:commandSandbox', cfg),
   saveMaxAgentRounds: (n) => ipcRenderer.invoke('app:maxAgentRounds', n),
   setDesktopAlive: (on) => ipcRenderer.invoke('desktop:setAlive', !!on),
+  setCursorDirect: (on) => ipcRenderer.invoke('app:cursorDirect', !!on),
+  planWrite: (payload) => ipcRenderer.invoke('plan:write', payload),
+  planTree: (payload) => ipcRenderer.invoke('plan:tree', payload),
+  // 删除方案条目：转发到主进程 plan:remove
+  planRemoveItem: (payload) => ipcRenderer.invoke('plan:remove', payload),
+  dialogIndex: (payload) => ipcRenderer.invoke('dialog:index', payload),
   newWindow: () => ipcRenderer.invoke('window:new'),
   focusWindow: () => ipcRenderer.invoke('window:focus'),
   minimize: () => ipcRenderer.invoke('window:minimize'),
@@ -51,11 +57,6 @@ const api = {
   deleteRule: (payload) => ipcRenderer.invoke('rules:delete', payload),
   loadPersona: () => ipcRenderer.invoke('persona:load'),
   savePersona: (body) => ipcRenderer.invoke('persona:save', body),
-  listMemory: () => ipcRenderer.invoke('memory:list'),
-  addMemory: (payload) => ipcRenderer.invoke('memory:add', payload),
-  deleteMemory: (id) => ipcRenderer.invoke('memory:delete', id),
-  clearMemory: (payload) => ipcRenderer.invoke('memory:clear', payload || {}),
-  pinMemory: (id, pinned) => ipcRenderer.invoke('memory:pin', { id, pinned }),
   getGlobalMemory: () => ipcRenderer.invoke('globalMemory:get'),
   saveGlobalProfile: (profile) => ipcRenderer.invoke('globalMemory:saveProfile', profile),
   addGlobalPref: (payload) => ipcRenderer.invoke('globalMemory:addPref', payload),
@@ -166,6 +167,7 @@ const api = {
   },
 
   reportError: (message, detail) => ipcRenderer.send('log:client', { message, detail }),
+  logSummaryTrace: (metadata) => ipcRenderer.send('log:summary-trace', metadata),
 
   detectHardware: () => ipcRenderer.invoke('hw:detect'),
   modelAdvice: (purpose, opts) => ipcRenderer.invoke('hw:advice', purpose, opts || {}),

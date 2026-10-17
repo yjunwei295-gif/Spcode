@@ -36,6 +36,7 @@ const state = {
   commandSandbox: { enabled: true, timeoutSec: 60 },
   maxAgentRounds: 16,
   desktopAlive: false,
+  cursorDirect: true,
   capabilityDefaults: {},
   assemblies: {},
   assemblyKey: '',
@@ -70,7 +71,6 @@ const state = {
   livePaintTimer: null,
   typewriterRaf: null,
   milestones: [],
-  memories: [],
   globalMemory: null,
   dl: { taskId: null, purpose: null },
   downloads: [],
@@ -91,6 +91,26 @@ function clampAgentRounds(n) {
 function roundsOf(tab) {
   if (tab && tab.maxAgentRounds != null) return clampAgentRounds(tab.maxAgentRounds);
   return clampAgentRounds(state.maxAgentRounds);
+}
+
+/** 直通跟着模型走：大脑、总结、代码、规划有一个用 Cursor / Codex 就开，否则关，用户不能手动切换 */
+function syncCursorDirectBtn() {
+  const btn = $('btn-cursor-direct');
+  if (!btn) return;
+  const m = currentModel();
+  const brainProtocol = !!m && m.type !== 'local' ? providerById(m.providerId)?.protocol : '';
+  const roleProtocols = ['summary', 'code', 'planning'].map((role) => {
+    const slot = rosterSlot(role);
+    if (slot?.protocol) return slot.protocol;
+    const model = slot?.apiId ? (state.models || []).find((x) => x.id === slot.apiId) : null;
+    return model && model.type !== 'local' ? providerById(model.providerId)?.protocol : '';
+  });
+  const directProtocols = [brainProtocol, ...roleProtocols].filter((p) => p === 'cursor' || p === 'codex');
+  const on = directProtocols.length > 0;
+  btn.disabled = true;
+  btn.classList.toggle('on', on);
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  btn.textContent = directProtocols.includes('codex') ? 'Codex 直通' : (on ? 'Cursor 直通' : t('cursorDirect'));
 }
 
 function syncRoundsInput(tab) {
@@ -136,11 +156,9 @@ async function persistModels(currentId) {
   refreshQuotaBar();
 }
 
-// source：当前额度条数值来源，'provider' 表示厂商返回值，'manual' 表示用户手填钱包快照
-// inflightSeq：记录是「哪一次请求」占用 inflight，避免旧请求复位新请求的标记（纯内存，不落盘）
-const quotaMem = { key: '', at: 0, payload: null, seq: 0, blocked: {}, inflight: false, inflightSeq: 0, source: null };
-// 厂商额度值保活时长：正确厂商值在 30 分钟内优先于手填钱包，避免对话中被手填值顶掉
-const PROVIDER_QUOTA_KEEP_MS = 30 * 60 * 1000;
+// 每个厂商单独缓存余额，顶部显示所有厂商按币种分组的合计；Codex 百分比单独展示。
+const quotaMem = { providers: new Map(), inflight: new Map() };
+const PROVIDER_QUOTA_REFRESH_MS = 5 * 60 * 1000;
 // 开工选项按钮文案上限：超过则截断显示（补省略号），全文仍进 title
 const MAX_START_OPTION_LABEL = 120;
 // 开工方案条数的安全上限：正常「有几个方案出几个按钮」，超过 12 条说明是异常长列表，只取前 12 条防止按钮区被撑爆
@@ -164,32 +182,10 @@ function formatQuotaMoney(n, currency) {
   return `$${body}`;
 }
 
-function currentQuotaKey() {
-  const m = currentModel();
-  if (!m) return '';
-  if (m.type === 'local' || m.id === 'local-gguf') return '';
-  if (m.type === 'zbaingAi' || m.id === 'zbaingAi') return '';
-  return m.providerId || m.id || '';
-}
-
 function quotaCanShow(b) {
   // 放宽：厂商可能只回一个剩余额度（如 DeepSeek 的 balance_infos[0].total_balance），
   // 没有 used/total 也允许显示；缺字段时 paintQuotaBar 只渲染 remaining
   return !!(b && b.available === true && Number.isFinite(b.remaining));
-}
-
-// 当前额度条上是否已有「本厂商」的可用厂商值：来源必须是 provider 且该值能显示
-function hasProviderQuota(key) {
-  if (!key) return false;
-  if (quotaMem.source !== 'provider') return false;
-  if (quotaMem.key !== key) return false;
-  return quotaCanShow(quotaMem.payload);
-}
-
-// 厂商值是否仍在保活期内：只有还新鲜才拒绝被手填值覆盖
-function providerQuotaStillFresh(key) {
-  if (!hasProviderQuota(key)) return false;
-  return Date.now() - quotaMem.at < PROVIDER_QUOTA_KEEP_MS;
 }
 
 function walletSnapshotOf(p) {
@@ -214,122 +210,111 @@ function paintQuotaBar(b) {
   const name = $('title-app-name');
   const text = $('quota-text');
   if (!bar || !name) return;
-  if (!quotaCanShow(b)) {
+  const displayText = b?.kind === 'aggregate'
+    ? String(b.text || '')
+    : quotaCanShow(b) ? t('quotaRemain', { remain: formatQuotaMoney(b.remaining, b.currency) }) : '';
+  if (!displayText) {
     bar.hidden = true;
     name.hidden = false;
     return;
   }
   name.hidden = true;
   bar.hidden = false;
-  bar.removeAttribute('title');
-  if (text) text.textContent = t('quotaRemain', {
-    remain: formatQuotaMoney(b.remaining, b.currency)
-  });
+  if (b.title) bar.title = b.title;
+  else bar.removeAttribute('title');
+  if (text) text.textContent = displayText;
 }
 
-async function refreshQuotaBar(force, opts) {
-  const isAuto = !!(opts && opts.auto);
-  const key = currentQuotaKey();
-  if (!key) {
-    quotaMem.key = '';
-    quotaMem.payload = null;
-    quotaMem.source = null;
-    paintQuotaBar(null);
-    return;
-  }
-  const p = providerById(key);
-  // 1) 先算出 manual 备用值（用户手填的钱包快照），只算不画；厂商值查不到时用它兜底
-  const manual = walletSnapshotOf(p);
-  // 2) 自动同步（对话结束）：该厂商已知查不到余额，或已有请求在飞，直接放弃，不发请求也不动界面
-  if (isAuto) {
-    if (quotaMem.blocked[key]) return;
-    if (quotaMem.inflight) return;
-  }
-  const now = Date.now();
-  // 3) 60 秒内存缓存：非强制刷新且未过期，直接用缓存结果，不再请求厂商
-  if (!force && quotaMem.key === key && now - quotaMem.at < 60000) {
-    paintQuotaBar(quotaMem.payload);
-    return;
-  }
-  const seq = ++quotaMem.seq;
-  // 4) 非自动路径（手动刷新/切模型/钱包保存/启动）进入请求前清掉标记，允许重试一次
-  if (!isAuto) delete quotaMem.blocked[key];
-  // 5) 标记请求在飞，并记下占用者 seq，供 finally 判断是否该由自己复位
-  quotaMem.inflight = true;
-  quotaMem.inflightSeq = seq;
-  try {
-    const r = await api.fetchAccountBalance(key);
-    if (seq !== quotaMem.seq) return;
-    if (quotaCanShow(r)) {
-      // 6) 厂商值可用：写入缓存并以厂商值显示，来源记为 provider，同时清掉该 key 的失败标记
-      quotaMem.key = key;
-      quotaMem.at = Date.now();
-      quotaMem.payload = r;
-      quotaMem.source = 'provider';
-      delete quotaMem.blocked[key];
-      paintQuotaBar(r);
-      return;
+function providerCacheKey(p) {
+  const text = `${p?.protocol || ''}\0${p?.baseUrl || ''}\0${p?.apiKey || ''}`;
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+  return (hash >>> 0).toString(16);
+}
+
+function aggregateQuotaSnapshot() {
+  const totals = new Map();
+  const details = [];
+  const codexUsage = [];
+  const providers = state.providers || [];
+  for (const p of providers) {
+    const cached = quotaMem.providers.get(p.id);
+    const fromProvider = cached?.configKey === providerCacheKey(p) ? cached.balance : null;
+    const balance = quotaCanShow(fromProvider) ? fromProvider : walletSnapshotOf(p);
+    if (quotaCanShow(balance)) {
+      const rawCurrency = String(balance.currency || 'USD').toUpperCase();
+      const currency = rawCurrency === 'RMB' ? 'CNY' : rawCurrency;
+      // 不同厂商的 credits 不是同一单位，单独按厂商列出，不做无意义相加。
+      if (currency !== 'CREDITS') totals.set(currency, (totals.get(currency) || 0) + Number(balance.remaining));
+      details.push(`${p.name || p.id}: ${formatQuotaMoney(balance.remaining, currency)}${currency === 'CREDITS' ? ' Credits' : ''}`);
+    } else if (fromProvider?.available && fromProvider.kind === 'rate-limits' && fromProvider.text) {
+      codexUsage.push(`${p.name || p.id}: ${fromProvider.text}`);
+    } else {
+      details.push(`${p.name || p.id}: ${t('quotaUnavailable')}`);
     }
-    // 6) 厂商这次没给可用值（available:false 或 remaining 非有限数）：
-    //    若已有仍在保活期内的正确厂商值，保留内存与顶部显示不动，不画手填值
-    if (providerQuotaStillFresh(key)) {
-      // 自动路径下仍照原样记标记，保持原有防重入行为
-      if (isAuto) quotaMem.blocked[key] = true;
-      return;
-    }
-    // 6.1) 没有可保留的厂商值（或已超过 30 分钟未刷新）：有 manual 就画 manual，否则隐藏额度条
-    quotaMem.key = key;
-    quotaMem.at = Date.now();
-    quotaMem.payload = manual;
-    quotaMem.source = manual ? 'manual' : null;
-    paintQuotaBar(manual);
-    // 自动路径下「查不到」也要记标记，避免每轮对话都白请求一次
-    if (isAuto) quotaMem.blocked[key] = true;
-  } catch {
-    // 7) 请求异常：自动路径下先记标记；再判断是否保留已查到的正确厂商值
-    if (isAuto) quotaMem.blocked[key] = true;
-    if (seq !== quotaMem.seq) return;
-    // 仍有保活期内的厂商值：保留内存与顶部显示不动，不画手填值
-    if (providerQuotaStillFresh(key)) return;
-    // 7.1) 无可保留厂商值：有 manual 就画 manual，无 manual 则隐藏额度条
-    quotaMem.key = key;
-    quotaMem.at = Date.now();
-    quotaMem.payload = manual;
-    quotaMem.source = manual ? 'manual' : null;
-    paintQuotaBar(manual);
-  } finally {
-    // 8) 只有自己那次请求仍是最新才复位 inflight，避免并发时旧请求复位新请求的标记导致同步卡死
-    if (quotaMem.inflightSeq === seq) quotaMem.inflight = false;
   }
+  const sums = [];
+  for (const [key, value] of totals) {
+    const amount = formatQuotaMoney(value, key);
+    sums.push(amount);
+  }
+  const summary = sums.length ? t('quotaTotal', { text: sums.join(' · ') }) : '';
+  if (summary) details.unshift(summary);
+  if (codexUsage.length) details.push(...codexUsage);
+  // 顶栏直接列出每家厂商的当前额度，避免不同厂商同币种合并后看不出 DeepSeek 等单家数据。
+  const providerDetails = details.filter((line) => line !== summary && !codexUsage.includes(line));
+  const text = [summary, ...providerDetails, ...codexUsage].filter(Boolean).join(' · ');
+  if (!text) return null;
+  return { available: true, kind: 'aggregate', text, title: details.join('\n') };
+}
+
+function showAggregateQuota() {
+  paintQuotaBar(aggregateQuotaSnapshot());
 }
 
 function ingestProviderBalance(providerId, balance) {
-  const key = currentQuotaKey();
-  if (!providerId || providerId !== key) return;
-  const manual = walletSnapshotOf(providerById(key));
-  if (quotaCanShow(balance)) {
-    // 厂商值优先写入内存并显示，来源记为 provider（字段解析沿用上游传来的 balance）
-    quotaMem.key = key;
-    quotaMem.at = Date.now();
-    quotaMem.payload = balance;
-    quotaMem.source = 'provider';
-    delete quotaMem.blocked[key];
-    paintQuotaBar(balance);
-    return;
-  }
-  // 厂商值不可用或缺失：若仍有保活期内的正确厂商值，保留内存与顶部显示不动
-  if (providerQuotaStillFresh(key)) return;
-  // 回退显示用户手填的钱包快照，来源记为 manual
-  quotaMem.key = key;
-  quotaMem.at = Date.now();
-  quotaMem.payload = manual;
-  quotaMem.source = manual ? 'manual' : null;
-  paintQuotaBar(manual);
+  const p = providerById(providerId);
+  if (!p) return;
+  quotaMem.providers.set(providerId, { balance, at: Date.now(), configKey: providerCacheKey(p) });
+  showAggregateQuota();
+}
+
+async function refreshProviderQuota(p, force) {
+  if (!p?.id) return;
+  const configKey = providerCacheKey(p);
+  const cached = quotaMem.providers.get(p.id);
+  if (!force && cached?.configKey === configKey && Date.now() - cached.at < PROVIDER_QUOTA_REFRESH_MS) return;
+  if (quotaMem.inflight.has(p.id)) return quotaMem.inflight.get(p.id);
+  const job = api.fetchAccountBalance(p.id)
+    .catch(() => ({ available: false }))
+    .then((balance) => {
+      quotaMem.providers.set(p.id, { balance, at: Date.now(), configKey });
+      showAggregateQuota();
+    })
+    .finally(() => quotaMem.inflight.delete(p.id));
+  quotaMem.inflight.set(p.id, job);
+  return job;
+}
+
+async function refreshQuotaBar(force, opts) {
+  const providers = (state.providers || []).filter((p) => p?.id);
+  const currentIds = new Set(providers.map((p) => p.id));
+  for (const id of quotaMem.providers.keys()) if (!currentIds.has(id)) quotaMem.providers.delete(id);
+  showAggregateQuota();
+  let next = 0;
+  const workers = Array.from({ length: Math.min(3, providers.length) }, async () => {
+    while (next < providers.length) {
+      const p = providers[next++];
+      await refreshProviderQuota(p, !!force && !(opts && opts.auto));
+    }
+  });
+  await Promise.all(workers);
 }
 
 function applyWalletSnapshot(ev) {
   const pid = ev.providerId;
-  const p = pid ? providerById(pid) : providerById(currentQuotaKey());
+  const activeModel = currentModel();
+  const p = pid ? providerById(pid) : providerById(activeModel?.providerId || activeModel?.id || '');
   if (p) {
     p.wallet = {
       ...(p.wallet || {}),
@@ -340,11 +325,8 @@ function applyWalletSnapshot(ev) {
       tokensOut: Number(ev.tokensOut) || 0
     };
   }
-  // 账本照旧写回 p.wallet；只有顶部显示的覆盖需要判断
-  // 厂商值优先：当前显示的就是厂商值，且该值仍在 30 分钟保活期内时，不覆盖顶部显示
-  const keepProvider = providerQuotaStillFresh(currentQuotaKey());
-  if (keepProvider) return;
-  paintQuotaBar(quotaCanShow(ev) ? ev : walletSnapshotOf(p));
+  // 更新当前厂商本地账本后重算全部厂商合计。
+  showAggregateQuota();
 }
 
 function syncAgentBtn() {
@@ -397,7 +379,7 @@ function applyLocaleUi() {
   syncSendBtn();
   syncAgentBtn();
   renderClipPanel();
-  paintQuotaBar(quotaMem.payload);
+  showAggregateQuota();
 }
 
 function showWelcome() {
@@ -560,11 +542,6 @@ async function refreshMeta() {
     state.milestones = [];
   }
   try {
-    state.memories = state.workspace ? (await api.listMemory()) : [];
-  } catch {
-    state.memories = [];
-  }
-  try {
     state.globalMemory = await api.getGlobalMemory();
   } catch {
     state.globalMemory = null;
@@ -598,7 +575,7 @@ function isAbsTreePath(p) {
 }
 
 function emptyWorkingMemory() {
-  return { goal: '', openQuestions: [], focusPaths: [], scratch: [] };
+  return { goal: '', openQuestions: [], focusPaths: [], scratch: [], todos: [] };
 }
 
 function prefersReducedMotion() {
@@ -1552,24 +1529,58 @@ function repaintStartGo(m, i, tab) {
   if (html) host.insertAdjacentHTML('beforeend', html);
 }
 
+// [铆钉优化] 开工状态上报去重：renderStartGo 是逐条消息调用的，同一次重绘会把同一个结果
+// 重复上报几百次（每条 assistant 消息一次 IPC），对话变长后光这些 IPC 就能把主进程和小窗一起拖死。
+// 只在「能不能开工 + 开工方案清单」真的变了时才发一次，主进程拿到的最终值与逐条上报完全一致
+const lastStartReport = new Map();
+
+function reportStartReady(tab, canStart, options) {
+  const tabKey = String((tab && tab.id) || '');
+  const list = Array.isArray(options) ? options : [];
+  const sig = (canStart ? '1' : '0') + '|' + JSON.stringify(list);
+  if (lastStartReport.get(tabKey) === sig) return;
+  lastStartReport.set(tabKey, sig);
+  if (api.floatCanStart) api.floatCanStart(!!canStart, list);
+}
+
 function renderStartGo(m, i, lastIdx, tab) {
   // 只取这一次正文，闸门和原来的 START_ASK_RE 判定共用同一个字符串，保证两边看的是同一份内容
   const text = String(m.text || '');
   // [铆钉优化] 闸门：本轮明说没有待改项时，直接不渲染任何开工按钮（含那颗普通「开始」），
   // 并沿本文件已有的上报路径把这条消息的 canStart 报成 false、方案为空，让小窗「开始」也保持不亮
   if (textSaysNoPendingWork(text)) {
-    if (api.floatCanStart) api.floatCanStart(false, []);
+    reportStartReady(tab, false, []);
     return '';
   }
-  // 「能否开工」就这一份判定（START_ASK_RE 只在这里用）：判定完顺手回报小窗，让它决定要不要亮「开始」
-  const canStart = i === lastIdx && !m.stopped && !m.askPending && !isTabSending(tab)
-    && START_ASK_RE.test(text);
+  // 有标记方案时走多选开工路径；没有标记方案时，仅保留原来的 START_ASK_RE 单按钮判定。
+  const markerOptions = parseMarkerStartOptions(text);
+  // 停止或恢复会话后的完整方案仍可由用户明确确认开工；真正执行仍需点击按钮。
+  const eligible = i === lastIdx && (!m.stopped || START_ASK_RE.test(text) || markerOptions.length > 0) && !m.askPending && !isTabSending(tab);
+  const canStart = eligible && (markerOptions.length > 0 || START_ASK_RE.test(text));
   // 认定能开工时再看这段复述里有没有可选方案，有就拆成多颗按钮，并把选项一并报给小窗
-  const options = canStart ? parseStartOptions(String(m.text || '')) : [];
-  if (api.floatCanStart) api.floatCanStart(!!canStart, options);
+  const options = canStart && markerOptions.length > 0 ? parseStartOptions(text) : [];
+  // 诊断：开工按钮判定分解（只记录元数据，不含正文），用于定位按钮不出现的原因。
+  // 本函数是逐条消息调用的，只让候选那条（最后一条）上报一次：每条都上报的话，
+  // 上千条消息会在一次重绘里发出上千次 IPC，主进程是同步写日志，整个界面会被拖死
+  if (i === lastIdx && api.reportError) api.reportError('[开工按钮诊断]', {
+    msgIndex: i, lastIndex: lastIdx, stopped: !!m.stopped, askPending: !!m.askPending,
+    tabSending: isTabSending(tab), askMatched: START_ASK_RE.test(text),
+    markerOptionCount: markerOptions.length, canStart: !!canStart, optionCount: options.length
+  });
+  // 用户可点「写入方案」查看导图，也可在核对后直接回复「开始」；后台会锁定最新方案块。
+  // 没有【方案】段时后台把整条回复写进去。AGI 开着时后台不查方案，这里也不拦
+  const needPlan = canStart && !state.desktopAlive;
+  const planNeedsWrite = needPlan && !m.planWritten;
+  reportStartReady(tab, !!canStart, options);
   if (!canStart) return '';
   const en = getLocale() === 'en';
   let btns = '';
+  if (needPlan) {
+    const planLabel = m.planWritten ? (en ? 'Plan written' : '已写入方案') : (en ? 'Write plan' : '写入方案');
+    btns += `<button type="button" class="start-go-submit" data-plan-write="1">${planLabel}</button>`;
+    if (m.planWritten && m.planItems) btns += `<button type="button" class="start-go-submit" data-plan-map="${i}">${en ? 'Plan map' : '方案导图'}</button>`;
+    if (m.planNote) btns += `<span class="start-go-hint">${escapeHtml(String(m.planNote))}</span>`;
+  }
   if (options.length >= 1) {
     // 有方案时改成多选：单击选项只切换勾选，勾选态存在当前消息对象的 m.startPicked（数组，存 value 字符串）上，
     // 流式刷新会重新调 renderStartGo，勾选态从这里恢复，不会丢；真正开工统一交给行尾那颗「一起开工」
@@ -1607,12 +1618,15 @@ function renderStartGo(m, i, lastIdx, tab) {
     noteBox.textContent = String(m.startDraft == null ? '' : m.startDraft);
     noteBox.addEventListener('input', onStartNoteInput);
     row.appendChild(noteBox);
-    btns = row.innerHTML;
+    btns += row.innerHTML;
   } else {
     // 没有方案就完全保持原样：一颗按钮，空值代表旧行为
-    btns = `<button type="button" class="start-go" data-start-go="">${en ? 'Start' : '开始'}</button>`;
+    btns += `<button type="button" class="start-go" data-start-go="">${en ? 'Start' : '开始'}</button>`;
   }
-  return `<div class="start-go-row">${btns}<span class="start-go-hint">${en ? 'Hand off to the code worker' : '确认方案，派给代码模块改'}</span></div>`;
+  const hint = planNeedsWrite
+    ? (en ? 'Review it, then click Write plan or reply Start' : '核对后点写入方案，或直接回复「开始」')
+    : (en ? 'Hand off to the code worker' : '确认方案，派给代码模块改');
+  return `<div class="start-go-row">${btns}<span class="start-go-hint">${hint}</span></div>`;
 }
 
 // 补充说明框的输入：实时把内容写回该条消息的 m.startDraft，
@@ -1628,6 +1642,33 @@ function onStartNoteInput(e) {
   const picked = Array.isArray(m.startPicked) ? m.startPicked : [];
   // 与渲染时同一条判定：一项没勾且补充说明去空白后为空才灰
   goAll.disabled = picked.length < 1 && !String(m.startDraft == null ? '' : m.startDraft).trim();
+}
+
+// AI 用 todo_write 列的任务清单，每条回复存一份当时的快照
+function renderTodoCard(m) {
+  const list = Array.isArray(m.todos) ? m.todos : [];
+  if (!list.length) return '';
+  const rows = list.map((td) => {
+    const st = ['pending', 'in_progress', 'completed', 'cancelled'].includes(td.status) ? td.status : 'pending';
+    return `<li class="todo-item todo-${st}"><span class="todo-mark"></span><span class="todo-text">${escapeHtml(String(td.content || ''))}</span></li>`;
+  }).join('');
+  return `<div class="todo-card"><div class="todo-head">To-dos ${list.length}</div><ul class="todo-list">${rows}</ul></div>`;
+}
+
+function paintTodoCard(tab, m) {
+  const idx = tab.messages.indexOf(m);
+  const el = idx >= 0 && document.querySelector(`.msg.assistant[data-msg-i="${idx}"]`);
+  if (!el) return;
+  const html = renderTodoCard(m);
+  const old = el.querySelector(':scope > .todo-card');
+  if (old) {
+    if (html) old.outerHTML = html; else old.remove();
+    return;
+  }
+  if (!html) return;
+  const anchor = el.querySelector(':scope > .bubble');
+  if (anchor) anchor.insertAdjacentHTML('beforebegin', html);
+  else el.insertAdjacentHTML('beforeend', html);
 }
 
 function renderAskCard(m) {
@@ -1678,23 +1719,6 @@ async function addAskImages(list) {
   }
   renderMessages();
   return true;
-}
-
-function memoryListHtml() {
-  if (!state.workspace) return `<div class="hint">${t('openProjectFirst')}</div>`;
-  const items = state.memories || [];
-  if (!items.length) return `<div class="hint">${t('noMemory')}</div>`;
-  return items.map((m) => {
-    const pin = m.pinned ? ` · ${t('memoryPinned')}` : '';
-    const paths = (m.paths || []).length ? `<br><span class="desc">${escapeHtml(clipText((m.paths || []).join(', '), 40))}</span>` : '';
-    return `<div class="side-item memory-item" data-mem-id="${escapeHtml(m.id)}">
-      <b>${escapeHtml(clipText(m.summary, 48))}</b>${pin}${paths}
-      <div class="mem-actions">
-        <button type="button" class="link" data-mem-pin="${escapeHtml(m.id)}" data-pinned="${m.pinned ? '1' : '0'}">${m.pinned ? t('memoryUnpin') : t('memoryPin')}</button>
-        <button type="button" class="link danger" data-mem-del="${escapeHtml(m.id)}">${t('delete')}</button>
-      </div>
-    </div>`;
-  }).join('');
 }
 
 function globalPrefListHtml() {
@@ -1801,76 +1825,6 @@ function openProfileEditor() {
   };
 }
 
-function openMemoryEditor() {
-  if (!state.workspace) {
-    openModal(`<h3>${t('memory')}</h3><p class="hint">${t('openProjectFirst')}</p><div class="modal-actions"><button class="primary" id="m-ok">${t('ok')}</button></div>`);
-    $('m-ok').onclick = closeModal;
-    return;
-  }
-  openModal(`<div class="modal-card-inner">
-    <h3>${t('memoryNew')}</h3>
-    <p class="hint">${t('memoryHint')}</p>
-    <textarea id="m-mem-summary" rows="4" placeholder="${t('memorySummaryPh')}"></textarea>
-    <input id="m-mem-paths" type="text" placeholder="${t('memoryPathsPh')}" style="width:100%;margin-top:8px" />
-    <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
-      <input type="checkbox" id="m-mem-pin" checked /> ${t('memoryPinned')}
-    </label>
-    <div class="modal-actions">
-      <button id="m-cancel">${t('cancel')}</button>
-      <button class="primary" id="m-save">${t('save')}</button>
-    </div>
-  </div>`);
-  $('m-cancel').onclick = closeModal;
-  $('m-save').onclick = async () => {
-    const summary = $('m-mem-summary').value.trim();
-    if (!summary) return;
-    const paths = $('m-mem-paths').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
-    const pinned = $('m-mem-pin').checked;
-    state.memories = await api.addMemory({ summary, paths, pinned, kind: pinned ? 'pin' : 'invariant' });
-    closeModal();
-    renderSidebar();
-  };
-}
-
-function openMemoryClearDialog() {
-  if (!state.workspace) {
-    openModal(`<h3>${t('memory')}</h3><p class="hint">${t('openProjectFirst')}</p><div class="modal-actions"><button class="primary" id="m-ok">${t('ok')}</button></div>`);
-    $('m-ok').onclick = closeModal;
-    return;
-  }
-  const items = state.memories || [];
-  const pinnedCount = items.filter((m) => m.pinned).length;
-  openModal(`<div class="modal-card-inner">
-    <h3>${t('memoryClearTitle')}</h3>
-    <p class="hint">${t('memoryClearHint', { total: items.length, pinned: pinnedCount })}</p>
-    <label style="display:flex;align-items:center;gap:8px;margin-top:10px">
-      <input type="checkbox" id="m-mem-keep-pin" checked /> ${t('memoryKeepPinned')}
-    </label>
-    <div class="modal-actions">
-      <button id="m-cancel">${t('cancel')}</button>
-      <button class="danger" id="m-clear">${t('delete')}</button>
-    </div>
-  </div>`);
-  $('m-cancel').onclick = closeModal;
-  $('m-clear').onclick = async () => {
-    const keepPinned = $('m-mem-keep-pin').checked;
-    const toDelete = items.filter((m) => !keepPinned || !m.pinned).length;
-    if (!toDelete) {
-      alert(t('memoryClearEmpty'));
-      return;
-    }
-    if (!confirm(t('memoryClearConfirm', { n: toDelete }))) return;
-    try {
-      state.memories = await api.clearMemory({ keepPinned });
-      closeModal();
-      renderSidebar();
-      alert(t('memoryClearedOk', { n: toDelete }));
-    } catch (err) {
-      alert(err?.message || t('memoryClearFail'));
-    }
-  };
-}
-
 function openGlobalPrefEditor() {
   openModal(`<div class="modal-card-inner">
     <h3>${t('addGlobalPref')}</h3>
@@ -1954,6 +1908,12 @@ function paintRevealBubble(msg, done) {
   const idx = tab ? tab.messages.indexOf(msg) : -1;
   if (idx < 0) return false;
   const el = document.querySelector(`.msg.assistant[data-msg-i="${idx}"] .bubble`);
+  logSummaryTrace('打字机刷新总结文本', tab, msg, {
+    msgIndex: idx,
+    renderTargetFound: !!el,
+    renderingMode: done ? 'markdown-final' : 'typewriter',
+    renderedLength: done ? String(msg.text || '').length : String(msg.text || '').slice(0, msg.revealLen || 0).length
+  });
   if (!el) return false;
   const box = $('messages');
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 96;
@@ -1961,12 +1921,25 @@ function paintRevealBubble(msg, done) {
     el.classList.remove('typewriter', 'typing');
     el.classList.add('md', 'md-reveal');
     el.innerHTML = renderMarkdown(msg.text || '');
+    requestAnimationFrame(() => el.classList.remove('md-reveal'));
   } else {
     el.classList.remove('md');
     el.classList.add('typewriter', 'typing');
     el.textContent = (msg.text || '').slice(0, msg.revealLen || 0);
   }
   if (nearBottom) box.scrollTop = box.scrollHeight;
+  // 诊断：气泡实际写进 DOM 的文本长度与滚动位置，判断“已渲染但看不见”（只记元数据）
+  if (api.reportError) {
+    const elRect = el.getBoundingClientRect();
+    const boxRect = box.getBoundingClientRect();
+    api.reportError('[总结气泡诊断]', {
+      msgIndex: idx, done: !!done, textLength: String(msg.text || '').length,
+      revealLen: Number(msg.revealLen || 0), domTextLength: String(el.textContent || '').length,
+      nearBottom: nearBottom, scrollTop: Math.round(box.scrollTop),
+      scrollHeight: box.scrollHeight, clientHeight: box.clientHeight,
+      visibleInViewport: elRect.top < boxRect.bottom && elRect.bottom > boxRect.top
+    });
+  }
   return true;
 }
 
@@ -2120,6 +2093,13 @@ function renderMessages(switching = false) {
     }
     const thumbs = (m.images || []).map((src) => `<img class="msg-thumb" src="${src}" alt="" data-zoom-src="${src}">`).join('');
     const typing = isAssistantTyping(m);
+    if (m.role === 'assistant' && tab && m === tab.liveAssistant && m.text) {
+      logSummaryTrace('完整消息渲染总结文本', tab, m, {
+        msgIndex: i,
+        renderingMode: typing ? 'typewriter' : 'markdown',
+        renderedLength: typing ? String(m.text || '').slice(0, m.revealLen || 0).length : String(m.text || '').length
+      });
+    }
     let body = '';
     if (m.text) {
       if (m.role === 'assistant') {
@@ -2147,10 +2127,11 @@ function renderMessages(switching = false) {
       <div class="role">${m.role === 'user' ? t('you') : t('assistantName')}${m.role === 'assistant' ? rosterHtml(m) : ''}
         <span>
           ${m.role === 'user' ? `<button class="msg-refill" data-refill="${i}" title="${t('refillTitle')}">${t('refill')}</button>` : ''}
+          ${m.role === 'assistant' && m.planMap ? planMapBtnHtml(i) : ''}
           <button class="msg-fork" data-fork="${i}" title="${t('forkTitle')}">${t('fork')}</button>
         </span>
       </div>
-      ${m.role === 'assistant' ? renderThink(m, i) : ''}${bubble}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
+      ${m.role === 'assistant' ? renderThink(m, i) : ''}${m.role === 'assistant' ? renderTodoCard(m) : ''}${bubble}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
     </div>`;
   }).join('');
   // [铆钉优化] 进入/切换对话一律滚到最新；同一标签页重绘时原来贴底就继续贴底，否则保持原位。其他 AI 请勿改回恢复 scrollPos 旧位置
@@ -2205,12 +2186,51 @@ function flushLivePaint() {
   }
 }
 
+function planMapBtnHtml(i) {
+  const en = getLocale() === 'en';
+  return `<button class="msg-fork" data-plan-map="${i}">${en ? 'Plan map' : '方案导图'}</button>`;
+}
+
+// 先向后台要最新的条目状态（落在方案文件夹里），拿不到再用这条消息上缓存的推送
+async function openPlanMap(tab, m) {
+  if (!tab || !window.PlanMap) return;
+  let map = null;
+  try {
+    if (api.planTree) map = await api.planTree({ workspace: tab.workspace || state.workspace, tabId: String(tab.id || '') });
+  } catch (_) { map = null; }
+  if (!map) map = m && m.planMap;
+  if (!map) { alert('没有方案条目：方案文件已收尾或还没写入方案'); return; }
+  // 传 workspace 与 tabId，删除条目时前端才有定位参数可用
+  window.PlanMap.open({ title: tab.title || '', map, workspace: tab.workspace || state.workspace, tabId: String(tab.id) });
+}
+
 function scheduleLivePaint() {
   if (state.livePaintTimer) return;
   state.livePaintTimer = setTimeout(() => {
     state.livePaintTimer = null;
     paintLiveAssistant();
   }, 100);
+}
+
+// 只记录总结链路元数据，避免把用户或助手正文写入诊断日志。
+function logSummaryTrace(stage, tab, msg, details = {}) {
+  const tabId = String(tab?.id || '');
+  const turnId = String(msg?.turnId || '');
+  const msgIndex = tab && msg ? tab.messages.indexOf(msg) : -1;
+  const metadata = {
+    stage,
+    tabId,
+    turnId,
+    msgIndex,
+    textLength: String(msg?.text || '').length,
+    revealLength: Number(msg?.revealLen || 0)
+  };
+  const safeDetailFields = ['finalTextLength', 'incomingLength', 'renderTargetFound', 'renderingMode', 'renderedLength'];
+  for (const key of safeDetailFields) {
+    if (Object.prototype.hasOwnProperty.call(details, key)) metadata[key] = details[key];
+  }
+  console.info('[总结链路诊断]', metadata);
+  api.logSummaryTrace?.(metadata);
 }
 
 function paintLiveAssistant() {
@@ -2269,12 +2289,18 @@ function paintLiveAssistant() {
   }
   if (last.text) {
     let bubble = el.querySelector('.bubble');
+    const typing = isAssistantTyping(last);
+    logSummaryTrace('实时渲染总结文本', tab, last, {
+      msgIndex: tab.messages.indexOf(last),
+      renderTargetFound: !!bubble,
+      renderingMode: typing ? 'typewriter' : 'markdown',
+      renderedLength: typing ? String(last.text || '').slice(0, last.revealLen || 0).length : String(last.text || '').length
+    });
     if (!bubble) {
       bubble = document.createElement('div');
       bubble.className = 'bubble';
       el.appendChild(bubble);
     }
-    const typing = isAssistantTyping(last);
     bubble.classList.toggle('md', !typing);
     bubble.classList.toggle('typewriter', typing);
     bubble.classList.toggle('typing', typing && isTabSending(tab));
@@ -2418,7 +2444,6 @@ function renderSidebar() {
   bindSkillDrag($('skill-list'));
   if ($('milestone-list')) $('milestone-list').innerHTML = milestoneListHtml();
   if ($('global-pref-list')) $('global-pref-list').innerHTML = globalPrefListHtml();
-  if ($('memory-list')) $('memory-list').innerHTML = memoryListHtml();
   $('persona-list').innerHTML = personaListHtml();
   $('rule-list').innerHTML = ruleListHtml();
 }
@@ -2623,23 +2648,33 @@ function capRefSlot(ref, role) {
   return slotDisplayName(slot) ? slot : null;
 }
 
+/** 模块实际用的槽位：先看当前组装，再看能力默认 */
+function rosterSlot(role) {
+  const pack = state.assemblies && state.assemblies[state.assemblyKey];
+  const slots = Array.isArray(pack?.slots) ? pack.slots : [];
+  const hit = slots.find((s) => s && s.role === role && slotDisplayName(s));
+  if (hit) return hit;
+  const row = (state.capabilityDefaults || {})[role] || {};
+  const primary = capRefSlot(row.primary, role);
+  if (primary) return primary;
+  const backs = Array.isArray(row.fallbacks) ? row.fallbacks : [];
+  return backs.map((r) => capRefSlot(r, role)).find(Boolean) || null;
+}
+
+function slotIsCursor(slot) {
+  if (!slot) return false;
+  if (slot.protocol === 'cursor' || slot.protocol === 'codex') return true;
+  const m = slot.apiId ? (state.models || []).find((x) => x.id === slot.apiId) : null;
+  const protocol = !!m && m.type !== 'local' ? providerById(m.providerId)?.protocol : '';
+  return protocol === 'cursor' || protocol === 'codex';
+}
+
 function idleRoster() {
   const cur = currentModel();
   const name = cur?.model || cur?.name || t('model');
   const list = [{ name, role: 'brain' }];
-  const pack = state.assemblies && state.assemblies[state.assemblyKey];
-  const slots = Array.isArray(pack?.slots) ? pack.slots : [];
-  const caps = state.capabilityDefaults || {};
   for (const role of ROSTER_ROLES) {
-    let slot = slots.find((s) => s && s.role === role && slotDisplayName(s));
-    if (!slot) {
-      const row = caps[role] || {};
-      slot = capRefSlot(row.primary, role);
-      if (!slot) {
-        const backs = Array.isArray(row.fallbacks) ? row.fallbacks : [];
-        slot = backs.map((r) => capRefSlot(r, role)).find(Boolean) || null;
-      }
-    }
+    const slot = rosterSlot(role);
     const n = slotDisplayName(slot);
     if (!n) continue;
     list.push({ name: n, role });
@@ -2694,6 +2729,7 @@ function paintModelButton(activeName, activeRole) {
     chip.append(label, tag);
     btn.append(chip);
   }
+  syncCursorDirectBtn();
 }
 
 function renderModelMenu() {
@@ -3177,9 +3213,12 @@ async function sendOne(tab, text, draft) {
   const atts = draft.attachments || [];
   const imageAtts = atts.filter((a) => a.preview);
   const otherAtts = atts.filter((a) => !a.preview);
+  const userText = [text, ...(draft.contextPaths || []).map((p) => `@${p}`), ...otherAtts.map((a) => a.name)].filter(Boolean).join('\n');
   tab.messages.push({
     role: 'user',
-    text: [text, ...(draft.contextPaths || []).map((p) => `@${p}`), ...otherAtts.map((a) => a.name)].filter(Boolean).join('\n'),
+    text: userText,
+    // 只回「开始」的一轮没有新信息（方案在方案文件里），默认不塞给 AI
+    ctxSkip: /^(开始|开始吧)[。.!！~～]*$/.test(userText.trim()),
     images: imageAtts.map((a) => a.preview),
     _enterAnim: !prefersReducedMotion(),
     draft: {
@@ -3191,7 +3230,23 @@ async function sendOne(tab, text, draft) {
     }
   });
   if (isNewChatTitle(tab.title) && text) tab.title = text.slice(0, 18);
-  const history = tab.messages.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => ({ role: m.role, content: m.text || '' }));
+  const roundByMsg = new Map();
+  for (const r of dialogRounds(tab)) {
+    roundByMsg.set(r.user, r);
+    if (r.asst) roundByMsg.set(r.asst, r);
+  }
+  // 带上轮次编号、不适用标记和索引：后台更早的轮次只发索引，不适用的整轮跳过
+  const history = tab.messages.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => {
+    const r = roundByMsg.get(m);
+    return {
+      role: m.role,
+      content: m.text || '',
+      round: r ? r.n : undefined,
+      skip: !!(r && r.user.ctxSkip && !r.user.ctxRemoved),
+      removed: !!(r && r.user.ctxRemoved),
+      index: (r && r.asst && r.asst.dialogIndex) || undefined
+    };
+  });
   history.pop();
   const turnId = uid();
   const modelId = draft.modelId || tab.modelId || state.currentModelId;
@@ -3266,6 +3321,7 @@ async function sendOne(tab, text, draft) {
       restoreStoppedDraft(tab, assistant);
       aborted = true;
     } else {
+      logSummaryTrace('收到总结最终结果', tab, assistant, { finalTextLength: String(result.text || '').length });
       assistant.text = result.text || assistant.text;
       if (result.zbaingMeta) assistant.zbaing = result.zbaingMeta;
       assistant.changes = result.changes || [];
@@ -3278,6 +3334,7 @@ async function sendOne(tab, text, draft) {
       revealRest(assistant);
       if (result.workingMemory) tab.workingMemory = result.workingMemory;
       if (result.contextSummary != null) tab.contextSummary = result.contextSummary;
+      fillDialogIndex(tab, assistant, modelId);
     }
   } catch (e) {
     if (isStopError(e, tab)) {
@@ -3472,13 +3529,13 @@ function pushThink(last, type, text) {
   last.thinking.push({ type, text });
 }
 
-function mergeMsgUsage(msg, ev) {
+function mergeMsgUsage(msg, ev, ctxTotal) {
   if (!msg) return;
   if (!msg.usage) msg.usage = { input: 0, output: 0, usd: 0, credits: 0 };
   msg.usage.input = (Number(msg.usage.input) || 0) + (Number(ev.input) || 0);
   msg.usage.output = (Number(msg.usage.output) || 0) + (Number(ev.output) || 0);
-  // [铆钉优化] 上下文 = 这一轮里单次调用发给模型的最大输入量（输入是多次调用累加的，不能代表上下文）。其他 AI 请勿改成累加
-  msg.usage.context = Math.max(Number(msg.usage.context) || 0, Number(ev.input) || 0);
+  // [铆钉优化] 上下文 = 整次对话累计输入：本次会话里所有模型调用的 input 相加（含各轮与工具循环）。其他 AI 请勿改回单次最大值
+  msg.usage.context = Number(ctxTotal) || 0;
   if (ev.usd != null && Number.isFinite(Number(ev.usd))) {
     msg.usage.usd = (Number(msg.usage.usd) || 0) + Number(ev.usd);
   }
@@ -3500,21 +3557,85 @@ function fmtTokens(n) {
 function usageLineText(u) {
   if (!u || (!(u.input || u.output) && !u.credits && !u.usd)) return '';
   const bits = [];
-  if (u.context) bits.push(t('msgContext', { ctx: fmtTokens(u.context) }));
   bits.push(t('msgTokens', { in: fmtTokens(u.input), out: fmtTokens(u.output) }));
   if (u.credits) bits.push(`${formatQuotaMoney(u.credits, 'CREDITS')} Credits`);
   else if (u.usd) bits.push(formatQuotaMoney(u.usd, 'USD'));
   return bits.join(' · ');
 }
 
-// [铆钉优化] 上下文统计旁的「查看」按钮，点开预览这一轮实际发给模型的上下文。其他 AI 请勿删
+/** 对话按轮分组：每轮 { n, user, asst }，user / asst 是消息对象；一轮只认用户消息后的第一条回复 */
+function dialogRounds(tab) {
+  const out = [];
+  let cur = null;
+  for (const m of (tab?.messages || [])) {
+    if (m.role === 'user') {
+      cur = { n: out.length + 1, user: m, asst: null };
+      out.push(cur);
+    } else if (m.role === 'assistant' && cur && !cur.asst) {
+      cur.asst = m;
+    }
+  }
+  return out;
+}
+
+/** 一轮结束后在后台生成这一轮的索引，不挡对话；失败时后台会退回简易索引 */
+function fillDialogIndex(tab, asst, modelId) {
+  if (!api.dialogIndex || !asst || asst.dialogIndex) return;
+  const r = dialogRounds(tab).find((x) => x.asst === asst);
+  if (!r) return;
+  api.dialogIndex({ userText: r.user.text || '', assistantText: asst.text || '', modelId: modelId || '' })
+    .then((idx) => {
+      if (!idx || !(idx.title || idx.summary)) return;
+      asst.dialogIndex = { title: String(idx.title || ''), summary: String(idx.summary || '') };
+      persistTab(tab);
+    })
+    .catch(() => {});
+}
+
+/** 打开「塞给 AI 的上下文」导图：只画会发出去的轮次，旁边列表勾选调整，点「应用」才保存 */
+function openDialogMap(turnId) {
+  const tab = activeSession();
+  if (!tab || !window.DialogMap) return;
+  const one = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+  const rounds = dialogRounds(tab).filter((r) => !r.user.ctxRemoved).map((r) => {
+    const idx = r.asst && r.asst.dialogIndex;
+    return {
+      n: r.n,
+      title: (idx && idx.title) || one(r.user.text).slice(0, 20) || '（空）',
+      indexTitle: (idx && idx.title) || '',
+      indexSummary: (idx && idx.summary) || '',
+      userText: String(r.user.text || ''),
+      asstText: String((r.asst && r.asst.text) || ''),
+      skip: !!r.user.ctxSkip
+    };
+  });
+  window.DialogMap.open({
+    title: tab.title || t('newChat'),
+    rounds,
+    onApply: (payload) => {
+      const skipSet = payload && payload.skipSet ? payload.skipSet : payload;
+      const removeSet = (payload && payload.removeSet) || new Set();
+      for (const r of dialogRounds(tab)) {
+        if (removeSet.has(r.n)) {
+          r.user.ctxRemoved = true;
+          continue;
+        }
+        if (r.user.ctxRemoved) continue;
+        r.user.ctxSkip = skipSet.has(r.n);
+      }
+      renderMessages();
+      persistTab(tab);
+    },
+    onPreview: turnId ? () => openContextPreview(turnId) : null
+  });
+}
+
+// 用量行最前面是「上下文」按钮，点开看下一轮会塞给 AI 哪些上下文
 function usageLineHtml(m) {
   const text = usageLineText(m?.usage);
   if (!text) return '';
-  const btn = m.usage?.context && m.turnId
-    ? ` <button type="button" class="msg-ctx-view" data-ctx-turn="${escapeHtml(m.turnId)}">${t('ctxView')}</button>`
-    : '';
-  return `${escapeHtml(text)}${btn}`;
+  const chip = `<button type="button" class="msg-ctx-view" data-dialog-map="${escapeHtml(m.turnId || '')}">${escapeHtml(t('msgContextBtn'))}</button>`;
+  return `${chip} · ${escapeHtml(text)}`;
 }
 
 function renderUsageLine(m) {
@@ -3615,7 +3736,18 @@ function onChatEvent(ev) {
     const msg = tab?.liveAssistant
       || (ev.turnId && tab?.messages.find((m) => m.role === 'assistant' && m.turnId === ev.turnId));
     if (msg) {
-      mergeMsgUsage(msg, ev);
+      // [铆钉优化] 累加整次对话的输入：本会话内所有 assistant 消息已记录的 input，加上本次调用
+      let ctxTotal = Number(ev.input) || 0;
+      if (Array.isArray(tab.messages)) {
+        for (let i = 0; i < tab.messages.length; i++) {
+          const one = tab.messages[i];
+          if (one === msg) { continue; }
+          if (one.role !== 'assistant') { continue; }
+          if (!one.usage) { continue; }
+          ctxTotal += Number(one.usage.input) || 0;
+        }
+      }
+      mergeMsgUsage(msg, ev, ctxTotal);
       if (tab && isActiveTab(tab)) patchLiveUsage(tab, msg);
     }
     return;
@@ -3633,6 +3765,7 @@ function onChatEvent(ev) {
   tab.lastChatEventAt = Date.now();
   armStallWatch(tab);
   if (ev.type === 'rewrite_text') {
+    logSummaryTrace('接收总结重写', tab, last, { incomingLength: String(ev.text || '').length });
     // 新文字和已经显示的部分相同的前缀保留，后面的交给打字机逐字流出
     const shown = (last.text || '').slice(0, last.revealLen || 0);
     last.text = ev.text || '';
@@ -3645,6 +3778,7 @@ function onChatEvent(ev) {
       scheduleLivePaint();
     }
   } else if (ev.type === 'text') {
+    logSummaryTrace('接收总结文本片段', tab, last, { incomingLength: String(ev.text || '').length });
     last.status = t('generating');
     last.text += ev.text;
     scheduleStreamSave(tab);
@@ -3698,8 +3832,28 @@ function onChatEvent(ev) {
       renderMessages();
       scrollMessagesToBottom();
     }
+  } else if (ev.type === 'plan_tree') {
+    if (ev.map) {
+      const fresh = !last.planMap;
+      last.planMap = ev.map;
+      if (window.PlanMap && window.PlanMap.isOpen()) window.PlanMap.update(ev.map);
+      if (fresh && touchUi) {
+        const idx = tab.messages.indexOf(last);
+        const span = document.querySelector(`.msg.assistant[data-msg-i="${idx}"] > .role > span`);
+        if (span && !span.querySelector('[data-plan-map]')) span.insertAdjacentHTML('afterbegin', planMapBtnHtml(idx));
+      }
+    }
   } else if (ev.type === 'working_memory') {
-    if (ev.workingMemory) tab.workingMemory = ev.workingMemory;
+    if (ev.workingMemory) {
+      // 只在清单真的变了时挂到这条回复上，免得只改工作记忆别的字段时把上一轮的旧清单带进来
+      const todos = Array.isArray(ev.workingMemory.todos) ? ev.workingMemory.todos : [];
+      const before = JSON.stringify((tab.workingMemory && tab.workingMemory.todos) || []);
+      if (last.todos || JSON.stringify(todos) !== before) {
+        last.todos = todos;
+        if (touchUi) paintTodoCard(tab, last);
+      }
+      tab.workingMemory = ev.workingMemory;
+    }
   } else if (ev.type === 'context_compacted') {
     last.thinkingOpen = true;
     pushThink(last, 'think', t('contextCompacted'));
@@ -3712,6 +3866,7 @@ function onChatEvent(ev) {
     };
     if (touchUi) scheduleLivePaint();
   } else if (ev.type === 'done') {
+    logSummaryTrace('收到总结完成事件', tab, last, { finalTextLength: String(ev.text || '').length });
     last.thinkingOpen = false;
     last.status = '';
     last.askPending = false;
@@ -3733,6 +3888,19 @@ function onChatEvent(ev) {
       paintModelButton();
       flushLivePaint();
       renderMessages();
+    }
+    // 诊断：回合结束时总结文本的实际状态与消息区滚动位置（只记元数据，不含正文）
+    if (api.reportError) {
+      const msgBox = $('messages');
+      api.reportError('[回合结束诊断]', {
+        tabId: String(tab && tab.id || ''), turnId: String(ev.turnId || ''),
+        touchUi: !!touchUi, hidden: !!document.hidden,
+        textLength: String(last.text || '').length, revealLen: Number(last.revealLen || 0),
+        typewriterDone: !!last.typewriterDone,
+        scrollTop: msgBox ? Math.round(msgBox.scrollTop) : -1,
+        scrollHeight: msgBox ? msgBox.scrollHeight : -1,
+        clientHeight: msgBox ? msgBox.clientHeight : -1
+      });
     }
     // 对话结束后自动同步厂商余额（不 await，失败由 blocked 记录，不再自动重试）
     refreshQuotaBar(true, { auto: true });
@@ -4061,6 +4229,8 @@ function openSettings() {
   const protocolLabel = (p) => {
     if (p === 'anthropic') return t('protocolAnthropic');
     if (p === 'gemini') return t('protocolGemini');
+    if (p === 'cursor') return t('protocolCursor');
+    if (p === 'codex') return t('protocolCodex');
     return t('protocolOpenai');
   };
   const providerRows = (state.providers || []).map((p) => `
@@ -4151,6 +4321,8 @@ function openSettings() {
       <option value="openai">${t('protocolOpenai')}</option>
       <option value="anthropic">${t('protocolAnthropic')}</option>
       <option value="gemini">${t('protocolGemini')}</option>
+      <option value="cursor">${t('protocolCursor')}</option>
+      <option value="codex">${t('protocolCodex')}</option>
     </select>
     <label>${t('apiUrl')}</label><input id="p-url" placeholder="https://api.openai.com/v1" />
     <label>${t('apiKey')}</label><input id="p-key" type="password" placeholder="sk-..." />
@@ -4328,8 +4500,15 @@ function openSettings() {
       el.textContent = t('accountBalanceIdle');
       return;
     }
-    el.textContent = remoteBalance?.available && remoteBalance.text
-      ? t('accountBalance', { text: remoteBalance.text })
+    if (remoteBalance?.available && remoteBalance.text) {
+      el.textContent = remoteBalance.kind === 'rate-limits'
+        ? remoteBalance.text
+        : t('accountBalance', { text: remoteBalance.text });
+      return;
+    }
+    const provider = providerById($('mm-provider')?.value || '');
+    el.textContent = String(provider?.protocol || '').toLowerCase() === 'codex'
+      ? t('codexUsageUnknown')
       : t('accountBalanceUnknown');
   };
 
@@ -4361,9 +4540,10 @@ function openSettings() {
     box.innerHTML = ids.map((id) => {
       const on = known.has(id);
       const price = remoteCatalog[id]?.priceText || t('modelPriceUnknown');
+      const label = remoteCatalog[id]?.name || id;
       return `<label class="remote-model-item ${on ? 'on' : ''}">
         <input type="checkbox" data-remote-id="${escapeHtml(id)}" ${on ? 'checked' : ''} />
-        <span title="${escapeHtml(id)}">${escapeHtml(id)}</span>
+        <span title="${escapeHtml(id)}">${escapeHtml(label)}</span>
         <span class="remote-model-price" title="${escapeHtml(price)}">${escapeHtml(price)}</span>
       </label>`;
     }).join('');
@@ -4450,6 +4630,11 @@ function openSettings() {
     $('p-name').value = p.name;
     $('p-protocol').value = p.protocol || 'openai';
     $('p-url').value = p.baseUrl || '';
+  };
+  // Cursor 和 Codex 走 SDK，没有真实接口地址，填固定占位地址
+  $('p-protocol').onchange = () => {
+    if ($('p-protocol').value === 'cursor') $('p-url').value = 'cursor://sdk';
+    else if ($('p-protocol').value === 'codex') $('p-url').value = 'codex://sdk';
   };
 
   let editingProvId = null;
@@ -4550,14 +4735,49 @@ function openSettings() {
     refreshQuotaBar(true);
   };
   $('mm-fetch').onclick = async () => {
-    const pid = $('mm-provider').value;
+    let pid = $('mm-provider').value;
     if (!pid) return alert(t('needProvider'));
     const btn = $('mm-fetch');
     const old = btn.textContent;
     btn.disabled = true;
     btn.textContent = t('fetchingModels');
     try {
-      const r = await api.listRemoteModels(pid);
+      let r;
+      try {
+        r = await api.listRemoteModels(pid);
+      } catch (e) {
+        const selected = providerById(pid);
+        let codex = (state.providers || []).find((p) => p && p.protocol === 'codex');
+        const needsBearer = /missing bearer authentication/i.test(String(e?.message || e));
+        const isUnkeyedOpenAi = selected?.protocol === 'openai'
+          && !String(selected.apiKey || '').trim()
+          && /^https:\/\/api\.openai\.com(?:\/|$)/i.test(String(selected.baseUrl || ''));
+        if (!needsBearer || !isUnkeyedOpenAi) throw e;
+        if (!codex) {
+          codex = {
+            id: uid().replace(/^s_/, 'prov_'),
+            name: t('codexProviderName'),
+            protocol: 'codex',
+            baseUrl: 'codex://sdk',
+            apiKey: '',
+            timeout: 120,
+            maxRetries: 0,
+            retryInterval: 0
+          };
+          state.providers.push(codex);
+          await persistModels();
+          refreshProviderSelect();
+          const providerRows = state.providers.map((p) => `
+            <div class="model-row" data-prov-id="${escapeHtml(p.id)}">
+              <div><b>${escapeHtml(p.name)}</b><div class="hint">${escapeHtml(protocolLabel(p.protocol))} · ${escapeHtml(p.baseUrl)}</div></div>
+              <div><button type="button" data-prov-test="${escapeHtml(p.id)}">${t('test')}</button><button type="button" data-prov-edit="${escapeHtml(p.id)}">${t('edit')}</button><button type="button" data-prov-del="${escapeHtml(p.id)}">${t('del')}</button></div>
+            </div>`).join('');
+          $('provider-list').innerHTML = providerRows;
+        }
+        pid = codex.id;
+        $('mm-provider').value = pid;
+        r = await api.listRemoteModels(pid);
+      }
       remoteIds = r.models || [];
       remoteCatalog = r.catalog || {};
       remoteBalance = r.balance || null;
@@ -4587,7 +4807,7 @@ function openSettings() {
       if (!exists) {
         state.models.push({
           id: uid(),
-          name: modelId,
+          name: cat.name || modelId,
           model: modelId,
           type: 'api',
           providerId,
@@ -4694,8 +4914,9 @@ function openSettings() {
       }
     }
   };
-  if (currentQuotaKey() && providerById(currentQuotaKey()) && $('mm-provider')) {
-    $('mm-provider').value = currentQuotaKey();
+  const activeProviderId = currentModel()?.providerId || currentModel()?.id;
+  if (activeProviderId && providerById(activeProviderId) && $('mm-provider')) {
+    $('mm-provider').value = activeProviderId;
   }
   paintWalletForm();
 }
@@ -5743,8 +5964,6 @@ function bind() {
     }
   };
   $('btn-new-skill').onclick = () => openSkillEditor(null);
-  $('btn-new-memory')?.addEventListener('click', () => openMemoryEditor());
-  $('btn-clear-memory')?.addEventListener('click', () => openMemoryClearDialog());
   $('btn-edit-profile')?.addEventListener('click', () => openProfileEditor());
   $('btn-new-global-pref')?.addEventListener('click', () => openGlobalPrefEditor());
   $('btn-edit-persona').onclick = () => openPersonaEditor();
@@ -5906,37 +6125,6 @@ function bind() {
       renderMessages();
     }
   });
-  $('memory-list')?.addEventListener('click', async (e) => {
-    const pinId = e.target.closest('[data-mem-pin]')?.getAttribute('data-mem-pin');
-    if (pinId) {
-      e.stopPropagation();
-      try {
-        const pinned = e.target.closest('[data-mem-pin]').getAttribute('data-pinned') !== '1';
-        state.memories = await api.pinMemory(pinId, pinned);
-        renderSidebar();
-      } catch (err) {
-        alert(err?.message || t('saveFail'));
-      }
-      return;
-    }
-    const delId = e.target.closest('[data-mem-del]')?.getAttribute('data-mem-del');
-    if (delId) {
-      e.stopPropagation();
-      if (!confirm(t('memoryDeleteConfirm'))) return;
-      try {
-        await api.deleteMemory(delId);
-        state.memories = state.workspace ? (await api.listMemory()) : [];
-        renderSidebar();
-        if ((state.memories || []).some((m) => m.id === delId)) {
-          alert(t('memoryDeleteFail'));
-        } else {
-          alert(t('memoryDeletedOk'));
-        }
-      } catch (err) {
-        alert(err?.message || t('memoryDeleteFail'));
-      }
-    }
-  });
   $('global-pref-list')?.addEventListener('click', async (e) => {
     const pinId = e.target.closest('[data-gpref-pin]')?.getAttribute('data-gpref-pin');
     if (pinId) {
@@ -6000,6 +6188,12 @@ function bind() {
     if (ctxBtn) {
       e.stopPropagation();
       openContextPreview(ctxBtn.getAttribute('data-ctx-turn'));
+      return;
+    }
+    const mapBtn = e.target.closest('[data-dialog-map]');
+    if (mapBtn) {
+      e.stopPropagation();
+      openDialogMap(mapBtn.getAttribute('data-dialog-map'));
       return;
     }
     const askCard = e.target.closest('[data-ask-card]');
@@ -6092,6 +6286,38 @@ function bind() {
         zbRetry.disabled = false;
         zbRetry.textContent = t('zbDislike');
       }
+      return;
+    }
+    const planMapBtn = e.target.closest('[data-plan-map]');
+    if (planMapBtn) {
+      e.stopPropagation();
+      const host = planMapBtn.closest('[data-msg-i]');
+      const idx = host ? Number(host.getAttribute('data-msg-i')) : NaN;
+      openPlanMap(activeSession(), Number.isInteger(idx) ? activeSession()?.messages?.[idx] : null);
+      return;
+    }
+    // 写入方案：把这条回复里的【方案】段写入方案文件，方便查看导图；已确认方案也可直接开工
+    if (e.target.closest('[data-plan-write]')) {
+      const host = e.target.closest('[data-msg-i]');
+      const idx = host ? Number(host.getAttribute('data-msg-i')) : NaN;
+      const tab = activeSession();
+      const m = Number.isInteger(idx) ? tab?.messages?.[idx] : null;
+      if (!m || !api.planWrite) return;
+      let r;
+      try {
+        r = await api.planWrite({ workspace: tab.workspace || state.workspace, tabId: String(tab.id || ''), text: String(m.text || '') });
+      } catch (err) {
+        r = { ok: false, message: err.message || String(err) };
+      }
+      m.planWritten = !!(r && r.ok);
+      m.planItems = (r && r.items) || 0;
+      const bad = (r && r.mismatch) || [];
+      m.planNote = r && r.ok
+        ? [`方案文件：${r.file}`, m.planItems ? `共 ${m.planItems} 条` : '', r.merged ? `合并进 ${r.merged} 条新条目` : '', bad.length ? `有 ${bad.length} 条现状原文对不上代码（${bad.map((b) => `第 ${b.no} 条`).join('、')}），开始时不会放行` : ''].filter(Boolean).join(' · ')
+        : String((r && r.message) || '写入方案失败');
+      if (!m.planWritten) alert(`写入方案失败：${m.planNote}`);
+      await persistSession();
+      repaintStartGo(m, idx, tab);
       return;
     }
     // 多选提交：把这条消息上勾中的项拼成一条消息发出去，发完清空勾选并重绘
@@ -6562,6 +6788,8 @@ api.onIndexProgress(paintIndexCard);
   state.commandSandbox = s.commandSandbox || { enabled: true, timeoutSec: 60 };
   state.maxAgentRounds = clampAgentRounds(s.maxAgentRounds);
   state.desktopAlive = s.desktopAlive === true;
+  state.cursorDirect = s.cursorDirect !== false;
+  syncCursorDirectBtn();
   const aliveBtn = $('btn-alive');
   if (aliveBtn) {
     aliveBtn.classList.toggle('on', state.desktopAlive);
@@ -6601,4 +6829,10 @@ api.onIndexProgress(paintIndexCard);
   syncRoundsInput(activeSession());
   initClipboardPanel();
   refreshQuotaBar();
+  setInterval(() => {
+    if (!document.hidden) refreshQuotaBar(false, { auto: true });
+  }, 60 * 1000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) refreshQuotaBar(false, { auto: true });
+  });
 })();

@@ -310,8 +310,10 @@
   // 段落：单个换行按 <br> 保留 —— 聊天里换行几乎总是有意的，
   // 按 markdown 原义合并成一行反而更难读
   function renderParagraph(lines, start, out) {
-    var body = [];
-    var i = start;
+    // 当前行先收下：isBlockStart 认作块开头、别的分支却都不接的行（如没有分隔行的「| a |」），
+    // 不先收就一行不前进，死循环把内存撑爆
+    var body = [lines[start]];
+    var i = start + 1;
     // 收段落时也要在开工选项标记处停下，否则标记会被当普通行并进这一段正文
     while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])
       && lines[i].indexOf('[开工选项]') < 0) {

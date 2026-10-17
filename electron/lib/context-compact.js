@@ -1,7 +1,7 @@
 const assembly = require('./assembly');
 
 const SOFT_LIMIT = 24000;
-const KEEP_TURNS = 6;
+const KEEP_TURNS = 3;
 const SUMMARY_MAX = 4000;
 
 function emptyWorking() {
@@ -25,25 +25,61 @@ function normalizeWorking(raw) {
       : [],
     scratch: Array.isArray(w.scratch)
       ? w.scratch.map(String).filter(Boolean).slice(0, 12)
-      : []
+      : [],
+    todos: Array.isArray(w.todos) ? w.todos.map(normalizeTodo).filter(Boolean).slice(0, TODO_MAX) : []
   };
 }
 
+const TODO_MAX = 30;
+const TODO_STATUS = new Set(['pending', 'in_progress', 'completed', 'cancelled']);
+
+function normalizeTodo(t) {
+  if (!t || typeof t !== 'object') return null;
+  const id = String(t.id || '').trim().slice(0, 60);
+  const content = String(t.content || '').trim().slice(0, 300);
+  if (!id || !content) return null;
+  return { id, content, status: TODO_STATUS.has(t.status) ? t.status : 'pending' };
+}
+
+/** merge=true 按 id 更新已有条目、追加新条目；merge=false 整份替换 */
+function mergeTodos(current, incoming, merge) {
+  const list = Array.isArray(incoming) ? incoming : [];
+  if (!merge) return list.map(normalizeTodo).filter(Boolean).slice(0, TODO_MAX);
+  const out = current.map((t) => ({ ...t }));
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') continue;
+    const id = String(raw.id || '').trim();
+    const hit = out.find((t) => t.id === id);
+    if (hit) {
+      if (typeof raw.content === 'string' && raw.content.trim()) hit.content = raw.content.trim().slice(0, 300);
+      if (TODO_STATUS.has(raw.status)) hit.status = raw.status;
+    } else {
+      const t = normalizeTodo(raw);
+      if (t) out.push(t);
+    }
+  }
+  return out.slice(0, TODO_MAX);
+}
+
+const TODO_TAG = { pending: '待办', in_progress: '进行中', completed: '完成', cancelled: '取消' };
+
 function formatWorking(w, { english = false } = {}) {
   const m = normalizeWorking(w);
-  if (!m.goal && !m.openQuestions.length && !m.focusPaths.length && !m.scratch.length) return '';
+  if (!m.goal && !m.openQuestions.length && !m.focusPaths.length && !m.scratch.length && !m.todos.length) return '';
   const lines = [];
   if (english) {
     if (m.goal) lines.push(`Goal: ${m.goal}`);
     if (m.openQuestions.length) lines.push(`Open: ${m.openQuestions.join(' | ')}`);
     if (m.focusPaths.length) lines.push(`Focus files: ${m.focusPaths.join(', ')}`);
     if (m.scratch.length) lines.push(`Notes: ${m.scratch.join(' | ')}`);
+    if (m.todos.length) lines.push(`Todos:\n${m.todos.map((t) => `- [${t.status}] ${t.id}: ${t.content}`).join('\n')}`);
     return `## Working memory (this chat)\n${lines.join('\n')}`;
   }
   if (m.goal) lines.push(`目标：${m.goal}`);
   if (m.openQuestions.length) lines.push(`未决：${m.openQuestions.join(' ｜ ')}`);
   if (m.focusPaths.length) lines.push(`焦点文件：${m.focusPaths.join(', ')}`);
   if (m.scratch.length) lines.push(`要点：${m.scratch.join(' ｜ ')}`);
+  if (m.todos.length) lines.push(`任务清单：\n${m.todos.map((t) => `- [${TODO_TAG[t.status]}] ${t.id}：${t.content}`).join('\n')}`);
   return `## 工作记忆（本会话）\n${lines.join('\n')}`;
 }
 
@@ -66,6 +102,7 @@ function patchWorking(current, patch) {
   if (typeof patch.addQuestion === 'string' && patch.addQuestion.trim()) {
     w.openQuestions = [...new Set([...w.openQuestions, patch.addQuestion.trim()])].slice(0, 12);
   }
+  if (Array.isArray(patch.todos)) w.todos = mergeTodos(w.todos, patch.todos, !!patch.todoMerge);
   return w;
 }
 
@@ -107,7 +144,56 @@ const KEEP_USER_CHARS = 4000;
 const TOOL_RESULT_CAP = 8000;
 const OLD_TOOL_CHARS = 400;
 
-// 本地裁历史：只留最近几轮全文，更早的用户原话收成摘要。不调模型，避免再等一轮。
+const INDEX_MAX_CHARS = 6000;
+function oneLine(t) { return String(t || '').replace(/\s+/g, ' ').trim(); }
+
+// 一轮的索引行：有总结出来的索引就用，没有就拿原话和回复开头拼一条简易索引
+function roundIndexLine(r) {
+  const idx = r.index && (r.index.title || r.index.summary) ? r.index : null;
+  if (idx) {
+    const title = oneLine(idx.title);
+    const summary = oneLine(idx.summary);
+    return `#R${r.round} ${title}${summary ? ' — ' + summary : ''}`.slice(0, 400);
+  }
+  const u = oneLine(r.user).slice(0, 80);
+  const a = oneLine(r.assistant).slice(0, 120);
+  return `#R${r.round} ${u}${a ? ' — ' + a : ''}`;
+}
+
+// 按轮次分组：消息带 round 就用，没带就按用户消息计数
+function roundsOf(messages) {
+  const map = new Map();
+  let n = 0;
+  for (const m of messages || []) {
+    if (m.role === 'user') n += 1;
+    const round = Number(m.round) || n || 1;
+    if (!map.has(round)) map.set(round, { round, user: '', assistant: '', index: null });
+    const r = map.get(round);
+    const text = String(m.content || m.text || '');
+    if (m.role === 'user') r.user = r.user ? `${r.user}\n${text}` : text;
+    else r.assistant = r.assistant ? `${r.assistant}\n${text}` : text;
+    if (m.index) r.index = m.index;
+  }
+  return Array.from(map.values());
+}
+
+// 更早轮次的索引文字；太长时只留最近的
+function indexTextOf(older) {
+  const lines = roundsOf(older).map(roundIndexLine);
+  const out = [];
+  let size = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    size += lines[i].length + 1;
+    if (size > INDEX_MAX_CHARS) {
+      out.unshift(`（更早的 ${i + 1} 轮没列出）`);
+      break;
+    }
+    out.unshift(lines[i]);
+  }
+  return out.join('\n');
+}
+
+// 本地裁历史：只留最近几轮全文，更早的轮次换成对话索引。不调模型，避免再等一轮。
 function trimHistoryLocal(history, contextSummary) {
   const { older, keep } = splitHistory(history);
   const clipped = (keep || []).map((m) => {
@@ -117,19 +203,41 @@ function trimHistoryLocal(history, contextSummary) {
     if (t.includes('【文件】') || t.includes('【全文】')) return { role: m.role, content: t };
     return { role: m.role, content: t.slice(0, cap) + '\n…（本条已截断）' };
   });
+  const prev = String(contextSummary || '');
   if (!older.length) {
-    return { history: clipped, contextSummary: String(contextSummary || ''), didTrim: clipped.length !== (history || []).length };
+    return { history: clipped, contextSummary: prev, indexText: '', didTrim: clipped.length !== (history || []).length };
   }
-  const bits = [];
-  for (const m of older) {
-    if (m.role !== 'user') continue;
-    const t = String(m.content || m.text || '').replace(/\s+/g, ' ').trim();
-    if (t) bits.push('- ' + t.slice(0, 180));
+  return { history: clipped, contextSummary: prev, indexText: indexTextOf(older), didTrim: true };
+}
+
+// 一轮只留标题；总结模型还没出标题时拿用户原话开头顶上
+function roundTitleLine(r) {
+  const title = oneLine(r.index && r.index.title);
+  return `#R${r.round} ${(title || oneLine(r.user).slice(0, 60) || '（空）')}`.slice(0, 120);
+}
+
+// 历史全部换成标题索引，不发任何全文；太长时只留最近的
+function titleIndexOf(history) {
+  const lines = roundsOf(history).map(roundTitleLine);
+  const out = [];
+  let size = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    size += lines[i].length + 1;
+    if (size > INDEX_MAX_CHARS) {
+      out.unshift(`（更早的 ${i + 1} 轮没列出）`);
+      break;
+    }
+    out.unshift(lines[i]);
   }
-  const digest = bits.slice(-24).join('\n');
-  const prev = String(contextSummary || '').trim();
-  const next = [prev, digest ? ('更早用户原话：\n' + digest) : ''].filter(Boolean).join('\n').slice(0, SUMMARY_MAX);
-  return { history: clipped, contextSummary: next, didTrim: true };
+  return out.join('\n');
+}
+
+function formatIndexForPrompt(indexText, { english = false } = {}) {
+  const s = String(indexText || '').trim();
+  if (!s) return '';
+  return english
+    ? `## Conversation index\nPrevious rounds are NOT included in the messages; only their titles are listed here, one per line: #id title. When you need what was said in a round (including the latest one), call dialog_lookup with the id first; never guess from the title. Rounds the user marked as not applicable are removed; do not bring them up.\n${s}`
+    : `## 对话索引\n之前的对话不在消息里，这里只列每轮标题，每行一轮：#编号 标题。需要某一轮说了什么（包括最近一轮）就先用 dialog_lookup 传编号查原文，禁止凭标题猜。用户标了不适用的轮次已经去掉，不要提起。\n${s}`;
 }
 
 function replaceFullBlock(text, filePath) {
@@ -298,7 +406,6 @@ const PARALLEL_TOOLS = new Set([
   'semantic_search',
   'map_lookup',
   'goto_definition',
-  'memory_list'
 ]);
 
 function isParallelTool(name) {
@@ -537,6 +644,9 @@ module.exports = {
   splitToolWaves,
   compactHistory,
   formatSummaryForPrompt,
+  formatIndexForPrompt,
+  titleIndexOf,
+  roundsOf,
   isContextOverflowError,
   pickSummaryCfg
 };

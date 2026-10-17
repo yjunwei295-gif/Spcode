@@ -101,7 +101,7 @@ function renderMarkdownRaw(src) {
 
     // 围栏代码块。流式输出时收尾的 ``` 往往还没到，所以没闭合也照样当代码块画，
     // 不然每次回答的中途都会闪一屏原始 markdown
-    const fence = /^\s*```+\s*([\w+#.-]*)\s*$/.exec(line);
+    const fence = /^\s*```+\s*([\w+#.-]*)[^`]*$/.exec(line);
     if (fence) {
       const body = [];
       i++;
@@ -156,7 +156,9 @@ function renderMarkdownRaw(src) {
 
     // 段落。单个换行按 <br> 保留——聊天里换行几乎总是有意的，
     // 按 markdown 原义合并成一行反而更难读
-    const body = [];
+    // 当前行先收下：像「| a |」后面没有分隔行、「```cs 标题」这类行，isBlockStart 认它是块开头，
+    // 上面的分支却都不接，不先收就一行不前进，死循环把内存撑爆
+    const body = [lines[i++]];
     // 收段落时也要在开工选项标记处停下，否则标记会被当普通行并进这一段正文
     while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])
       && lines[i].indexOf('[开工选项]') < 0) body.push(lines[i++]);

@@ -7,12 +7,17 @@ const { httpFetch } = require('./http-fetch');
 const toolXml = require('./tool-xml');
 const wallet = require('./wallet');
 
-const PROTOCOLS = ['openai', 'anthropic', 'gemini'];
+const cursorModel = require('./cursor-model');
+const codexModel = require('./codex-model');
+
+const PROTOCOLS = ['openai', 'anthropic', 'gemini', 'cursor', 'codex'];
 
 function normalizeProtocol(raw) {
   const p = String(raw || 'openai').toLowerCase().trim();
   if (p === 'claude' || p === 'anthropic') return 'anthropic';
   if (p === 'google' || p === 'gemini') return 'gemini';
+  if (p === 'cursor') return 'cursor';
+  if (p === 'codex') return 'codex';
   return 'openai';
 }
 
@@ -204,6 +209,7 @@ async function fetchJsonQuiet(url, headers, ms) {
 /** 余额问不到就返回 available:false，不抛错，避免挡住模型列表 */
 async function fetchAccountBalance(modelCfg) {
   const protocol = normalizeProtocol(modelCfg?.protocol);
+  if (protocol === 'codex') return codexModel.fetchRateLimitBalance(modelCfg);
   const host = String(modelCfg?.baseUrl || '');
   if (protocol === 'anthropic' || protocol === 'gemini') {
     return { available: false };
@@ -484,6 +490,8 @@ function authHeaders(protocol, apiKey) {
 
 async function listModels(modelCfg) {
   const protocol = normalizeProtocol(modelCfg?.protocol);
+  if (protocol === 'cursor') return cursorModel.listModels(modelCfg);
+  if (protocol === 'codex') return codexModel.listModels(modelCfg);
   const baseUrl = modelCfg?.baseUrl;
   const apiKey = modelCfg?.apiKey;
   if (!baseUrl) throw new Error('请填写接口地址');
@@ -542,6 +550,7 @@ async function listModels(modelCfg) {
 
 async function testConnection(modelCfg) {
   if (modelCfg?.type === 'local') throw new Error('本地模型请用本地探测');
+  if (normalizeProtocol(modelCfg?.protocol) === 'codex') return codexModel.testConnection(modelCfg);
   const listed = await listModels(modelCfg);
   if (modelCfg?.model) {
     const hit = listed.models.find((id) => id === modelCfg.model || id.endsWith(`/${modelCfg.model}`));
@@ -977,7 +986,14 @@ async function complete({
 
   try {
     let msg;
-    if (protocol === 'anthropic') {
+    if (protocol === 'cursor') {
+      msg = await cursorModel.complete({
+        modelCfg, messages, tools,
+        onDelta: wrappedDelta, onReason: wrappedReason, signal: ctl.signal
+      });
+    } else if (protocol === 'codex') {
+      msg = await codexModel.complete({ modelCfg, messages, onDelta: wrappedDelta, onReason: wrappedReason, signal: ctl.signal });
+    } else if (protocol === 'anthropic') {
       msg = await completeAnthropic({
         modelCfg, messages, stream, tools,
         onDelta: wrappedDelta, onReason: wrappedReason, signal, ctl: wrapCtl

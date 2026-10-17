@@ -125,6 +125,8 @@ using System.Windows.Automation;
 public static class Uia {
   static List<AutomationElement> cache = new List<AutomationElement>();
   static int seq = 0;
+  // 超时的扫描线程停不下来；它还活着时不再开新线程，避免越堆越多拖慢目标程序
+  static Thread running = null;
   static readonly ControlType[] Wanted = new ControlType[] {
     ControlType.Button, ControlType.SplitButton, ControlType.MenuItem, ControlType.Edit, ControlType.Document,
     ControlType.CheckBox, ControlType.RadioButton, ControlType.ComboBox, ControlType.ListItem, ControlType.TabItem,
@@ -133,6 +135,7 @@ public static class Uia {
   static bool B(object o) { return o is bool && (bool)o; }
 
   public static object[] Scan(IntPtr hwnd, int max, int timeoutMs) {
+    if (running != null && running.IsAlive) return new object[] { -1, "busy", null };
     List<object[]> rows = null;
     List<AutomationElement> els = null;
     string err = null;
@@ -187,8 +190,11 @@ public static class Uia {
       } catch (Exception e) { err = e.Message; }
     });
     t.IsBackground = true;
+    t.Priority = ThreadPriority.BelowNormal;
+    running = t;
     t.Start();
     if (!t.Join(timeoutMs)) return new object[] { -1, "timeout", null };
+    running = null;
     if (err != null) return new object[] { -1, err, null };
     cache = els;
     seq++;

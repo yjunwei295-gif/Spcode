@@ -8,7 +8,8 @@ const MAX_TEXT_CHARS = 5000;
 const MAX_CAPTURE_EDGE = 1920;
 const MIN_CONFIDENCE = 45;
 const REUSE_MS = 20000;
-const OCR_IDLE_MS = 5 * 60 * 1000;
+// 闲置 1 分钟就关 OCR 引擎，及时还内存
+const OCR_IDLE_MS = 60 * 1000;
 const OCR_RETRY_MS = 60 * 1000;
 const HASH_W = 128;
 const HASH_H = 72;
@@ -39,9 +40,11 @@ let ocrIdleTimer = null;
 let ocrBrokenAt = 0;
 let ocrBrokenMsg = '';
 
+// 线程数按电脑档位走（低配 1 / 中配 2 / 高配 3），不再固定吃到 4 个
 function workerCount() {
   const cpus = require('os').cpus().length || 2;
-  return Math.max(1, Math.min(4, Math.floor(cpus / 3)));
+  const tier = require('./agi-throttle').profile().ocrWorkers;
+  return Math.max(1, Math.min(tier, Math.floor(cpus / 3) || 1));
 }
 
 async function startOcr() {
@@ -129,10 +132,11 @@ function dedupeOverlap(pieces) {
   return kept;
 }
 
-// 返回原图像素坐标下的行片段 {text, x0, y0, x1, y1, conf}
-function recognize(image) {
+// 返回原图像素坐标下的行片段 {text, x0, y0, x1, y1, conf}；maxWorkers 限制本次并行条数（电脑忙时传 1）
+function recognize(image, maxWorkers) {
   const job = ocrQueue.then(async () => {
-    const workers = await getOcr();
+    const all = await getOcr();
+    const workers = maxWorkers > 0 ? all.slice(0, maxWorkers) : all;
     armIdleStop();
     const { width, height } = image.getSize();
     const n = workers.length;
@@ -189,7 +193,8 @@ async function captureDisplay(display, maxEdge) {
   if (!display) throw new Error('没有可用的屏幕。');
   const dipWidth = Math.max(1, Math.round(display.size.width));
   const dipHeight = Math.max(1, Math.round(display.size.height));
-  const scale = Math.min(1, (maxEdge || MAX_CAPTURE_EDGE) / Math.max(dipWidth, dipHeight));
+  const edge = maxEdge || Math.min(MAX_CAPTURE_EDGE, require('./agi-throttle').profile().captureEdge);
+  const scale = Math.min(1, edge / Math.max(dipWidth, dipHeight));
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
     thumbnailSize: { width: Math.round(dipWidth * scale), height: Math.round(dipHeight * scale) }
@@ -349,7 +354,10 @@ function resetControlIds() {
 
 async function observeOnce(force, threshold) {
   const desktopHand = require('./desktop-hand');
+  const throttle = require('./agi-throttle');
   if (!desktopHand.isAlive()) throw new Error('「AGI」没开。');
+  // 先看电脑负载：忙就等，等不到就降级
+  const room = await throttle.beforeObserve();
   const display = pickDisplay();
   const shot = await captureDisplay(display);
   const hash = frameHash(shot.image);
@@ -357,6 +365,7 @@ async function observeOnce(force, threshold) {
       Date.now() - last.at < REUSE_MS && hashDiff(hash, last.hash) <= threshold && !last.ocrNote) {
     last.at = Date.now();
     desktopHand.noteLook(last);
+    throttle.markObserved();
     return last;
   }
   const scaleX = shot.dipWidth / shot.width;
@@ -364,7 +373,7 @@ async function observeOnce(force, threshold) {
   let lines = [];
   let ocrNote = '';
   // OCR 在 tesseract 线程里跑，控件和窗口列表在 PowerShell 助手里跑，两边并行
-  const ocrJob = recognize(shot.image).then((pieces) => {
+  const ocrJob = recognize(shot.image, room.degraded ? 1 : 0).then((pieces) => {
     lines = normalizeLines(pieces, scaleX, scaleY);
   }).catch((err) => {
     ocrNote = err && err.message ? err.message : String(err);
@@ -373,9 +382,16 @@ async function observeOnce(force, threshold) {
   let scan = null;
   const helperJob = (async () => {
     try { windows = await desktopHand.listWindows(); } catch { windows = null; }
+    if (room.degraded) {
+      scan = { ok: false, message: '电脑繁忙，本次跳过控件扫描', items: [] };
+      return;
+    }
     try { scan = await desktopHand.scanControls(); } catch { scan = null; }
   })();
   await Promise.all([ocrJob, helperJob]);
+  // 内存紧张时识别完立刻关掉 OCR 引擎还内存，下次再按需拉起
+  if (room.memLow) stopOcr();
+  throttle.markObserved();
   const controls = buildControls(scan, shot);
   lines = dropCoveredLines(lines, controls);
   const frame = {
@@ -523,6 +539,7 @@ function reset() {
   last = null;
   observing = null;
   stopOcr();
+  require('./agi-throttle').reset();
 }
 
 module.exports = {

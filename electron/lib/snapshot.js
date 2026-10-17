@@ -895,8 +895,29 @@ function rejectFileHunk(workspace, snapshotId, relPath, hunkIndex) {
   return listFileHunks(workspace, snapshotId, change.path);
 }
 
+// 本轮内单独撤回一个文件：还原成改前备份（新建的则删掉），并从快照条目里去掉
+function revertChange(workspace, snapshot, relPath) {
+  if (!snapshot?.manifest) return false;
+  const norm = relParts(relPath).join('/');
+  const idx = snapshot.manifest.changes.findIndex((c) => c.path === norm);
+  if (idx < 0) return false;
+  const change = snapshot.manifest.changes[idx];
+  const abs = path.resolve(workspace, ...relParts(norm));
+  if (!isInside(workspace, abs)) throw new Error('路径超出工作目录');
+  const backup = nestedUnder(path.join(snapshot.dir, 'files'), norm);
+  if (change.existed) {
+    if (!fs.existsSync(backup)) throw new Error(`没有改前备份：${norm}`);
+    copyFileSafe(backup, abs);
+  } else if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+    fs.unlinkSync(abs);
+  }
+  snapshot.manifest.changes.splice(idx, 1);
+  fs.writeFileSync(path.join(snapshot.dir, 'manifest.json'), JSON.stringify(snapshot.manifest, null, 2), 'utf8');
+  return true;
+}
+
 module.exports = {
-  create, recordChange, captureAfter, list, restore, undo, redo,
+  create, recordChange, revertChange, captureAfter, list, restore, undo, redo,
   scanFingerprints, diffFingerprints, preBackupWorkspace, recordCommandDiff,
   listFileHunks, rejectFileHunk, shouldSkipSnapshotFile,
   migrateLegacySnapshots,

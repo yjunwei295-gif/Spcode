@@ -41,7 +41,7 @@
     return Object.assign({}, map, { nodes, edges });
   }
 
-  // 构建筛选侧边面板：目录树统计 + 文件勾选 + 仅显示未引用 + 全选/清空
+  // 构建筛选侧边面板：目录树统计 + 文件勾选 + 全部/已引用/未引用筛选 + 全选/清空（只作用于当前筛选）
   // 白名单语义：勾选 = 该模块显示在地图；未勾选 = 不显示
   function buildFilterPanel(map, include, onApply) {
     const panel = el('div', { className: 'map-filter' });
@@ -58,14 +58,32 @@
     const inDeg = {};
     for (const e of (map.edges || [])) inDeg[e.to] = (inDeg[e.to] || 0) + 1;
 
-    // 按目录聚合：目录 -> 节点数组
-    const dirMap = new Map();
+    // 按路径建目录树：每个目录 { name, path, dirs: Map, files: [] }
+    const tree = { name: '', path: '', dirs: new Map(), files: [] };
     for (const n of (map.nodes || [])) {
       const parts = n.path.split('/');
-      const dir = parts.length > 1 ? parts.slice(0, -1).join('/') : '(根目录)';
-      if (!dirMap.has(dir)) dirMap.set(dir, []);
-      dirMap.get(dir).push(n);
+      let d = tree;
+      for (const seg of parts.slice(0, -1)) {
+        if (!d.dirs.has(seg)) d.dirs.set(seg, { name: seg, path: d.path ? d.path + '/' + seg : seg, dirs: new Map(), files: [] });
+        d = d.dirs.get(seg);
+      }
+      d.files.push(n);
     }
+    const byName = (a, b) => a.name.localeCompare(b.name);
+    const fileName = (n) => n.path.split('/').pop() || n.path;
+    // 只有一个子目录、自己没有文件的连续路径合成一行
+    function compact(d) {
+      let label = d.name;
+      let cur = d;
+      while (!cur.files.length && cur.dirs.size === 1) {
+        cur = cur.dirs.values().next().value;
+        label += '/' + cur.name;
+      }
+      return { label, cur };
+    }
+    // 展开状态在面板打开期间保留；默认展开第一层目录
+    const expanded = new Set();
+    for (const d of tree.dirs.values()) expanded.add(compact(d).cur.path);
 
     const checked = new Set(include.includes || []);
     const list = el('div');
@@ -74,12 +92,27 @@
     const bar = el('div');
     bar.style.cssText = 'display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);flex-wrap:wrap;align-items:center;';
 
-    const onlyUnref = el('label');
-    onlyUnref.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;';
-    const onlyChk = el('input', { type: 'checkbox' });
-    onlyUnref.appendChild(onlyChk);
-    onlyUnref.appendChild(document.createTextNode('仅显示未引用'));
-    bar.appendChild(onlyUnref);
+    // 筛选：全部 / 已引用（有别的文件指向它）/ 未引用；全选和清空只作用于当前筛选看得到的文件
+    let mode = 'all';
+    const modes = [['all', '全部'], ['ref', '已引用'], ['unref', '未引用']];
+    const modeBox = el('div');
+    modeBox.style.cssText = 'display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;';
+    const modeBtns = modes.map(([id, label]) => {
+      const b = el('button', { textContent: label });
+      b.onclick = () => { mode = id; paintModes(); renderList(); };
+      modeBox.appendChild(b);
+      return [id, b];
+    });
+    function paintModes() {
+      for (const [id, b] of modeBtns) {
+        const on = id === mode;
+        b.style.cssText = 'border:0;padding:3px 8px;cursor:pointer;font-size:12px;'
+          + (on ? 'background:var(--accent);color:var(--accent-fg);' : 'background:var(--hover);color:inherit;');
+      }
+    }
+    paintModes();
+    bar.appendChild(modeBox);
+    const visible = (n) => mode === 'all' || (mode === 'ref' ? !!inDeg[n.id] : !inDeg[n.id]);
 
     const selAll = el('button', { textContent: '全选' });
     selAll.style.cssText = 'border:1px solid var(--border);background:var(--hover);border-radius:6px;padding:3px 8px;cursor:pointer;font-size:12px;';
@@ -97,54 +130,75 @@
     panel.appendChild(list);
 
     function renderList() {
+      const keepScroll = list.scrollTop;
       list.innerHTML = '';
-      const only = onlyChk.checked;
-      for (const [dir, items] of dirMap) {
-        const visItems = only ? items.filter((n) => !inDeg[n.id]) : items;
-        if (!visItems.length) continue;
-        const grp = el('div');
-        grp.style.cssText = 'margin-bottom:6px;';
-        const head = el('div');
-        head.style.cssText = 'display:flex;align-items:center;gap:6px;font-weight:600;margin:4px 0;';
-        const grpChk = el('input', { type: 'checkbox' });
-        grpChk.checked = visItems.every((n) => checked.has(n.id));
-        grpChk.onchange = () => {
-          for (const n of visItems) { if (grpChk.checked) checked.add(n.id); else checked.delete(n.id); }
-          renderList();
-        };
-        head.appendChild(grpChk);
-        head.appendChild(document.createTextNode(dir + ' (' + visItems.length + ')'));
-        grp.appendChild(head);
-        for (const n of visItems) {
-          const row = el('label');
-          row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:2px 0 2px 18px;cursor:pointer;';
-          const chk = el('input', { type: 'checkbox' });
-          chk.checked = checked.has(n.id);
-          chk.onchange = () => { if (chk.checked) checked.add(n.id); else checked.delete(n.id); };
-          row.appendChild(chk);
-          const name = (n.path.split('/').pop() || n.path);
-          row.appendChild(document.createTextNode(name));
-          if (!inDeg[n.id]) {
-            const tag = el('span');
-            tag.textContent = '未引用';
-            tag.style.cssText = 'color:var(--muted);font-size:10px;margin-left:4px;';
-            row.appendChild(tag);
-          }
-          grp.appendChild(row);
-        }
-        list.appendChild(grp);
+      // 每次重画重新算：目录下符合当前筛选的全部文件
+      const visCache = new Map();
+      function visUnder(d) {
+        if (visCache.has(d)) return visCache.get(d);
+        const out = d.files.filter(visible);
+        for (const c of d.dirs.values()) out.push(...visUnder(c));
+        visCache.set(d, out);
+        return out;
       }
+      function fileRow(n, depth) {
+        const row = el('label');
+        row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:2px 0;cursor:pointer;padding-left:' + (depth * 14 + 18) + 'px;';
+        const chk = el('input', { type: 'checkbox' });
+        chk.checked = checked.has(n.id);
+        chk.onchange = () => { if (chk.checked) checked.add(n.id); else checked.delete(n.id); renderList(); };
+        row.appendChild(chk);
+        row.appendChild(document.createTextNode(fileName(n)));
+        const tag = el('span');
+        tag.textContent = inDeg[n.id] ? '已引用' : '未引用';
+        tag.style.cssText = 'color:var(--muted);font-size:10px;margin-left:4px;';
+        row.appendChild(tag);
+        list.appendChild(row);
+      }
+      function dirRows(d, depth) {
+        for (const child of Array.from(d.dirs.values()).sort(byName)) {
+          const { label, cur } = compact(child);
+          const vis = visUnder(cur);
+          if (!vis.length) continue;
+          const open = expanded.has(cur.path);
+          const row = el('div');
+          row.style.cssText = 'display:flex;align-items:center;gap:4px;padding:2px 0;font-weight:600;padding-left:' + (depth * 14) + 'px;';
+          const arrow = el('span', { textContent: open ? '▾' : '▸' });
+          arrow.style.cssText = 'width:12px;cursor:pointer;color:var(--muted);user-select:none;';
+          const toggle = () => { if (open) expanded.delete(cur.path); else expanded.add(cur.path); renderList(); };
+          arrow.onclick = toggle;
+          const chk = el('input', { type: 'checkbox' });
+          const all = vis.every((n) => checked.has(n.id));
+          chk.checked = all;
+          chk.indeterminate = !all && vis.some((n) => checked.has(n.id));
+          chk.onchange = () => {
+            for (const n of vis) { if (chk.checked) checked.add(n.id); else checked.delete(n.id); }
+            renderList();
+          };
+          const name = el('span', { textContent: label + ' (' + vis.length + ')' });
+          name.title = cur.path;
+          name.style.cssText = 'cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+          name.onclick = toggle;
+          row.appendChild(arrow);
+          row.appendChild(chk);
+          row.appendChild(name);
+          list.appendChild(row);
+          if (open) dirRows(cur, depth + 1);
+        }
+        for (const n of d.files.filter(visible).sort((a, b) => fileName(a).localeCompare(fileName(b)))) fileRow(n, depth);
+      }
+      dirRows(tree, 0);
+      list.scrollTop = keepScroll;
     }
 
-    onlyChk.onchange = renderList;
     selAll.onclick = () => {
-      for (const n of (map.nodes || [])) {
-        if (onlyChk.checked && inDeg[n.id]) continue;
-        checked.add(n.id);
-      }
+      for (const n of (map.nodes || [])) if (visible(n)) checked.add(n.id);
       renderList();
     };
-    clearAll.onclick = () => { checked.clear(); renderList(); };
+    clearAll.onclick = () => {
+      for (const n of (map.nodes || [])) if (visible(n)) checked.delete(n.id);
+      renderList();
+    };
     applyBtn.onclick = () => { onApply(Array.from(checked)); };
 
     renderList();

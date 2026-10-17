@@ -32,7 +32,7 @@ D:\SpCode\
 |----|------|----------|
 | 主进程 | 业务逻辑、模型、工具沙盒、记忆、配置 | `electron/` |
 | 渲染进程 | 纯 UI，不发业务请求，只走 IPC | `renderer/` |
-| 共享状态 | 配置 / 项目记忆→`userData`；技能 / 规则→`APP_ROOT`（`D:\SpCode` 或打包后 `userData/app-root`） | 二者分离 |
+| 共享状态 | 配置 / 全局用户偏好→`userData`；技能 / 规则→`APP_ROOT`（`D:\SpCode` 或打包后 `userData/app-root`） | 二者分离 |
 
 ## 3. 模块索引（按职责）
 
@@ -55,8 +55,9 @@ D:\SpCode\
 - `tool-xml.js`：非标准工具调用格式归一
 - `generate.js`：生图 / 视频 / 3D（仅 API）
 
-**记忆**
-- `memory.js` / `memory-global.js` / `memory-retrieve.js` / `context-compact.js`
+**上下文**
+- `memory-global.js` / `memory-retrieve.js`：跨项目用户画像与偏好
+- `context-compact.js`：会话工作记忆与历史压缩
 
 **技能 / 规则 / 语言**
 - `skills.js`：技能 / 规则 / 人设读写（同名上层覆盖下层）
@@ -76,7 +77,7 @@ D:\SpCode\
 |------|------|----------|
 | electron / electron-builder | 框架 / 打包 | 全局 |
 | node-llama-cpp | 本地 GGUF 推理 | local-llm*.js |
-| @xenova/transformers | 记忆向量召回 | memory-retrieve.js |
+| @xenova/transformers | 全局偏好向量召回 | memory-retrieve.js |
 | mammoth / word-extractor / pdf-parse / xlsx / jszip | 文档解析 | media*.js |
 
 ## 5. 进程通信边界（preload 暴露的 `window.simple`）
@@ -84,7 +85,7 @@ D:\SpCode\
 渲染进程经 IPC 调用的能力（从 `app.js` 调用反推）：
 - 对话：`chatAbort`
 - 工作区：`setWorkspace` / `openProject` / `showInFolder` / `filePreview` / `fileTree`
-- 配置 CRUD：`saveModels` / `listSkills` / `listRules` / `listSnapshots` / `listMilestones` / `listMemory` / `getGlobalMemory` / `addMemory` / `addGlobalPref` / `saveGlobalProfile`
+- 配置 CRUD：`saveModels` / `listSkills` / `listRules` / `listSnapshots` / `listMilestones` / `getGlobalMemory` / `addGlobalPref` / `saveGlobalProfile`
 - 会话：`loadSessions` / `saveSession` / `loadSession`
 - 杂项：`fetchAccountBalance` / `savePasteFile` / `reportError`
 - 兼容旧名：`window.sinpo`（SinpoCode→SimpleCode 迁移痕迹）

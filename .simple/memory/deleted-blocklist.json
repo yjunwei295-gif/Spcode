@@ -223,6 +223,675 @@
       ],
       "deletedAt": "2026-10-08T08:40:41.608Z",
       "id": "mem-muza6wf4-xqavhx"
+    },
+    {
+      "summary": "大脑重派后同样要存入 semantic 标记，保证重派后的语义状态一致",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.464Z",
+      "id": "mem-mvb3ga21-29tnxg"
+    },
+    {
+      "summary": "存在说明型条目时即使全部验收通过也不能跳过总结，确保说明内容被确认",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.465Z",
+      "id": "mem-mvb3ga21-uke88v"
+    },
+    {
+      "summary": "程序验收通过时必须把 semantic 标记存进条目，保证验收状态可追溯",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.465Z",
+      "id": "mem-mvb3ga21-4eiv3s"
+    },
+    {
+      "summary": "说明型条目必须标记为需总结核对，避免被自动验收跳过人工审核",
+      "paths": [
+        "electron/lib/plan-tree.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.465Z",
+      "id": "mem-mvb3ga21-oofhau"
+    },
+    {
+      "summary": "方案执行汇报和总结验收只统计/处理通过与退回，不保留“待语义验收”统计或转通过分支。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.465Z",
+      "id": "mem-mvb02nwt-hso21i"
+    },
+    {
+      "summary": "说明类条目验收时程序只核对文件有改动后直接通过，不进入语义验收状态。",
+      "paths": [
+        "electron/lib/plan-tree.js",
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.466Z",
+      "id": "mem-mvb02nwt-66602c"
+    },
+    {
+      "summary": "方案锁定不影响删除条目，删除按钮始终可用且前后端不拦截锁定删除。",
+      "paths": [
+        "electron/lib/agent.js",
+        "renderer/plan-map.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.466Z",
+      "id": "mem-mvb02nwt-mca5ma"
+    },
+    {
+      "summary": "方案状态机固定为待核对/可开工/不一致/进行中/通过/退回，不能重新引入“待语义验收”状态。",
+      "paths": [
+        "electron/lib/plan-tree.js",
+        "renderer/plan-map.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.466Z",
+      "id": "mem-mvb02nws-ccnxm2"
+    },
+    {
+      "summary": "新增 IPC 通道时必须在 electron/preload.js 暴露对应 API，前端统一通过 window.simple 或 window.sinpo 调用。",
+      "paths": [
+        "electron/preload.js",
+        "renderer/plan-map.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.466Z",
+      "id": "mem-mvap1cra-bd4mnk"
+    },
+    {
+      "summary": "删除计划条目时按条目编号 no 过滤而非节点 id；plan-tree 条目节点需带 no 字段，前端删除也传 no。",
+      "paths": [
+        "electron/lib/plan-tree.js",
+        "electron/lib/agent.js",
+        "renderer/plan-map.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.466Z",
+      "id": "mem-mvap1cra-1lu462"
+    },
+    {
+      "summary": "readPlanTree 返回 map 时需附带 locked = !!readPlanLock(file)，前端据此置灰删除按钮。",
+      "paths": [
+        "electron/lib/agent.js",
+        "renderer/plan-map.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.467Z",
+      "id": "mem-mvap1cra-nbo15x"
+    },
+    {
+      "summary": "新增 electron/lib/agent.js 中供 IPC 调用的方法后，必须同步加入文件末尾 module.exports 导出表，否则 main 中 agent.xxx 为 undefined。",
+      "paths": [
+        "electron/lib/agent.js",
+        "electron/main.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.467Z",
+      "id": "mem-mvap1cra-gynl39"
+    },
+    {
+      "summary": "httpFetch 必须尊重调用方 init.signal 的取消信号，并清理直连探测定时器和监听器，且主动取消时不得触发代理回退。",
+      "paths": [
+        "electron/lib/http-fetch.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.467Z",
+      "id": "mem-mvan58j9-flcpzg"
+    },
+    {
+      "summary": "直连探测超时固定为 10000ms（DIRECT_PROBE_TIMEOUT_MS），避免直连请求无限阻塞等待。",
+      "paths": [
+        "electron/lib/http-fetch.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.467Z",
+      "id": "mem-mvan58j9-t6lf58"
+    },
+    {
+      "summary": "直连会话使用独立 partition 'spcode-direct' 懒加载并设置代理模式为 direct，避免污染默认代理会话。",
+      "paths": [
+        "electron/lib/http-fetch.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.468Z",
+      "id": "mem-mvan58j9-kqkbjl"
+    },
+    {
+      "summary": "electron/lib/http-fetch.js 的网络请求必须采用直连优先、失败回退代理的策略，以兼顾直连可用性和代理穿透场景。",
+      "paths": [
+        "electron/lib/http-fetch.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.468Z",
+      "id": "mem-mvan58j9-0qx8ak"
+    },
+    {
+      "summary": "「全解放」开关通过 renderer 的 unlimitedRounds 下发到 agent 侧，并沿 agentLoop/runTurn 传入 buildMessages，最终影响 thinkBudget 与提示词；改相关功能时必须保持这条链路一致。",
+      "paths": [
+        "electron/lib/agent.js",
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.468Z",
+      "id": "mem-mvaio0ck-hlxow7"
+    },
+    {
+      "summary": "「全解放」与 AGI 模式必须同样视为无思考轮次上限，thinkBudget 应为 null，不能只按 AGI 判断，否则 AI 仍会自称有轮次限制。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.468Z",
+      "id": "mem-mvaio0ck-82fhaj"
+    },
+    {
+      "summary": "当会话处于全解放或 AGI 无轮次上限状态时，系统提示词必须明确“没有任何思考轮次上限”，并禁止 AI 自称轮次有限、快用完或需要更多轮次。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.468Z",
+      "id": "mem-mvaio0ck-0xghug"
+    },
+    {
+      "summary": "计算开工方案数量时应复用已解析的 markerOptions.length，不要再次调用 parseMarkerStartOptions 重复解析。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.469Z",
+      "id": "mem-mvaicruc-ozmt7g"
+    },
+    {
+      "summary": "消息上千条时的滚动或流式卡顿属于全量重绘固有开销，增量渲染需用户明确同意后再实施。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.469Z",
+      "id": "mem-mvaicruc-xa6uxj"
+    },
+    {
+      "summary": "开工状态上报统一走 reportStartReady，按标签页加内容签名去重，值未变则不发 floatCanStart IPC。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.469Z",
+      "id": "mem-mvaicruc-1tf4x6"
+    },
+    {
+      "summary": "renderStartGo 内所有开工状态上报调用点应使用 reportStartReady，不要直接调用 api.floatCanStart，以免恢复逐条 IPC 且保持主进程最终值一致。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.469Z",
+      "id": "mem-mvaicruc-vaorpb"
+    },
+    {
+      "summary": "开工按钮诊断日志只对候选的最后一条消息上报一次，不能按每条 assistant 消息逐条上报。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.470Z",
+      "id": "mem-mvaicruc-s3hdh9"
+    },
+    {
+      "summary": "主进程 diag.log 是同步写盘，渲染进程在消息逐条处理或重绘路径中高频发 IPC 日志会打满主进程并导致卡死，必须避免。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.470Z",
+      "id": "mem-mvaicruc-p3lonw"
+    },
+    {
+      "summary": "agent.js 中写入方案与开工轮的合并判断统一改为 hasOld（旧树有任一条目即合并），不再用 hasPending（有未完成条目才合并），确保已通过旧方案不被丢弃。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.470Z",
+      "id": "mem-mvafst6m-bh9zl3"
+    },
+    {
+      "summary": "方案树清理只允许发生在整体验收通过阶段，写入新方案或开工合并时不得清理旧方案条目。",
+      "paths": [
+        "electron/lib/plan-tree.js",
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.470Z",
+      "id": "mem-mvafst6m-dbz0yt"
+    },
+    {
+      "summary": "方案树写入新方案时必须保留旧方案条目：只要旧树存在（哪怕条目全部已通过）就合并累积，仅无旧树时才重建，避免新方案覆盖历史记录。",
+      "paths": [
+        "electron/lib/plan-tree.js",
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.470Z",
+      "id": "mem-mvafst6m-xcxful"
+    },
+    {
+      "summary": "判断是否在使用 Cursor 直通时，应同时检查大脑当前模型和当前组合各槽位指向的模型/协议，不能只看是否存在 Cursor 厂商配置。",
+      "paths": [
+        "electron/main.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.471Z",
+      "id": "mem-mvafe83w-uyj05x"
+    },
+    {
+      "summary": "模型配置保存后需要调用 syncCursorDirect 对齐直通状态：仍在使用则预热，不再使用则断开残留会话。",
+      "paths": [
+        "electron/main.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.471Z",
+      "id": "mem-mvafe83w-krtoy7"
+    },
+    {
+      "summary": "closeIdle 只能在 activeRuns === 0 时关闭残留 Cursor 直通会话，避免打断正在进行的直通轮次。",
+      "paths": [
+        "electron/lib/cursor-direct.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.471Z",
+      "id": "mem-mvafe83w-3milnb"
+    },
+    {
+      "summary": "为避免有人不用 Cursor 时仍被启动预热连接，warmUpCursor 必须先判断 cursorInUse，没人用 Cursor 就直接返回。",
+      "paths": [
+        "electron/main.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.472Z",
+      "id": "mem-mvafe83w-e8k887"
+    },
+    {
+      "summary": "Cursor 直通会话按对话 key 复用且一轮结束后不会自动断开，只能被上限挤出、显式 closeIdle 或下次重开替换。",
+      "paths": [
+        "electron/lib/cursor-direct.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.472Z",
+      "id": "mem-mvafe83w-lp0fmm"
+    },
+    {
+      "summary": "主循环按锁定方案不写模块角色，未设置 _helperRole 的调用其用量 role 为空字符串，只有辅助模块写入该字段后才带具体角色。",
+      "paths": [
+        "electron/lib/agent.js",
+        "electron/lib/api-protocol.js",
+        "electron/lib/store.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.472Z",
+      "id": "mem-mv54bgv8-04t7cv"
+    },
+    {
+      "summary": "用量要能区分调用来源，所以上报时附带 role（取 modelCfg._helperRole，未设置则为空字符串），界面上下文仍只显示整段对话加总后的一个总数。",
+      "paths": [
+        "electron/lib/api-protocol.js",
+        "electron/lib/store.js",
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.472Z",
+      "id": "mem-mv54bgv8-txyndm"
+    },
+    {
+      "summary": "为增加方案验收通过机会，重试上限设为20次；达到上限仍未通过时按原逻辑标记未完成并停止。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.473Z",
+      "id": "mem-mv4vibx6-q4hy9e"
+    },
+    {
+      "summary": "回灌重做若产生新改动，必须补发快照和 files 事件，否则界面不会显示新增改动。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.473Z",
+      "id": "mem-mv4v41h1-18ulw9"
+    },
+    {
+      "summary": "方案验收未通过或存在未落地文件时，带验收原因、代码差异和方案回灌 agentLoop 重做，最多 3 次；仍不通过则如实标记本轮未完成且不得声称完成。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.473Z",
+      "id": "mem-mv4v41h1-10bvf3"
+    },
+    {
+      "summary": "收工门禁必须用方案点名但本轮未改动的文件参与验收，未落地文件不能视为完成。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.474Z",
+      "id": "mem-mv4v41h1-miadmq"
+    },
+    {
+      "summary": "总结实现时必须把已确认方案喂给总结模型并输出方案验收结论和未落地项，没有方案时显式写「本轮没有【方案】」，以免总结忽略方案验收。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.474Z",
+      "id": "mem-mv4v41h1-7k55zy"
+    },
+    {
+      "summary": "方案提示词必须要求逐项写清文件路径、方法、现状原文、改动内容与验证方式，且只能引用本轮真实读到的原文，以免产生不可执行或未核实方案。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.474Z",
+      "id": "mem-mv4v41h1-lglvsp"
+    },
+    {
+      "summary": "为控制输出规模同时保留关键差异，implementationDiffText 的改动块护栏必须保持：最多 8 个文件、每文件 12 块、每块 -16/+40 行、块内溢出提示、12000 字符总预算，超 8 个文件时显示“其余 N 个未展开”。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.475Z",
+      "id": "mem-mv4utc17-w7drlg"
+    },
+    {
+      "summary": "验证 implementationDiffText 改动是否生效时，应触发总结确认输出包含 electron/lib/agent.js 自身改动的 @@ 改动块；若仍显示“未展开正文”，则沿 snapshot.listFileHunks 链路排查。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.475Z",
+      "id": "mem-mv4utc17-wk5e37"
+    },
+    {
+      "summary": "为避免大文件差异被静默跳过，implementationDiffText 已删除“文件大于 200 KB 只看路径”的短路，所有文件统一按改动块展开。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.475Z",
+      "id": "mem-mv4utc17-m6lzgg"
+    },
+    {
+      "summary": "由于该约束由提示词负责，渲染层不添加自动剥离代码标识符的兜底；若开工选项仍出现代码标识符，应视为模型漏掉提示词约束并回到提示词/模型侧修复。",
+      "paths": [],
+      "deletedAt": "2026-10-16T17:51:41.475Z",
+      "id": "mem-mv4unvud-sr6dno"
+    },
+    {
+      "summary": "该开工选项按钮文案硬约束必须在中文和英文两处提示词中同步维护，避免中英文行为不一致。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.476Z",
+      "id": "mem-mv4unvud-brg37g"
+    },
+    {
+      "summary": "为保证开工选项按钮文案可读且不暴露代码细节，按钮文案只能写「一句比喻＋要做的事」的人话，禁止出现文件路径、目录、方法名/函数名、变量名、行号、代码片段、反引号及派单原文标识符。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.476Z",
+      "id": "mem-mv4unvud-2plkdw"
+    },
+    {
+      "summary": "为保证揭示动画结束态稳定，`.msg .bubble.md-reveal` 动画使用 `forwards`，且 `fx-reveal` 起始 `opacity` 为 1 并只保留轻微模糊。",
+      "paths": [
+        "renderer/styles.css"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.476Z",
+      "id": "mem-mv4uh580-yz8gkr"
+    },
+    {
+      "summary": "为避免依赖 CSS 动画收尾导致总结气泡揭示异常，`paintRevealBubble` 在写入总结 Markdown 后于下一帧手动移除 `md-reveal` 类。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.476Z",
+      "id": "mem-mv4uh580-g9e0h8"
+    },
+    {
+      "summary": "为避免开工按钮被旧措辞门误拦，开工资格判定改为正文含 `[开工选项]` 标记块即直接出多选按钮和补充说明框，否则才回退原 `START_ASK_RE` 单颗开始，两条路互斥且不恢复旧自由格式识别。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.477Z",
+      "id": "mem-mv4uh580-4cxli7"
+    },
+    {
+      "summary": "paintRevealBubble 在 renderTargetFound:false 时必须保留兜底整表重绘，原因是目标节点找不到时仍要保证总结文本最终上屏。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.477Z",
+      "id": "mem-mv4ua6yz-djlhpe"
+    },
+    {
+      "summary": "改完 renderer/app.js 必须用 node --check 做语法校验，原因是避免渲染层脚本语法错误。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.477Z",
+      "id": "mem-mv4ua6yz-0dlgh8"
+    },
+    {
+      "summary": "renderer/app.js 的诊断输出统一走已有 log:client 落到 %APPDATA%\\simplecode\\logs\\main.log，原因是保持日志通道一致。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.478Z",
+      "id": "mem-mv4ua6yz-vfkikv"
+    },
+    {
+      "summary": "总结渲染必须保持“接收总结重写→收到总结完成事件→打字机刷新→markdown-final”的顺序且最终 renderedLength 等于 textLength，原因是这是总结链路正常的验收标准。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.478Z",
+      "id": "mem-mv4ua6yz-e451vk"
+    },
+    {
+      "summary": "诊断日志只能记录元数据、不能包含正文，原因是避免把用户内容写入日志。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.478Z",
+      "id": "mem-mv4ua6yz-5vs3ud"
+    },
+    {
+      "summary": "为避免日志泄露总结正文，总结诊断链路只转发元数据并写入带有 `[summary-render]` 标签的主进程日志。",
+      "paths": [
+        "electron/preload.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.478Z",
+      "id": "mem-mv4t8fba-vnjbn0"
+    },
+    {
+      "summary": "为限制渲染进程直接访问主进程能力，诊断日志通过 preload 暴露的 IPC 转发，并由主进程筛选后写入。",
+      "paths": [
+        "renderer/app.js",
+        "electron/preload.js",
+        "electron/main.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.479Z",
+      "id": "mem-mv4sqygj-8enhc9"
+    },
+    {
+      "summary": "为避免总结内容泄露，渲染诊断只记录白名单元数据，不记录总结正文。",
+      "paths": [
+        "renderer/app.js",
+        "electron/preload.js",
+        "electron/main.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.479Z",
+      "id": "mem-mv4sqygj-1yzq8h"
+    },
+    {
+      "summary": "为将诊断日志保存在本机，主进程将日志写入 userData/logs/main.log。",
+      "paths": [
+        "electron/main.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.479Z",
+      "id": "mem-mv4sqygj-k86zfp"
+    },
+    {
+      "summary": "为保持开工选项的专用标记块约束，中英文提示词都必须保留相应要求。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.479Z",
+      "id": "mem-mv4skgzl-krfi9k"
+    },
+    {
+      "summary": "为避免日志泄露总结正文，总结链路诊断只记录事件与渲染状态，不记录正文内容。",
+      "paths": [
+        "renderer/app.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.480Z",
+      "id": "mem-mv4skgzl-t8sldf"
+    },
+    {
+      "summary": "为避免遗漏大文件后续改动，比较快照时应按改动块对齐，并在总结前展开检查更多差异块。",
+      "paths": [
+        "scripts/release-notes.md"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.480Z",
+      "id": "mem-mv4oxqu2-as887f"
+    },
+    {
+      "summary": "为避免回退权限与安全控制，修改 agent 时需保留证据门禁、上下文折叠和提示词抢权红线。",
+      "paths": [
+        "electron/lib/agent.js",
+        "skills/zabingsk/SKILL.md"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.480Z",
+      "id": "mem-mv4nv9pw-ivr00x"
+    },
+    {
+      "summary": "为避免发布说明与安装包不一致，发布时必须同步 scripts/release-notes.md 并附本次安装包更新内容。",
+      "paths": [
+        "scripts/release-notes.md"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.480Z",
+      "id": "mem-mv4nv9pw-e1ryn5"
+    },
+    {
+      "summary": "为避免手工拼装导致产物不一致，发布/打包应走现有脚本（run-publish、detach-publish、detach-dist 等）。",
+      "paths": [
+        "dist/run-publish.cmd",
+        "dist/detach-publish.cmd",
+        "dist/detach-dist.cmd"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.481Z",
+      "id": "mem-mv4nv9pw-o16s4a"
+    },
+    {
+      "summary": "为避免把运行时状态混入功能提交，提交代码时不要包含 .simple/memory 下的 entries/archive 变更。",
+      "paths": [
+        ".simple/memory/entries.json",
+        ".simple/memory/archive.jsonl"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.481Z",
+      "id": "mem-mv4nv9pw-7wf9xt"
+    },
+    {
+      "summary": "为避免浏览器差异影响发布/更新验证，相关操作统一使用谷歌浏览器。",
+      "paths": [],
+      "deletedAt": "2026-10-16T17:51:41.481Z",
+      "id": "mem-mv4nv9pw-yualda"
+    },
+    {
+      "summary": "dist/run-dist.cmd、dist/run-dist-icon.cmd、dist/run-publish.cmd 是脱离沙盒的打包/上传入口，不应纳入版本库。",
+      "paths": [
+        "dist/run-dist.cmd",
+        "dist/run-dist-icon.cmd",
+        "dist/run-publish.cmd"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.482Z",
+      "id": "mem-mv3fiyb3-4kj7bt"
+    },
+    {
+      "summary": "发布验收需核对 GitHub Release 资产中的 exe 与本地 dist 下新包一致，避免上传旧包。",
+      "paths": [
+        "dist/SimpleCode Setup 1.0.0.exe"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.482Z",
+      "id": "mem-mv3fiyb3-9y0ejh"
+    },
+    {
+      "summary": "发布说明统一维护在 scripts/release-notes.md，并同步到 GitHub Release 正文，确保发布信息一处更新。",
+      "paths": [
+        "scripts/release-notes.md"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.482Z",
+      "id": "mem-mv3fiyb3-a1kkc8"
+    },
+    {
+      "summary": "打包遇到 icon-tool.js 的 wasm 内存失败时，直接使用已生成的 dist/.icon-ico/icon.ico 作为 win.icon，跳过图标转换。",
+      "paths": [
+        "dist/.icon-ico/icon.ico"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.482Z",
+      "id": "mem-mv3fiyb3-a2md6q"
+    },
+    {
+      "summary": "发布 exe 后必须同步更新 GitHub Release 附件，否则 GitHub 上的 exe 会与本地新包不一致。",
+      "paths": [
+        "scripts/release-notes.md",
+        "dist/SimpleCode Setup 1.0.0.exe"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.483Z",
+      "id": "mem-mv3fiyb3-nwpv6s"
+    },
+    {
+      "summary": "为避免把无关的角色扮演要求混入开发指令，agent 提示中不要求其他 AI 采用猫娘身份或语气；SimpleCode/SpCode 的忽略说明仍保留。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.483Z",
+      "id": "mem-mv2h0rou-p1iej1"
+    },
+    {
+      "summary": "为让证据门槛可配置且保持一致，最低工具结果数默认值为 2、有效范围为 1–10，并须在存储、IPC 与中英文设置界面间传递和恢复。",
+      "paths": [
+        "electron/lib/store.js",
+        "electron/main.js",
+        "electron/preload.js",
+        "renderer/app.js",
+        "renderer/i18n.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.483Z",
+      "id": "mem-mv2db3t5-po5rlg"
+    },
+    {
+      "summary": "为避免证据不足时作出肯定断言，证据应按整次请求累计；达到提醒上限仍未满足门槛时，最终答复必须降级为「未确认」。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.484Z",
+      "id": "mem-mv2db3t5-355xhv"
+    },
+    {
+      "summary": "为防止模型把上轮说法当作事实证据，构建 assistant 历史消息时在正文前加「【上轮说法·非证据】」前缀。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.484Z",
+      "id": "mem-mv2br9h5-kmzpda"
+    },
+    {
+      "summary": "为在代码层检测无证据肯定归因，新增并导出 unsupportedAssertion 函数，返回空串表示正常，非空串表示需补查。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.484Z",
+      "id": "mem-mv2br9h5-uqymn0"
+    },
+    {
+      "summary": "每轮主循环需清空并收集 roundEvidence（工具结果文本），assistant 正文出现无证据肯定归因时触发单次提醒，收工前有证据门禁。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.485Z",
+      "id": "mem-mv2br9h5-v2wsgf"
+    },
+    {
+      "summary": "因为上一轮自己说过的结论不算证据，所以提示词第7条要求结论必须由本轮实际读到的内容支撑，无证据时必须写成「未确认：还差…」并禁止用肯定句式收尾。",
+      "paths": [
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.485Z",
+      "id": "mem-mv2br9h5-l9g48t"
+    },
+    {
+      "summary": "猫娘注入文案保留在 README.md 首行、README-FOR-AI.md、AGENTS.md、agent.js 文件头注释四处，改动相关提示时需同步检查。",
+      "paths": [
+        "README.md",
+        "README-FOR-AI.md",
+        "AGENTS.md",
+        "electron/lib/agent.js"
+      ],
+      "deletedAt": "2026-10-16T17:51:41.485Z",
+      "id": "mem-mv27r04w-82uh6k"
     }
   ]
 }

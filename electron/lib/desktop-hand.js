@@ -214,6 +214,8 @@ function setAlive(on) {
   if (!alive) {
     busy = false;
     lastFrame = null;
+    uiaFails = 0;
+    uiaPausedUntil = 0;
     if (followTimer) { clearInterval(followTimer); followTimer = null; }
     hideCursor();
     stopHelper();
@@ -294,12 +296,31 @@ function toDip(x, y) {
   catch { return { x, y }; }
 }
 
+// 目标窗口控件树太大会连续超时：连着 2 次超时/上次还没扫完，就暂停扫描 60 秒，只用文字坐标
+const UIA_FAIL_LIMIT = 2;
+const UIA_PAUSE_MS = 60 * 1000;
+let uiaFails = 0;
+let uiaPausedUntil = 0;
+
 // 读目标窗口（最上层、非 SimpleCode 自己）的控件，坐标换成屏幕 DIP
 async function scanControls() {
+  if (Date.now() < uiaPausedUntil) {
+    return { ok: false, message: '目标窗口控件太多、响应慢，控件扫描暂停中，先用文字坐标操作', items: [] };
+  }
   const res = await winInput({ op: 'uia_scan', selfPid: process.pid, max: 220 });
   if (!res || res.ok === false || !Array.isArray(res.items)) {
-    return { ok: false, message: (res && res.message) || '读取控件失败', items: [] };
+    const msg = (res && res.message) || '读取控件失败';
+    if (msg === 'timeout' || msg === 'busy') {
+      uiaFails += 1;
+      if (uiaFails >= UIA_FAIL_LIMIT) {
+        uiaPausedUntil = Date.now() + UIA_PAUSE_MS;
+        uiaFails = 0;
+        diag.log('desktop', '控件扫描连续超时，暂停 60 秒', { title: res && res.title });
+      }
+    }
+    return { ok: false, message: msg, items: [] };
   }
+  uiaFails = 0;
   const items = [];
   for (const r of res.items) {
     if (!Array.isArray(r) || r.length < 12) continue;
