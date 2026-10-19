@@ -31,3 +31,13 @@ Test.zip
 # 模型权重与元数据（GB 级，禁止入库）
 *.safetensors
 *.sc-meta.json
+
+# AI 助手的本地规则与本机工作区数据（个人环境，勿提交）
+.cursor/
+AGENTS.md
+.simple-userdata/
+.simple/plans/
+
+# 根目录下的临时克隆与误存的命令输出（不是本仓库内容）
+/xxx/
+/h
