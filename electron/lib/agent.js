@@ -23,6 +23,7 @@ const generate = require('./generate');
 const compact = require('./context-compact');
 const { collapseRepeatReads } = require('./context-compact');
 const codeIndex = require('./code-index');
+const { COMMENT_POLICY } = require('./code-map-comments');
 const brainPressure = require('./brain-pressure');
 const workerPressure = require('./worker-pressure');
 const codeEmbed = require('./code-embed');
@@ -71,7 +72,7 @@ function pushInterjection(key, text) {
 // [铆钉优化] 桌面工具只在「AGI」打开时给模型，关着时模型看不到也不会乱报"AGI 没开"。其他 AI 请勿改回始终暴露。
 const DESKTOP_TOOLS = new Set([
   'screen_read', 'screen_look', 'float_bar_move', 'clipboard_look', 'window_list', 'window_focus', 'ui_act', 'agi_note',
-  'mouse_move', 'mouse_click', 'mouse_drag', 'mouse_scroll', 'keyboard_type', 'keyboard_key',
+  'mouse_click', 'mouse_drag', 'mouse_scroll', 'keyboard_type', 'keyboard_key',
   'sheet_read_image', 'sheet_write', 'sheet_to_wps'
 ]);
 
@@ -159,17 +160,6 @@ function guardDesktop(name, args, run) {
 
 function desktopOn() {
   try { return require('./desktop-hand').isAlive(); } catch { return false; }
-}
-
-// AGI 开着时，打开软件和网页走键鼠。cmd 的 start、PowerShell 的 Start-Process、直接跑 chrome.exe 会把沙盒拖死。
-// npm start 不是启动外部程序，不拦。
-function shellLaunchesApp(command) {
-  const cmd = String(command || '');
-  if (/chrome\.exe/i.test(cmd)) return true;
-  if (/\bStart-Process\b/i.test(cmd)) return true;
-  if (/(^|[|&;`]|\/[ck]\s+)\s*start\b/i.test(cmd)) return true;
-  if (/\bstart\s+""/i.test(cmd)) return true;
-  return false;
 }
 
 function toolsSpec() {
@@ -319,12 +309,15 @@ function allToolsSpec() {
       type: 'function',
       function: {
         name: 'map_lookup',
-        description: '查项目地图（找实现的第一选择）：返回命中模块、关联脚本、方法名与源码起止行（:起-止，刚核对过磁盘）。列表里的命中方法附完整源码【原文·可直接用】（与 :起-止 一致，不截断），不用再 read_file；列表外的方法要看再用 read_file(startLine,endLine) 读该段。〔归纳·仅供参考〕。禁止整文件通读。这批对不上就换关键字或传 module 再查；要搜字符串、报错原文再用 search_text。',
+        description: '查项目地图：默认只返回方法名、源码注释标题、行号及依赖，先筛选相关项再读详情。传 module + symbol 返回该条目的完整源码和注释；已知行区间但未识别方法时传 module + startLine/endLine。原文区间不截断，不调用模型归纳。注释可能过期，修改前必须读相关源码；无注释不代表无关。未匹配可用 search_text。',
         parameters: {
           type: 'object',
           properties: {
             query: { type: 'string', description: '关键字（方法名、模块名、功能词，空格分隔多个）' },
             module: { type: 'string', description: '可选。模块路径（如 electron/lib/agent.js），传了则返回该模块全部方法与依赖' },
+            symbol: { type: 'string', description: '可选。与 module 一起使用，读取指定方法的注释及完整源码区段' },
+            startLine: { type: 'integer', description: '与 module/endLine 一起使用，读取指定区段；符号重名时也可用来定位' },
+            endLine: { type: 'integer', description: '指定区段的最后一行（包含）' },
             path: { type: 'string', description: '可选。只在该目录内检索' },
             limit: { type: 'integer', description: '返回模块条数，默认 10，最大 30' }
           }
@@ -424,8 +417,10 @@ function allToolsSpec() {
       type: 'function',
       function: {
         name: 'run_command',
-        description: process.platform === 'win32'
-          ? '在项目命令沙盒中执行命令（cwd 限制在工作区内，拦截高危命令，有超时）。Windows 下由 cmd.exe 执行：不支持 bash 语法（<<EOF、find -type、单引号字符串），PowerShell 语句要写成 powershell -NoProfile -Command "..."。只用于跑测试、构建、git 状态；改文件一律用 edit_file / write_file，禁止用 python/node/powershell 脚本改文件，也不要用它搜代码（用 search_text）或列目录（用 list_dir）。AGI 开着时，禁止用本工具执行 start、Start-Process 或启动 chrome.exe 来打开软件和网页，改用键鼠。'
+        description: desktopOn()
+          ? '为完成用户目标执行项目命令，可用于安装依赖、构建、启动程序、检查结果等；改源码优先 edit_file / write_file 保留改动追踪。cwd 在工作区内，命令有超时和输出上限。Windows 由 cmd.exe 执行，PowerShell 语句需包在 powershell -NoProfile -Command "..." 中。根据退出码和实际输出判断结果，命令被拒绝或失败不能当成功。'
+          : process.platform === 'win32'
+          ? '在项目命令沙盒中执行命令（cwd 限制在工作区内，拦截高危命令，有超时）。Windows 下由 cmd.exe 执行：不支持 bash 语法（<<EOF、find -type、单引号字符串），PowerShell 语句要写成 powershell -NoProfile -Command "..."。只用于跑测试、构建、git 状态；改文件一律用 edit_file / write_file，禁止用 python/node/powershell 脚本改文件，也不要用它搜代码（用 search_text）或列目录（用 list_dir）。'
           : '在项目命令沙盒中执行 shell 命令（cwd 限制在工作区内，拦截高危命令，有超时）。只用于跑测试、构建、git 状态；改文件一律用 edit_file / write_file，禁止用脚本改文件，搜代码用 search_text。',
         parameters: {
           type: 'object',
@@ -530,21 +525,6 @@ function allToolsSpec() {
         name: 'clipboard_look',
         description: '从剪贴板导入图片，交给看图模型理解并保存。剪贴板里没有图片时会说明。',
         parameters: { type: 'object', properties: {} }
-      }
-    },
-    {
-      type: 'function',
-      function: {
-        name: 'mouse_move',
-        description: '把虚拟光标移到画面坐标（只是给用户指一下位置），不移动系统鼠标。x,y 用【屏幕文字】里的坐标。',
-        parameters: {
-          type: 'object',
-          properties: {
-            x: { type: 'number', description: '图内横坐标' },
-            y: { type: 'number', description: '图内纵坐标' }
-          },
-          required: ['x', 'y']
-        }
       }
     },
     {
@@ -1352,6 +1332,9 @@ async function execToolRaw(workspace, snap, name, args, onEvent, extra, signal, 
     return codeIndex.search(workspace, extra, {
       query: q,
       module: mod,
+      symbol: args.symbol,
+      startLine: args.startLine,
+      endLine: args.endLine,
       within,
       limit: args.limit,
       signal
@@ -1404,17 +1387,14 @@ async function execToolRaw(workspace, snap, name, args, onEvent, extra, signal, 
   }
   if (name === 'run_command') {
     const s = store.load();
-    if (s.commandSandbox?.enabled === false) {
+    if (!desktopOn() && s.commandSandbox?.enabled === false) {
       return '命令沙盒已关闭，无法执行 shell。请在设置中开启「命令沙盒」。';
     }
     if (!workspace) throw new Error('请先打开项目');
     const command = String(args.command || '').trim();
     if (!command) throw new Error('command 不能为空');
-    if (typecheck.isUnity(workspace) && typecheck.isUnityBlockedCommand(command)) {
+    if (!desktopOn() && typecheck.isUnity(workspace) && typecheck.isUnityBlockedCommand(command)) {
       return '这是 Unity 工程，这条命令没有执行：这里不能跑测试、不能启动 Unity，也不能用 git。请只对照代码和需求是否一致。运行效果由用户在编辑器里看，不要再尝试这类命令。';
-    }
-    if (desktopOn() && shellLaunchesApp(command)) {
-      return '这条命令没有执行。AGI 已打开，打开软件和网页请用键鼠：先 screen_read，再用 keyboard_key（如 Win+R）、keyboard_type、mouse_click 或 ui_act。不要用 run_command 执行 start、Start-Process，也不要直接启动 chrome.exe。';
     }
     const timeoutMs = Math.max(3, Number(s.commandSandbox?.timeoutSec) || 60) * 1000;
     onEvent({ type: 'tool', name, status: 'running', detail: command.slice(0, 120), text: `沙盒命令 ${command.slice(0, 120)}` });
@@ -1626,7 +1606,6 @@ async function execToolRaw(workspace, snap, name, args, onEvent, extra, signal, 
       }
       return `【视力】已从剪贴板保存 ${shot.path}\n${seen}`;
     }
-    if (name === 'mouse_move') return desktopHand.moveTo(args.x, args.y);
     if (name === 'mouse_click') return guardDesktop(name, args, () => desktopHand.clickAt(args.x, args.y, args.button, args.times || (args.double ? 2 : 1)));
     if (name === 'mouse_drag') return desktopHand.dragStroke(args.points, args.button);
     if (name === 'mouse_scroll') return desktopHand.scrollAt(args.x, args.y, args.delta);
@@ -1896,8 +1875,12 @@ function buildSystemPrompt({
       : `\n本条消息里带有原图（image_url）。请直接根据画面回答，禁止说自己看不到图或没有看图通道。\n`;
   }
   const agiOn = desktopOn();
-  const agiSelfEn = '\nAGI is on. The user only accepts the result. You finish everything else yourself: understand the request, fill the gaps, read the screen, use the mouse and keyboard, edit files, run git, and run project commands. Do not wait for start, do not restate and stop, and do not hand work back. Your permissions are high. This turn is unlimited. Call screen_read first, then ui_act or the mouse and keyboard, then edit_file, write_file, or run_command as needed. Open apps and web pages with the keyboard and mouse only. Do not use run_command to run start, Start-Process, or chrome.exe. Do not call call_worker. When it is done, tell the user what to check.\n';
-  const agiSelfZh = '\nAGI 已打开。用户只管验收，其他所有事情都由你自己做完：看懂问题、补全需求、看屏幕、键鼠、改文件、Git、在项目里执行命令。不要等「开始」，不要复述完就停，不要把活交回用户。你的权限现在很高，基本上能干所有事情。这一轮全解放，不受思考轮次限制。必须先调用 screen_read，看完再用 ui_act 或键鼠，需要改文件或跑命令就自己调用 edit_file、write_file、run_command。打开软件和网页只用键鼠，禁止用 run_command 执行 start、Start-Process 或启动 chrome.exe。禁止 call_worker，禁止派单。做完后只告诉用户验收什么。\n';
+  // AGI 按目标自主执行；技能里的普通开工流程不能重新收紧当前模式。
+  const agiContract = !agiOn ? '' : (enPrompt
+    ? '\n[AGI EXECUTION MODE] Complete the user goal autonomously: investigate, choose necessary files and tools, implement, and verify the requested outcome. Ordinary plan approval, start words, named-file-only rules, and worker handoff requirements in rules or skills do not apply in this mode. Existing plans are context, not permission locks. Respect explicit user exclusions and read-only requests. Recover from failures using tool evidence and another suitable approach. A successful status query alone does not complete an implementation task. Ask only for genuinely missing information or credentials you cannot obtain yourself. Report actual changes and outcome evidence, including unresolved blockers.\n'
+    : '\n【AGI 当前执行模式】收到目标后自主完成：查资料、选择必要文件和工具、实现、核对目标效果。规则或技能里的普通方案确认、开始口令、只能修改点名文件、模块派单流程在此模式不适用；已有方案是任务参考，不是权限锁。用户明确的任务排除范围和只读要求仍须遵守。遇到失败依据工具结果排查、换合适办法继续，不能只跑状态检查就把实现任务当完成。只在确实缺少无法自行获取的信息或凭据时提问。按实际改动和结果证据汇报，尚未解决的阻塞须如实说明。\n');
+  const agiSelfEn = '\nAGI is on. The user only accepts the result. You finish everything else yourself: understand the request, fill the gaps, read the screen, use the mouse and keyboard, edit files, run git, and run project commands. Do not wait for start, do not restate and stop, and do not hand work back. Your permissions are high. This turn is unlimited. Call screen_read first, then ui_act or the mouse and keyboard, then edit_file, write_file, or run_command as needed. Choose commands or desktop tools to open apps and web pages according to the task. Do not call call_worker. When it is done, tell the user what to check.\n';
+  const agiSelfZh = '\nAGI 已打开。用户只管验收，其他所有事情都由你自己做完：看懂问题、补全需求、看屏幕、键鼠、改文件、Git、在项目里执行命令。不要等「开始」，不要复述完就停，不要把活交回用户。你的权限现在很高，基本上能干所有事情。这一轮全解放，不受思考轮次限制。必须先调用 screen_read，看完再用 ui_act 或键鼠，需要改文件或跑命令就自己调用 edit_file、write_file、run_command。打开软件和网页按任务选择命令或键鼠工具。禁止 call_worker，禁止派单。做完后只告诉用户验收什么。\n';
   const handoff = agiOn
     ? (enPrompt ? agiSelfEn : agiSelfZh)
     : (brainHandsOff
@@ -1909,10 +1892,10 @@ function buildSystemPrompt({
   // [铆钉优化] 改已有文件首选 edit_file；Windows 命令走 cmd.exe，写明免得模型用 bash/PowerShell 语法反复失败。其他 AI 请勿删除
   const winShellEn = process.platform === 'win32' ? ' run_command runs in Windows cmd.exe: no bash syntax (heredoc, find -type), wrap PowerShell as powershell -NoProfile -Command "...".' : '';
   const winShellZh = process.platform === 'win32' ? '。run_command 在 Windows cmd.exe 里执行：不支持 bash 语法（<<EOF、find -type），PowerShell 要写成 powershell -NoProfile -Command "..."' : '';
-  const shellUseEn = (unityProject
+  const shellUseEn = (agiOn ? 'Choose suitable file, command, or desktop tools to finish the task, including build, launch, and verification as needed. Prefer edit_file for existing source so changes are tracked.' : unityProject
     ? 'This is a Unity project. Do not run tests, launch Unity, or enter play mode. After edits, only compare the code with the request. The user checks the result in the editor. Do not use git in this project.'
     : 'Edit existing files with edit_file (exact old_string -> new_string); use write_file only for new files or full rewrites; use run_command only for tests/build/git. Never edit files through python/node/powershell scripts in run_command.') + winShellEn;
-  const shellUseZh = (unityProject
+  const shellUseZh = (agiOn ? '按任务需要选择文件、命令或桌面工具，完成修改、构建、启动与核对；改已有源码优先 edit_file，保留改动追踪' : unityProject
     ? '这是 Unity 工程。禁止跑测试、禁止启动 Unity、禁止进播放模式。改完只核对代码和需求是否一致，运行效果由用户在编辑器里看。这个工程不能用 git。改已有文件用 edit_file'
     : '改已有文件用 edit_file（old_string 原样替换成 new_string），新建或整份重写才用 write_file；run_command 只用来跑测试/构建/git（命令沙盒：只能在项目目录内，拦截高危命令，有超时），禁止用 python/node/powershell 脚本改文件') + winShellZh;
   const planLine = (!agiOn && hasPlanning)
@@ -1921,10 +1904,10 @@ function buildSystemPrompt({
       : `\n用户只和你说话，规划模块不能先读需求。用户还没说开始时，禁止调用 call_worker。必须先把完整方案写在回复的【方案】…【/方案】段里。用户可以点「写入方案」，也可以明确回复「开始」来确认并锁定最新方案；开始后立刻调用 call_worker，role 填 code，不要先插规划。若已经派过规划，规划结果只用来指挥代码，不符合就改清再派，禁止把没做完的方案回复给用户。\n`)
     : '';
   const actRuleEn = agiOn
-    ? 'AGI is on. The user only accepts the result. You finish everything else yourself and do not wait for start. Permissions are high and this turn is unlimited. Call screen_read first, then do the files, commands, and desktop actions yourself. Open apps and web pages with the keyboard and mouse only. Do not use run_command to run start, Start-Process, or chrome.exe. Do not call call_worker. If the always-on-top mini window of this app covers what you need to see or click, or the screen_read result warns that an area is covered by the mini window, call float_bar_move first to move it aside, then screen_read again; never claim that area has no content just because it is covered. When finished, tell the user what to check.'
+    ? 'AGI is on. The user only accepts the result. You finish everything else yourself and do not wait for start. Permissions are high and this turn is unlimited. Call screen_read first, then do the files, commands, and desktop actions yourself. Choose commands or desktop tools to open apps and web pages according to the task. Do not call call_worker. If the always-on-top mini window of this app covers what you need to see or click, or the screen_read result warns that an area is covered by the mini window, call float_bar_move first to move it aside, then screen_read again; never claim that area has no content just because it is covered. When finished, tell the user what to check.'
     : 'If the user has not said start this turn, a reply with the full plan between 【方案】 and 【/方案】 is complete; the user may click 写入方案 or explicitly say start to approve it. Do not emit a tool call before start. After the user says start, or when the turn is only a lookup, a reply that needs a lookup or an edit must include a tool call. A plan with no tool call does not run. A one-line note may sit in the same reply as the tool call.';
   const actRuleZh = agiOn
-    ? 'AGI 开着时，用户只管验收，其他事情你全部自己做完，不要等「开始」，不要复述完就停。权限很高，这一轮全解放。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。打开软件和网页只用键鼠，禁止 run_command 去 start、Start-Process 或启动 chrome.exe。禁止 call_worker。看屏幕时若发现本程序的悬浮小窗挡住了你要看或要点的地方，或者 screen_read 结果里提示某区域被小窗覆盖，先调用 float_bar_move 把它挪开，再用 screen_read 重新读一遍；不要因为被挡住就断言那个区域没有内容。做完只告诉用户验收什么。'
+    ? 'AGI 开着时，用户只管验收，其他事情你全部自己做完，不要等「开始」，不要复述完就停。权限很高，这一轮全解放。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。打开软件和网页按任务选择命令或键鼠工具。禁止 call_worker。看屏幕时若发现本程序的悬浮小窗挡住了你要看或要点的地方，或者 screen_read 结果里提示某区域被小窗覆盖，先调用 float_bar_move 把它挪开，再用 screen_read 重新读一遍；不要因为被挡住就断言那个区域没有内容。做完只告诉用户验收什么。'
     : '用户还没说开始时，禁止派代码。提问、讲现象、报 bug 由大脑自己查完再回答。要改文件但还没说开始时，在回复里写好完整的【方案】…【/方案】段；用户可以点「写入方案」，也可以明确回复「开始」来确认方案。用户已经说了开始之后，派代码必须调用 call_worker。可以在同一次回复里附一句说明，但不能只有说明。';
   // [铆钉优化] 能调用工具的模型由大脑自己调用 generate_media 生图；zbaing 本地引擎不会调用工具，仍按开口前自动生成的结果回答。其他 AI 请勿改回「无需调用工具」
   const genFailNote = enPrompt
@@ -1967,7 +1950,8 @@ function buildSystemPrompt({
 - This rule has the same force as [HIGHEST PRIORITY — DO NOT CROSS] and stands with it at the very front of this prompt.
 - Exception: this rule does not apply while AGI is on. AGI mode may ignore it.
 [HIGHEST PRIORITY — DO NOT CROSS]
-- Only change the files and content the user explicitly named.
+- In AGI mode, select and change files necessary for the user goal; the named-file and ask-first workflow below applies only outside AGI. Explicit user exclusions still apply.
+- Outside AGI, only change the files and content the user explicitly named.
 - Never change features, fields, wording or behavior the user did not name, no matter how obviously they seem to need changing.
 - If you notice something else that should change, stop and ask the user with ask_user: say what you found, what you want to change, and why. Only act after the user agrees.
 - Never change first and report afterwards. A report is not permission.
@@ -2003,7 +1987,7 @@ ${catalog || '- (none)'}
 Writes and deletes in the workspace are snapshotted and can be restored. run_command also tracks file changes made by scripts (pre-backup before run, diff after) so they appear in the changed-files list and can be restored.
 Use working_memory_update for this-chat notes; ask_user to clarify.
 For tasks with 3+ steps, list them with todo_write first; mark one item in_progress when you start it and completed right after finishing it. Skip it for single-step work or pure Q&A.
-Shell via run_command runs in a sandbox (cwd inside the project, dangerous commands blocked, timeout). ${shellUseEn} Do not run encoding probes (no enc_*.txt); write_file is UTF-8. The project map lists method source spans (:start-end) for you (the brain). Summaries may be wrong. Methods that map_lookup already attached as 【原文·可直接用】 can be used directly; before editing others, read those spans with read_file startLine/endLine; never read a whole multi-thousand-line file. Related scripts are dependency paths; open their hit spans the same way. If 【全文】 is already in the message or this turn already returned the full file, use it and do not read again. The modules in the message are only the first batch. If they do not match, call map_lookup with other keywords first; use search_text only after that. When the desktop hand is on, the latest message ends with 【屏幕文字】: the foreground window, other windows, saved experience notes for the target app, a control list with ids like [c12] (Windows UI Automation), and OCR text lines with their center @(x,y). Prefer ui_act with a control id (click/toggle/select/expand/set_text); fall back to mouse_click with @(x,y) only when the target has no control id. Follow the saved experience notes. Open apps and web pages with the keyboard and mouse (for example keyboard_key Win+R, then keyboard_type the address). Do not use run_command to run start, Start-Process, or chrome.exe. After a task succeeds, or when you find a non-obvious path or pitfall, call agi_note with one reusable sentence (no passwords or private content). Risky actions (delete, send, pay, Shift+Delete, Enter in chat apps) automatically ask the user first; do not ask again yourself and never work around a refusal. Work in an observe-act-verify loop: one action at a time, then read the 【操作后】 part of the tool result to check it worked before the next step; if nothing changed, rethink instead of repeating the same click. Before keyboard_type or keyboard_key, make sure the target window has focus (window_focus or click its input box). Use screen_read (optionally with wait_ms) to re-read after loading; screen_look only when text is not enough to judge icons or layout. Draw strokes and circles with mouse_drag. Desktop tools only exist while the switch is on; never claim you can see or click the screen otherwise.
+Shell via run_command runs in a sandbox (cwd inside the project, dangerous commands blocked, timeout). ${shellUseEn} Do not run encoding probes (no enc_*.txt); write_file is UTF-8. The project map lists method source spans (:start-end) for you (the brain). Summaries may be wrong. Methods that map_lookup already attached as 【原文·可直接用】 can be used directly; before editing others, read those spans with read_file startLine/endLine; never read a whole multi-thousand-line file. Related scripts are dependency paths; open their hit spans the same way. If 【全文】 is already in the message or this turn already returned the full file, use it and do not read again. The modules in the message are only the first batch. If they do not match, call map_lookup with other keywords first; use search_text only after that. When the desktop hand is on, the latest message ends with 【屏幕文字】: the foreground window, other windows, saved experience notes for the target app, a control list with ids like [c12] (Windows UI Automation), and OCR text lines with their center @(x,y). Prefer ui_act with a control id (click/toggle/select/expand/set_text); fall back to mouse_click with @(x,y) only when the target has no control id. Follow the saved experience notes. Choose commands or desktop tools to open apps and web pages according to the task. After a task succeeds, or when you find a non-obvious path or pitfall, call agi_note with one reusable sentence (no passwords or private content). Risky actions (delete, send, pay, Shift+Delete, Enter in chat apps) automatically ask the user first; do not ask again yourself and never work around a refusal. Work in an observe-act-verify loop: one action at a time, then read the 【操作后】 part of the tool result to check it worked before the next step; if nothing changed, rethink instead of repeating the same click. Before keyboard_type or keyboard_key, make sure the target window has focus (window_focus or click its input box). Use screen_read (optionally with wait_ms) to re-read after loading; screen_look only when text is not enough to judge icons or layout. Draw strokes and circles with mouse_drag. Desktop tools only exist while the switch is on; never claim you can see or click the screen otherwise.
 Independent read_file / list_dir / search_text / map_lookup in the same round should be emitted together as multiple tool calls. write_file calls for different files in the same round also run together. The same file, deletes, create_dir, run_command and ask_user stay serial.
 ${actRuleEn}
 Do not invent unread file contents. Copy, numbers, and fields that are not in the map summary or the file body must be read before you write them. Do not guess. After edits, list the files you changed.
@@ -2011,7 +1995,7 @@ Source files must be UTF-8. Never produce mojibake.
 
 ## Rules
 ${ruleText || 'None'}
-${skillText}${logChainGatePrompt(enPrompt)}${planPrompt(enPrompt)}${handoff}${planLine}${houseStyle.promptBlockIfNeeded(enPrompt, userOrder)}${brainPressure.promptBlock(workspace, enPrompt, agiOn)}`;
+${COMMENT_POLICY}${skillText}${agiOn ? agiContract : logChainGatePrompt(enPrompt) + planPrompt(enPrompt)}${handoff}${planLine}${houseStyle.promptBlockIfNeeded(enPrompt, userOrder)}${brainPressure.promptBlock(workspace, enPrompt, agiOn)}`;
   }
   return `${langLine}${planRule}${spcodeFirst}【第一红线·不得和用户抢权】
 - 用户还没做的决定、还没做的动作，属于用户，不属于你。用户自己决定用什么、绑什么、填什么、连什么、选什么，你没有权力替他定。典型场景：用户在 Unity 里新建了界面，组件引用还空着、参数还没填、配置还没选——这时禁止你自己去找那个组件、自己判断该绑哪一个就直接绑上、赋值、改好。这不是「顺手帮忙」，这是抢用户的权力。
@@ -2020,7 +2004,8 @@ ${skillText}${logChainGatePrompt(enPrompt)}${planPrompt(enPrompt)}${handoff}${pl
 - 本条与【最高优先级·不得越过】同等效力，一起排在提示词最前面。
 - 例外：AGI 开着时本条不适用，AGI 模式可以无视本条。
 【最高优先级·不得越过】
-- 只改用户明确点名的文件和内容。
+- AGI 模式自行选择并修改完成目标所需文件；下面点名文件、先请示的流程只适用于普通模式，用户明确排除的范围仍须遵守。
+- 普通模式只改用户明确点名的文件和内容。
 - 用户没点名的功能、字段、文案、行为，一律不准自己判断后动手改，包括「顺手改」「看起来也该改」「显然有问题」这类情况。
 - 发现别处需要改，必须停下，用 ask_user 问用户：发现了什么、想改什么、为什么。得到同意才动。
 - 禁止先改完再报告。事后报告不算许可。
@@ -2056,7 +2041,7 @@ ${catalog || '- （还没有技能）'}
 写入或删除工作目录文件会自动快照，用户可还原。run_command 执行的脚本若改动了工作区文件，也会记入快照和「已更改文件」，可一并还原。
 本会话要点用 working_memory_update；含糊时用 ask_user。
 三步以上的任务先用 todo_write 列清单；开始做某条就标 in_progress，做完立刻标 completed。单步小事和纯问答不用列。
-${shellUseZh}；不要写 tmp_*.ps1 批量替换。不要先做编码探针（不要写 enc_*.txt 试编码），write_file 一律 UTF-8。项目地图给方法源码起止行（:起-止）：这是定位依据。归纳可能不准；map_lookup 已附【原文·可直接用】的方法直接用，没附的改前用 read_file 的 startLine/endLine 只读该段，禁止整文件通读几千/几万行。关联脚本是依赖路径，需要对口时同样按命中方法的起止行读段。消息里已有【全文】、或本轮已整读过同一路径的，直接复用。消息里的模块只是第一批，对不上先换关键字 map_lookup，仍不够再用 search_text。用户打开「AGI」后，最后一条消息末尾有【屏幕文字】：前台窗口、其他窗口、这个软件以前记下的操作经验、带编号的控件列表（如 [c12]，来自 Windows UI 自动化）、以及 OCR 文字和中心坐标 @(x,y)。有控件编号时优先用 ui_act 按编号操作（click / toggle / select / expand / set_text），目标没有控件编号时才用 mouse_click 点 @(x,y)。照着以前记下的经验做。打开软件、打开网页用键鼠完成（例如 keyboard_key 按 Win+R，再 keyboard_type 输入地址），禁止用 run_command 执行 start、Start-Process 或启动 chrome.exe。任务做成后、或发现不明显的路径和坑时，调用 agi_note 记一句可复用的经验（不记密码、聊天内容等隐私）。删除、发送、付款、Shift+Delete、在聊天软件里按回车这类危险操作，程序会自动先问用户，你不要再自己问一遍；用户不允许就停，禁止换办法绕过去。按「看→做一步→核对」循环：一次只做一个动作，看工具结果里的【操作后】确认生效再做下一步；画面没变就换思路，不要原样重复点。keyboard_type / keyboard_key 之前先确认焦点在目标窗口（window_focus 或点一下输入框）。等界面加载用 screen_read（可带 wait_ms）重读；只有文字判断不了图标、布局时才用 screen_look。画线、画圆用 mouse_drag。开关关着时没有这些工具，不要假装能看见或能点击。
+${shellUseZh}；不要写 tmp_*.ps1 批量替换。不要先做编码探针（不要写 enc_*.txt 试编码），write_file 一律 UTF-8。项目地图给方法源码起止行（:起-止）：这是定位依据。归纳可能不准；map_lookup 已附【原文·可直接用】的方法直接用，没附的改前用 read_file 的 startLine/endLine 只读该段，禁止整文件通读几千/几万行。关联脚本是依赖路径，需要对口时同样按命中方法的起止行读段。消息里已有【全文】、或本轮已整读过同一路径的，直接复用。消息里的模块只是第一批，对不上先换关键字 map_lookup，仍不够再用 search_text。用户打开「AGI」后，最后一条消息末尾有【屏幕文字】：前台窗口、其他窗口、这个软件以前记下的操作经验、带编号的控件列表（如 [c12]，来自 Windows UI 自动化）、以及 OCR 文字和中心坐标 @(x,y)。有控件编号时优先用 ui_act 按编号操作（click / toggle / select / expand / set_text），目标没有控件编号时才用 mouse_click 点 @(x,y)。照着以前记下的经验做。打开软件和网页可以使用命令，也可以用键鼠（例如 Win+R 后输入地址），按任务选择可靠方式。任务做成后、或发现不明显的路径和坑时，调用 agi_note 记一句可复用的经验（不记密码、聊天内容等隐私）。删除、发送、付款、Shift+Delete、在聊天软件里按回车这类危险操作，程序会自动先问用户，你不要再自己问一遍；用户不允许就停，禁止换办法绕过去。按「看→做一步→核对」循环：一次只做一个动作，看工具结果里的【操作后】确认生效再做下一步；画面没变就换思路，不要原样重复点。keyboard_type / keyboard_key 之前先确认焦点在目标窗口（window_focus 或点一下输入框）。等界面加载用 screen_read（可带 wait_ms）重读；只有文字判断不了图标、布局时才用 screen_look。画线、画圆用 mouse_drag。开关关着时没有这些工具，不要假装能看见或能点击。
 同一轮里互不依赖的 read_file / list_dir / search_text / map_lookup 请一次发出多条 tool call，不要拆成多轮。不同文件的 write_file 也可以同一轮一起发，程序会同时写。同一个文件、删除、建目录、命令和 ask_user 必须等结果后再做。
 ${actRuleZh}
 不要编造未读过的文件内容。地图里没有的文案、数字、字段，必须先读到再写，不准猜。改完后用短列表说明改了哪些文件。
@@ -2064,7 +2049,7 @@ ${actRuleZh}
 
 ## 规则
 ${ruleText || '无额外规则'}
-${skillText}${logChainGatePrompt(enPrompt)}${planPrompt(enPrompt)}${handoff}${planLine}${houseStyle.promptBlockIfNeeded(enPrompt, userOrder)}${brainPressure.promptBlock(workspace, enPrompt, agiOn)}`;
+${COMMENT_POLICY}${skillText}${agiOn ? agiContract : logChainGatePrompt(enPrompt) + planPrompt(enPrompt)}${handoff}${planLine}${houseStyle.promptBlockIfNeeded(enPrompt, userOrder)}${brainPressure.promptBlock(workspace, enPrompt, agiOn)}`;
 }
 
 const MAX_VISION_IMAGES = 16;
@@ -2940,6 +2925,35 @@ function planFromMarkedText(text) {
   return body ? planFromText(body) : null;
 }
 
+/** 开工时找最近一份仍待执行的方案。方案后允许用户追问状态，但有新的改动要求就不能复用旧方案。 */
+function pendingPlanFromHistory(history) {
+  const items = Array.isArray(history) ? history : [];
+  let candidate = null;
+  let candidateIndex = -1;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const m = items[i];
+    if (!m || m.role !== 'assistant') continue;
+    const plan = planFromMarkedText(asText(m.content != null ? m.content : m.text));
+    if (!plan) continue;
+    candidate = plan;
+    candidateIndex = i;
+    break;
+  }
+  if (!candidate) return null;
+  for (let i = candidateIndex + 1; i < items.length; i++) {
+    const m = items[i];
+    if (!m) continue;
+    const text = asText(m.content != null ? m.content : m.text).trim();
+    if (m.role === 'assistant') {
+      if (/【程序记录的文件变更】|【方案逐条执行】|方案验收\s*[:：]\s*通过/.test(text)) return null;
+      continue;
+    }
+    if (m.role !== 'user' || userOrderedStart(text) || userAskedQuestion(text)) continue;
+    if (wantsChangeNow(text)) return null;
+  }
+  return candidate;
+}
+
 /** 简易索引：总结模型用不了时拿原话和回复开头拼 */
 function localDialogIndex(userText, assistantText) {
   const one = (t) => String(t || '').replace(/\s+/g, ' ').trim();
@@ -3024,6 +3038,8 @@ function removePlanItem({ workspace, tabId, no }) {
 
 /** 本轮改过、方案没点名、而且现在仍和改动前不一样的文件。程序不撤回，交给 AI 按方案改回去 */
 function offPlanFiles(workspace, snap) {
+  // AGI 依据任务自主选择关联文件，不套用普通模式旧方案的文件白名单。
+  if (desktopOn()) return [];
   const plan = snap && snap.plan;
   const current = snap && snap.current;
   if (!workspace || !plan || !plan.files.size || !current) return [];
@@ -3399,6 +3415,7 @@ async function completeOnceWithRetry(opts, mode) {
       await sleepMs(wait, opts.signal);
     }
   }
+  if (lastErr) lastErr.requestRetryExhausted = true;
   throw lastErr || new Error('模型没有返回内容');
 }
 
@@ -3501,6 +3518,7 @@ async function workerDirect({ modelCfg, messages, toolSpec, workspace, extra, sn
       turnText: last ? cursorDirect.textOf(last.content) : '',
       userContent: last ? last.content : '',
       tools: (toolSpec || []).map((t) => t.function).filter((f) => f && f.name && f.name !== 'call_worker'),
+      requiredToolNames: roleTag === 'code' ? ['edit_file', 'write_file', 'delete_file', 'create_dir'] : [],
       runTool,
       onEvent,
       signal
@@ -3537,7 +3555,6 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
     ui_act: '操作控件',
     agi_note: '记住操作经验',
     clipboard_look: '看剪贴板',
-    mouse_move: '移动虚拟光标',
     mouse_click: '点击',
     mouse_drag: '长按拖动',
     mouse_scroll: '滚动',
@@ -3738,7 +3755,7 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
         hasProgress
       });
       const canResume = (unlimited || round < SAFETY_MAX_ROUNDS - 1) && (unlimited || compact.thinkBudgetOpen({ thinkUsed: usedNow, thinkLimit, implementing }));
-      if (hasProgress && canResume && errorResume < 2) {
+      if (hasProgress && canResume && errorResume < 2 && isRetryableHttpError(e) && !e.requestRetryExhausted) {
         errorResume += 1;
         onEvent({ type: 'think', text: `调用出错，正在用已有结果继续：${e.message}` });
         onEvent({ type: 'status', text: '出错了，正在接上…' });
@@ -4007,7 +4024,7 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
             const out = await agentLoop({
               modelCfg: worker,
               messages: [
-                { role: 'system', content: codeSys },
+                { role: 'system', content: codeSys + COMMENT_POLICY },
                 { role: 'user', content: planHead + task }
               ],
               workspace,
@@ -4050,8 +4067,6 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
           diag.log('agent', '只读合同拦截写入', { name, roleTag, depth: depth || 0 });
         } else if (!agiBrain && !orderedStart && !orderedByText && (roleTag || 'brain') === 'brain' && !(depth || 0) && HAND_OFF_TOOLS.has(name)) {
           result = START_GATE_TEXT;
-        } else if (name === 'ask_user' && agiBrain) {
-          result = 'AGI 开着。用户只管验收，其他事情你自己做完。禁止用 ask_user 把活交回用户，不要等「开始」。';
         } else if (!agiBrain && workers && workers.code && HAND_OFF_TOOLS.has(name) && !(depth || 0)) {
           result = '大脑不能直接改文件。请改用 call_worker，role 填 code。task 要写全路径、方法与行号、现状、目标行为、不要改的范围。';
         } else {
@@ -4368,6 +4383,21 @@ function requirementText(userText, history) {
 }
 
 /** 验收前读改后代码：每个改动附近带行号摘出来，总结按这段判断会不会把项目跑挂 */
+function implementationStateKey(workspace, changes) {
+  if (!workspace) return null;
+  const hash = crypto.createHash('sha256');
+  try {
+    const paths = [...new Set((changes || []).map((c) => c.path).filter(Boolean))].sort();
+    for (const rel of paths) {
+      hash.update(rel + '\0');
+      const abs = path.resolve(workspace, rel);
+      hash.update(fs.existsSync(abs) ? fs.readFileSync(abs) : '<deleted>');
+      hash.update('\0');
+    }
+    return hash.digest('hex');
+  } catch { return null; }
+}
+
 function changedCodeText(workspace, snap, changes) {
   const parts = [];
   let budget = 14000;
@@ -4441,6 +4471,7 @@ async function summarizeImplementation({ vs, modelCfg, userText, assistantText, 
       ...(workspace && typecheck.isUnity(workspace)
         ? ['这是 Unity 工程。不要要求跑测试或进播放模式。']
         : []),
+      ...(desktopOn() ? ['【AGI 核对模式】以用户目标和实际代码为验收依据。旧方案仅供理解任务，不因未写入/未锁定方案、没有开始口令或改动必要的关联文件判为不通过；仍须核对目标落实情况和代码严重问题。'] : []),
       `【已确认方案】\n${snap && snap.plan && snap.plan.text ? snap.plan.text : '（没有锁定的方案文件）'}`,
       `【用户需求】\n${String(userText || '').slice(0, 4000)}`,
       `【代码差异】\n${diff || '（没有读到差异）'}`,
@@ -4473,7 +4504,7 @@ async function summarizeImplementation({ vs, modelCfg, userText, assistantText, 
   const out = await agentLoop({
     modelCfg: cfg,
     messages: [
-      { role: 'system', content: '你是总结模块，只核对、不改代码。可以用只读工具查代码。最后只输出核对结论。' },
+      { role: 'system', content: '你是总结模块，只核对、不改代码。可以用只读工具查代码。核对本次新增或修改的代码是否有清晰、准确的注释（方法用途、适用的参数/返回值、关键逻辑），缺失或过期时列为具体缺口回报大脑。最后只输出核对结论。' },
       { role: 'user', content: prompt }
     ],
     workspace,
@@ -4514,7 +4545,7 @@ async function runTurn({
   // 会话键：多会话各自一条插话队列，runTurn 不解析它的含义，只当字符串键用
   interjectKey
 }) {
-  // 一下命令就停住虚拟光标，这轮结束再跟着，避免写代码时置顶窗拖死系统鼠标
+  // 标记本轮桌面任务进行中，结束时释放画面坐标锁。
   try { require('./desktop-hand').hold(); } catch { /* 桌面手未就绪时忽略 */ }
   try { brainPressure.noteUser(workspace, userText); } catch { /* 压力没记上也不打断这轮 */ }
   try {
@@ -4583,12 +4614,12 @@ async function runTurn({
   const priorBlock = latestAssistantText(history);
   // 用户明确开工就是对上一条待确认方案的确认；把它落盘后走统一锁定与验收流程，
   // GPT 等模型无需再尝试点击 SpCode 界面里的「写入方案」按钮。
-  const approvedPlan = freshPlan || (turnStart ? planFromMarkedText(priorBlock) : null);
+  const approvedPlan = freshPlan || (turnStart ? (pendingPlanFromHistory(history) || planFromMarkedText(priorBlock)) : null);
   const planWasBlocked = /【方案无法通过】/.test(priorBlock);
   snap.planFile = planFileOf(workspace, interjectKey);
   let planLock = readPlanLock(snap.planFile);
   let relocked = false;
-  if (turnStart && snap.planFile) {
+  if (turnStart && snap.planFile && !desktopOn()) {
     if (approvedPlan) {
       writePlanText(snap.planFile, approvedPlan.text);
       planLock = lockPlanFile(snap.planFile);
@@ -4641,8 +4672,8 @@ async function runTurn({
       diag.log('agent', '方案树核对失败，按单文件方案走', { message: e && e.message });
     }
   }
-  const waived = planWasBlocked && userWaivesPlan(userText);
-  const stillBlocked = planWasBlocked && turnStart && !relocked;
+  const waived = !desktopOn() && planWasBlocked && userWaivesPlan(userText);
+  const stillBlocked = !desktopOn() && planWasBlocked && turnStart && !relocked;
   const noPlanFile = turnStart && !planLock && !!snap.planFile && !desktopOn();
   if (waived || stillBlocked || noPlanFile || planMismatch) {
     if (waived) {
@@ -5053,10 +5084,12 @@ async function runTurn({
     // 否则会对用户说「没有可用的文件写入工具」。其他 AI 请勿删除
     const directName = codexDirectOn ? 'Codex' : 'Cursor';
     const directHandsOff = !!codeWorker && !agiNow;
-    const directLine = !directOn ? '' : (directHandsOff
+    const directLine = !directOn ? '' : agiNow
+      ? `\n\n${directName} 直通已接通，当前为 AGI。直接使用 SpCode 工具完成用户目标，无需写入方案或等待开始，不派代码模块；实际工具结果是执行依据。\n`
+      : (directHandsOff
       ? (turnStart
         ? `\n\n${directName} 直通已接通。你是大脑，只负责理解需求、查资料、和用户确认方案；用户已经确认开始，立刻调用 SpCode 的 call_worker，role 填 code，把完整实现任务派给代码槽。禁止自己写文件或执行命令。总结模块只在代码完成后核对，不和用户对话。\n`
-        : `\n\n${directName} 直通已接通。你是唯一和用户对接的大脑。可以用 SpCode 只读工具查资料；需要改代码时先输出完整【方案】…【/方案】，等用户点「写入方案」或明确回复「开始」。禁止自己写文件或执行命令。收到开始后调用 call_worker，role 填 code；总结模块只在代码完成后核对，不和用户对话。\n`)
+        : `\n\n${directName} 直通已接通。你是唯一和用户对接的大脑。可以用 SpCode 只读工具查资料；需要改代码时先输出完整【方案】…【/方案】，等用户点「写入方案」或明确回复「开始」。${planningWorker ? '需要拆解执行步骤时，可后台调用 call_worker，role 填 planning；规划结果只回给你，由你负责和用户对接。' : ''}禁止自己写文件或执行命令。收到开始后调用 call_worker，role 填 code；总结模块只在代码完成后核对，不和用户对话。\n`)
       : (turnStart
         ? `\n\n${directName} 直通已接通。工具由 SpCode 提供，你自己调用 read_file、edit_file、write_file、search_text、map_lookup、list_dir、run_command。禁止说 Tool not found 或工具列表是空的。用户这轮已经说了开始，照锁定的方案文件立刻改文件，不要再复述方案。\n`
         : `\n\n${directName} 直通已接通。工具由 SpCode 提供。可以 read_file、search_text、map_lookup、list_dir。还没说开始时不要改项目文件，把完整方案写在回复的【方案】…【/方案】段里；用户可以点「写入方案」，也可以明确回复「开始」确认并锁定最新方案。禁止说 Tool not found 或工具列表是空的。\n`));
@@ -5082,8 +5115,8 @@ async function runTurn({
         contextSummary: summaryText,
         dialogIndex: dialogIndexText,
         zbaingBridge: isZbaingAi(modelCfg),
-        brainHandsOff: !!codeWorker && (!directOn || (!agiNow && !desktopOn())),
-        hasPlanning: !!planningWorker && !directOn,
+        brainHandsOff: !!codeWorker && !agiNow,
+        hasPlanning: !!planningWorker,
         userOrder: userText,
         // 全解放（用户点开「全解放」）与 AGI 模式都不给模型任何轮次上限；
         // 只按 AGI 判断会让全解放时提示词仍写着「思考上限 N 轮」，模型就自以为有轮次限制
@@ -5115,6 +5148,7 @@ async function runTurn({
     onEvent(ev);
   };
   let directWrites = !!turnStart || !!(snap && snap.askStarted);
+  let directPlanningDone = false;
   const directLabels = {
     list_dir: '查看目录', read_file: '读取文件', write_file: '写入文件', edit_file: '修改文件',
     create_dir: '创建文件夹', delete_file: '删除文件', search_text: '搜索代码', map_lookup: '查项目地图', dialog_lookup: '查对话索引',
@@ -5137,7 +5171,7 @@ async function runTurn({
     let result = '';
     try {
       if (snap && snap.readOnly && (wantsChangeNow(userText) || directWrites)) snap.readOnly = false;
-      if (!directWrites && HAND_OFF_TOOLS.has(name)) {
+      if (!desktopOn() && !directWrites && HAND_OFF_TOOLS.has(name)) {
         result = START_GATE_TEXT;
       } else if (snap && snap.readOnly && MUTATE_FILE_TOOLS.has(name)) {
         result = '当前是只读审查：禁止改文件。只报告问题；要改请明确说「开始改 / 修好」，或走复述后的「开始」。';
@@ -5166,11 +5200,11 @@ async function runTurn({
         diag.log('agent', '直通工具失败', { name, message: e && e.message });
       }
     }
-    diag.log('agent', 'Cursor 直通工具完成', { name, 耗时毫秒: Date.now() - startedAt, 结果字符数: String(result || '').length });
+    diag.log('agent', '直通工具完成', { provider: directProtocol, name, 耗时毫秒: Date.now() - startedAt, 结果字符数: String(result || '').length });
     onEvent({ type: 'tool', name, status: 'done', detail, text: `完成：${label}${detail ? ` ${detail}` : ''}` });
     return result;
   }
-  // 直通不走规划/部下。验收退回时同一会话接着改，总结仍在这轮外面跑
+  // 直通使用模型原生 MCP 会话；规划只在后台调用，方案与总结验收仍由本轮外层流程处理
   async function runBrain(loopMessages, startOrdered) {
     if (startOrdered) directWrites = true;
     if (!directOn) {
@@ -5213,10 +5247,12 @@ async function runTurn({
     }).filter(Boolean).join('\n\n');
     const last = lastUser >= 0 ? list[lastUser] : null;
     const direct = codexDirectOn ? codexDirect : cursorDirect;
-    const directTurnLine = codeWorker && !desktopOn()
+    const directTurnLine = desktopOn()
+      ? `【本轮 AGI 状态】直接完成用户目标，无需等待开始或锁定方案。${snap.readOnly ? '用户本轮要求只读，按该范围完成检查。' : 'SpCode 写文件和命令工具已开放，按任务需要实际执行并核对结果。'}`
+      : codeWorker
       ? (startOrdered
         ? '【本轮开工状态】用户这轮已经明确回复开始。按已锁定方案立即调用 SpCode 的 call_worker，role=code；不要再说用户没开始，不要要求写入方案，不要自己改文件。'
-        : '【本轮开工状态】用户这轮尚未确认开始。只能读取资料并给出【方案】；不要改文件或派代码。方案写完后由 SpCode 显示写入方案和开始按钮，不要说这些按钮或工具不可用。')
+        : `【本轮开工状态】用户这轮尚未确认开始。可以正常聊天、回答问题、读取资料和完善方案；只有涉及待实施的代码修改才需要给出【方案】。${planningWorker ? '需要拆解时可后台调用 call_worker，role=planning。' : ''}不要改项目文件或派代码。方案写完后由 SpCode 显示写入方案和开始按钮，不要说这些按钮或工具不可用。`)
       : (startOrdered
         ? '【本轮开工状态】用户这轮已经明确回复开始。立即按已锁定方案执行，不要再次要求确认。'
         : '【本轮开工状态】用户这轮尚未确认开始。按系统开工门槛处理。');
@@ -5234,36 +5270,72 @@ async function runTurn({
     }
     // 带图片的用户消息无法直接追加 OCR 文本，applyToMessages 会把它放进 system。
     // 必须在读屏后重新取 system，否则图片轮次会漏掉新屏幕内容。
-    const directSystem = list.filter((m) => m && m.role === 'system').map((m) => cursorDirect.textOf(m.content)).join('\n\n');
-  const directTools = toolsFor('brain').map((t) => t.function).filter((f) => {
-    if (!f || !f.name) return false;
-    if (!codeWorker || desktopOn()) return f.name !== 'call_worker';
-    if (MUTATE_FILE_TOOLS.has(f.name) || f.name === 'run_command') return false;
-    if (f.name === 'call_worker') return !!turnStart;
-    return true;
-  });
-  if (codeWorker && !desktopOn() && turnStart && !directTools.some((f) => f.name === 'call_worker')) {
-    directTools.push(callWorkerTool(['code']).function);
-  }
+    const directConversation = desktopOn()
+      ? '\n【AGI 对话与收尾】由你理解目标、实施和核对，语气自然。不要套用普通模式的写方案、等开始、派代码要求。实施类任务需完成实际改动并核对目标效果后再收尾；只读状态查询成功不是实施完成。失败时自行定位原因和调整步骤，无法完成时给出真实阻塞及已完成进度。\n'
+      : `\n【直通大脑的对话方式】
+你负责和用户沟通，代码负责实现，总结负责核对。开工门槛限制项目修改，不限制正常交流或完善回复里的方案。
+结合当前任务理解简短追问，语气自然，按问题需要给足解释，避免每轮重复固定称呼、流程说明和“尚未改文件”。普通聊天或知识问答直接回答，不强行生成方案、索要开始。
+用户已明确要求把某项内容补入方案时，本轮直接合并进完整的【方案】…【/方案】，保留原有仍有效的条目，不要只解释还没补、让用户再催一遍。问“方案写了吗”时，先根据真实状态回答；若先前已要求补充而你漏做，应在同一回复补齐。没有先前授权的纯状态询问不要擅自扩大工作范围。
+若当前只拿到历史标题或被截断的方案，用 dialog_lookup 取回相关轮次再合并；不靠猜测声称已保留所有条目。区分回复中的方案草稿、程序已写入的方案和工具实际改动的文件，只有对应的状态或工具结果能证明完成。方案补充不等于获准改项目文件。
+用户已经开始时沿用本轮开工状态，不重复要求确认。只有确实存在影响目标或范围的歧义才提问，明确的后续要求直接接着处理。\n`;
+    const directSystem = list.filter((m) => m && m.role === 'system').map((m) => cursorDirect.textOf(m.content)).join('\n\n') + directConversation;
+    const directCanDispatch = !!(turnStart || startOrdered || (snap && snap.askStarted));
+    const directWorkerRoles = [];
+    if (planningWorker && !desktopOn()) directWorkerRoles.push('planning');
+    if (codeWorker && !desktopOn() && directCanDispatch) directWorkerRoles.push('code');
+    const directTools = toolsFor('brain', directWorkerRoles, directWorkerRoles.length > 0).map((t) => t.function).filter((f) => {
+      if (!f || !f.name) return false;
+      if (desktopOn()) return f.name !== 'call_worker';
+      if (codeWorker && (MUTATE_FILE_TOOLS.has(f.name) || f.name === 'run_command')) return false;
+      if (f.name === 'call_worker') return directWorkerRoles.length > 0;
+      return true;
+    });
     const out = await direct.runTurn({
       key: interjectKey || `${directProtocol}:${workspace || 'none'}`,
       // Cursor 在建 Agent 时注册 customTools，Codex SDK 也会缓存 MCP 工具发现结果。
       // 把工具清单纳入签名，AGI 开关改变后重建直通会话，避免继续使用旧工具集。
-      sig: [modelCfg.model || '', modelCfg.apiKey || '', workspace || '', (skill && skill.id) || '', startOrdered ? 'start' : 'plan', directTools.map((f) => f.name).join(',')].join('\n'),
+      sig: [modelCfg.model || '', modelCfg.apiKey || '', workspace || '', (skill && skill.id) || '', startOrdered ? 'start' : 'plan', JSON.stringify(directTools)].join('\n'),
       fresh: false,
       modelCfg,
       workspace: undefined,
-      firstPrefix: [directSystem, priorText].filter(Boolean).join('\n\n'),
+      firstPrefix: priorText,
+      agiMode: desktopOn(),
+      systemContext: directSystem,
       turnText: `${directTurnLine}\n\n${last ? cursorDirect.textOf(last.content) : String(userText || '')}`,
       userContent: last ? last.content : userText,
       tools: directTools,
+      requiredToolNames: directCanDispatch
+        ? (codeWorker && !desktopOn()
+          ? ['call_worker']
+          : [...MUTATE_FILE_TOOLS, 'run_command', 'ui_act', 'mouse_click', 'keyboard_type', 'keyboard_key'])
+        : [],
       runTool: async (name, args) => {
         if (name !== 'call_worker') return directRunTool(name, args);
-        if (!turnStart || !directWrites) return '用户还没有确认开始，当前不能派代码。';
-        if (!codeWorker || desktopOn()) return '当前没有可用的代码槽。';
         const role = String(args?.role || 'code');
         const task = String(args?.task || '').trim();
-        if (role !== 'code') return '直通模式只允许大脑把已确认的实现任务派给代码槽。';
+        if (role === 'planning') {
+          if (!planningWorker || desktopOn()) return '当前没有可用的规划模块。';
+          if (!planningTaskReady(task)) return '规划任务还不完整；请先写清你理解后的目标、范围、约束和验收。';
+          const pName = planningWorker.model || planningWorker.name || '规划';
+          onEvent({ type: 'status', text: `正在规划 · ${pName}`, activeModel: pName, activeRole: 'planning' });
+          const planned = await completeWithFallback({
+            modelCfg: planningWorker,
+            messages: [
+              { role: 'system', content: '你是规划模块。只给大脑整理执行步骤、顺序和风险；不要和用户对话，不要读写项目文件，不要调用工具。材料不足时只向大脑指出具体缺口。' },
+              { role: 'user', content: task }
+            ],
+            noTools: true,
+            signal,
+            onDelta: () => {},
+            onWait: (sec) => onEvent({ type: 'status', text: `规划模块处理中 · ${sec}`, activeModel: pName, activeRole: 'planning' })
+          });
+          directPlanningDone = true;
+          return `${String(planned?.content || '').trim().slice(0, 6000) || '规划模块没有返回步骤。'}\n\n【交给大脑判断】这是内部规划结果，不要把模块身份转述给用户；请由大脑组织并核对最终方案。`;
+        }
+        if (!directCanDispatch || !directWrites) return '用户还没有确认开始，当前不能派代码。';
+        if (role !== 'code') return '直通模式只允许把规划交给 planning、把实现交给 code。';
+        if (!codeWorker || desktopOn()) return '当前没有可用的代码槽。';
+        if (wantPlanning && !directPlanningDone && !startOrdered) return '还没完成内部规划。请先调用 call_worker，role=planning；收到结果后由大脑整理方案。';
         if (!workerTaskReady(task)) return '派单信息不足；请先明确文件路径和改动目标，再派给代码槽。';
         const planHead = snap.plan?.text ? `【已确认方案·必须照做】\n${snap.plan.text}\n\n【本次派单】\n` : '';
         const unityCode = workspace && typecheck.isUnity(workspace)
@@ -5280,7 +5352,7 @@ async function runTurn({
         };
         onEvent({ type: 'status', text: `正在调用 ${codeWorker.model || codeWorker.name || '代码模型'}（代码 · 实现）…`, activeModel: codeWorker.model || codeWorker.name || '', activeRole: 'code' });
         const workerMessages = [
-          { role: 'system', content: codeSys },
+          { role: 'system', content: codeSys + COMMENT_POLICY },
           { role: 'user', content: planHead + task }
         ];
         const workerProtocol = apiProtocol.normalizeProtocol(codeWorker.protocol);
@@ -5383,7 +5455,7 @@ async function runTurn({
       try {
         await agentLoop({
           modelCfg: worker,
-          messages: [{ role: 'system', content: sys }, { role: 'user', content: planItemTask(it, total, feedback) }],
+          messages: [{ role: 'system', content: sys + COMMENT_POLICY }, { role: 'user', content: planItemTask(it, total, feedback) }],
           workspace, extra, snap, onEvent: trackEvent, signal, lang, workingMemoryRef, waitForUserAnswer,
           maxRounds: roundLimit, unlimitedRounds: !!unlimitedRounds,
           toolSpec: toolsFor('worker'), workers: null, roleTag: 'code', depth: 1, interjectKey
@@ -5498,7 +5570,7 @@ async function runTurn({
   if (planItemsAllPass) snap.planAccepted = true;
   if (!planItemsAllPass && codeChanges.length && !signal?.aborted) {
     // 方案验收：对不上就把「不一致：」原样派回代码。核实对不齐，或同一条回改后仍是原文，才停下来问用户
-    const MAX_PLAN_RETRY = 5;
+    const MAX_PLAN_RETRY = 3;
     let verdict = '';
     const seenStall = new Set();
     for (let attempt = 1; ; attempt += 1) {
@@ -5537,6 +5609,7 @@ async function runTurn({
       snap.planGaps = judged.gaps.join('\n');
       onEvent({ type: 'status', text: `方案验收未通过，正在把不一致点派回代码（第 ${attempt} 次）…` });
       messages.push({ role: 'user', content: planRetryPrompt(workspace, snap, codeChanges, verdict) });
+      const beforeRetry = implementationStateKey(workspace, codeChanges);
       finalText = await runBrain(messages, true);
       changes = snap.current?.manifest?.changes || [];
       codeChanges = changes.filter((c) => !/^generated\//i.test(String(c.path || '').replace(/\\/g, '/')));
@@ -5545,11 +5618,16 @@ async function runTurn({
         snapshot.captureAfter(workspace, snap.current);
         onEvent({ type: 'files', snapshotId: snap.current.id, changes });
       }
+      if (beforeRetry && beforeRetry === implementationStateKey(workspace, codeChanges)) {
+        snap.planUnverified = true;
+        snap.autoRetryStop = '【自动回改已停止】本次回改没有产生新的代码变化，已停止重复请求；保留方案和进度，可补充信息后继续。';
+        break;
+      }
     }
   }
-  // 问「修复了吗」却没验收通过：不许停。方案已经核实对不齐时，允许停，不再进这圈
+  // 追问后的自动收尾有次数上限；没有新改动时立即停，避免反复请求同一份代码。
   if (asksIfFixed(userText) && !snap.planAccepted && !snap.planBlocked && !snap.planUnverified && !signal?.aborted) {
-    const MAX_FINISH = 8;
+    const MAX_FINISH = 2;
     for (let n = 1; n <= MAX_FINISH && !snap.planAccepted && !signal?.aborted; n += 1) {
       onEvent({ type: 'status', text: `验收还没通过，不能停，正在继续改（第 ${n} 次）…` });
       snap.askStarted = true;
@@ -5563,6 +5641,7 @@ async function runTurn({
           `【刚才读到的情况】\n${String(finalText || '').slice(0, 2500)}`
         ].join('\n\n')
       });
+      const beforeFinish = implementationStateKey(workspace, codeChanges);
       finalText = await runBrain(messages, true);
       changes = snap.current?.manifest?.changes || [];
       if (snap.current && changes.length) {
@@ -5570,6 +5649,11 @@ async function runTurn({
         onEvent({ type: 'files', snapshotId: snap.current.id, changes });
       }
       codeChanges = changes.filter((c) => !/^generated\//i.test(String(c.path || '').replace(/\\/g, '/')));
+      if (beforeFinish && beforeFinish === implementationStateKey(workspace, codeChanges)) {
+        snap.planUnverified = true;
+        snap.autoRetryStop = '【自动继续已停止】本次继续没有产生新的代码变化，已停止重复请求；任务尚未验收通过。';
+        break;
+      }
       if (!codeChanges.length) continue;
       let verdict = '';
       try {
@@ -5624,7 +5708,8 @@ async function runTurn({
     }
     emitPlanTree();
   }
-  if (snap.planAccepted && planLock) retirePlanFile(snap.planFile);
+  if (snap.planAccepted && planLock && !desktopOn()) retirePlanFile(snap.planFile);
+  if (snap.autoRetryStop) finalText = [finalText, snap.autoRetryStop].filter(Boolean).join('\n\n');
   finalText = String(finalText || '')
     .split(/\r?\n/)
     .filter((line) => !/brain_pressure|train_pressure|压力\s*\d+\s*\/\s*100|压力满了|压力已经满|压力到顶|压力爆了/.test(line))
@@ -5667,11 +5752,11 @@ async function runTurn({
   });
 
   // 只在用户明确表达偏好或习惯时提炼画像；普通对话不额外请求模型。
-  const profileSignal = /(?:我(?:更|比较|通常|一直)?(?:喜欢|偏好|习惯|倾向于|希望)|我的(?:偏好|习惯|语言|技术水平)|我不喜欢|以后(?:请|都|尽量|用|不要|别)|从今(?:以后)?|请(?:始终|以后|默认|尽量|用)|(?:不要|别)(?:再)?给我|总是|\b(?:i prefer|my preference|i usually|i always|from now on|please use|please avoid|don't use|do not use)\b)/i.test(String(userText || ''));
+  const profileSignal = /(?:我(?:更|比较|通常|一直)?(?:喜欢|偏好|习惯|倾向于)|我的(?:偏好|习惯|语言|技术水平)|我不喜欢|以后(?:请|都|尽量|用|不要|别)|从今以后|请(?:始终|以后|默认)|\b(?:i prefer|my preference|i usually|i always|from now on)\b)/i.test(String(userText || ''));
   if (!changes.length && !explicitPreferenceSaved && profileSignal && !isZbaingAi(modelCfg) && !signal?.aborted) {
     completeWithFallback({
-      modelCfg,
-      messages: [{ role: 'user', content: memoryGlobal.profileExtractPrompt(userText, finalText) }],
+      modelCfg: compact.pickSummaryCfg(vs, modelCfg),
+      messages: [{ role: 'user', content: memoryGlobal.profileExtractPrompt(String(userText || '').slice(0, 1600), String(finalText || '').slice(0, 800)) }],
       noTools: true,
       signal,
       onDelta: () => {},

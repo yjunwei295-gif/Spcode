@@ -186,6 +186,7 @@
                   <button class="pill ghost" id="btn-model"><span data-i18n="model">模型</span></button>
                   <div class="menu-drop up" id="model-menu"></div>
                 </div>
+                <button type="button" class="pill ghost" id="btn-context-map" style="display: inline-flex" aria-label="上下文">上下文</button>
                 <div class="left">
                   <div class="select-wrap">
                     <button class="pill" id="btn-agent">∞ Agent</button>
@@ -195,11 +196,13 @@
                     <input id="input-rounds" type="number" min="1" max="64" value="16" />
                   </label>
                   <button type="button" class="pill ghost" id="btn-unlimited" data-i18n="unlimitedRounds" data-i18n-title="unlimitedRoundsTitle" title="打开后不再受轮数限制，直到模型自己收尾或你点停止" aria-pressed="false">全解放</button>
-                  <button type="button" class="pill ghost" id="btn-alive" data-i18n="desktopAlive" data-i18n-title="desktopAliveTitle" title="AGI（测试版）：打开后出现虚拟光标，没任务时慢一点跟着你的鼠标；下命令后它自己操作屏幕" aria-pressed="false">AGI</button>
+                  <button type="button" class="pill ghost" id="btn-alive" data-i18n="desktopAlive" data-i18n-title="desktopAliveTitle" title="AGI（测试版）：下命令后自动查看屏幕，使用系统鼠标点击、拖动并输入文字" aria-pressed="false">AGI</button>
                   <button type="button" class="pill ghost" id="btn-cursor-direct" data-i18n="cursorDirect" data-i18n-title="cursorDirectTitle" title="大脑、总结、代码、规划有一个用 Cursor 或 Codex 模型时自动打开，都不用时关闭，不能手动切换" aria-pressed="false" disabled>AI 直通</button>
                   <button id="btn-floatbar" class="pill ghost" data-i18n="floatBarToggle" data-i18n-title="floatBarToggleTitle" aria-pressed="true">小窗</button>
                 </div>
                 <div class="right">
+                  <button type="button" class="pill ghost" id="btn-guide" data-act="guide">使用手册</button>
+                  <button type="button" class="pill ghost" id="btn-local-deployment-guide">本地部署指南</button>
                   <button class="icon-btn" id="btn-attach" data-i18n-title="attach" title="上传或 Ctrl+V 粘贴图片、文件、视频、文档">🖇</button>
                   <button class="pill ghost" id="btn-enqueue" data-i18n="enqueue" data-i18n-title="enqueueTitle" title="把当前输入加入待发队列">排队</button>
                   <button class="send" id="btn-send" data-i18n="send">发送</button>

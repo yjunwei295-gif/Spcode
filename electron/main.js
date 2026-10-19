@@ -1307,6 +1307,12 @@ ipcMain.handle('index:getMap', (e) => {
   return codeIndex.getMap ? codeIndex.getMap(ws) : null;
 });
 
+// 用户展开单个地图条目时才取源码；这里只读本地文件，不触发模型调用。
+ipcMain.handle('index:sourceItem', (e, request) => {
+  const ws = workspaceByWin.get(getWin(e)) || '';
+  return codeIndex.sourceItem(ws, [], request || {});
+});
+
 ipcMain.handle('index:getExcludes', (e) => {
   const ws = workspaceByWin.get(getWin(e)) || '';
   return codeIndex.getExcludes ? codeIndex.getExcludes(ws) : [];
@@ -1327,15 +1333,7 @@ ipcMain.handle('index:setInclude', (e, obj) => {
   const ws = workspaceByWin.get(getWin(e)) || '';
   if (!codeIndex.setInclude) return { initialized: false, includes: [] };
   const saved = codeIndex.setInclude(ws, obj);
-  // 保存白名单后后台归纳勾选模块的方法（名字+关键值+说明），不阻塞界面
-  if (ws && saved.includes.length && codeIndex.summarizeIncludes) {
-    const s = store.load();
-    const modelCfg = store.resolveModelCfg(s.currentModelId, s);
-    if (modelCfg) {
-      codeIndex.summarizeIncludes(ws, saved.includes, modelCfg)
-        .catch((err) => diag.log('map', '方法归纳失败', { message: err && err.message }));
-    }
-  }
+  // 筛选只保存显示范围，不能隐式触发付费归纳。
   return saved;
 });
 
@@ -1343,7 +1341,8 @@ ipcMain.handle('index:summarizeOne', (e, id) => {
   const ws = workspaceByWin.get(getWin(e)) || '';
   if (!ws || !codeIndex.summarizeOne) return Promise.resolve({ ok: false, reason: 'no-map' });
   const s = store.load();
-  const modelCfg = store.resolveModelCfg(s.currentModelId, s);
+  const summary = assembly.resolveRole(s, 'summary');
+  const modelCfg = (summary?.slot && assembly.slotToModelCfg(summary.slot, s)) || store.resolveModelCfg(s.currentModelId, s);
   if (!modelCfg) return Promise.resolve({ ok: false, reason: 'no-model' });
   return codeIndex.summarizeOne(ws, id, modelCfg);
 });
@@ -1354,11 +1353,14 @@ ipcMain.handle('index:summarize', (e) => {
   const inc = codeIndex.getInclude(ws);
   if (!inc || !inc.initialized || !inc.includes || !inc.includes.length) return { ok: false, reason: 'no-include' };
   const s = store.load();
-  const modelCfg = store.resolveModelCfg(s.currentModelId, s);
+  const summary = assembly.resolveRole(s, 'summary');
+  const modelCfg = (summary?.slot && assembly.slotToModelCfg(summary.slot, s)) || store.resolveModelCfg(s.currentModelId, s);
   if (!modelCfg) return { ok: false, reason: 'no-model' };
-  codeIndex.summarizeIncludes(ws, inc.includes, modelCfg)
-    .catch((err) => diag.log('map', '方法归纳失败', { message: err && err.message }));
-  return { ok: true };
+  return codeIndex.summarizeIncludes(ws, inc.includes, modelCfg)
+    .catch((err) => {
+      diag.log('map', '方法归纳失败', { message: err && err.message });
+      return { ok: false, reason: 'fail' };
+    });
 });
 
 ipcMain.handle('index:sync', (e, extraFolders) => {

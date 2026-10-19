@@ -11,7 +11,7 @@
 // 「筛选」面板用白名单方式勾选要显示的模块。
 // 绘制遮罩：布局计算 / 首次空地图期间，整界面盖一层全屏「正在生成项目地图…」遮罩，完成才展示，避免看到半成品。
 // 白名单规则：只有勾选（include）的模块才会显示在地图；首次进入未勾选任何模块时自动弹出筛选面板，
-//  勾选并应用后持久化并自动对该模块做 AI 方法归纳，后续进入只显示并只归纳勾选的模块。
+//  勾选并应用后只保存显示范围；点开节点详情时按需归纳，同一版本复用缓存。
 // 老用户已有的 excludes（黑名单）会在首次读取时自动迁移成 includes。
 (function () {
   const api = window.simple;
@@ -23,12 +23,10 @@
   function el(tag, props, children) {
     const n = document.createElement(tag);
     if (props) Object.assign(n, props);
+    if (tag === 'button') n.classList.add('map-button');
     if (children) (Array.isArray(children) ? children : [children]).forEach((c) =>
       n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
     return n;
-  }
-  function cssVar(name) {
-    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   }
 
   // 白名单过滤：只保留 include.includes 集合里的节点；未初始化(initialized=false)时返回空地图（需先勾选）
@@ -46,12 +44,12 @@
   function buildFilterPanel(map, include, onApply) {
     const panel = el('div', { className: 'map-filter' });
     panel.style.cssText =
-      'position:absolute;top:0;right:0;width:320px;height:100%;background:var(--panel);' +
-      'border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:3;box-shadow:-4px 0 12px rgba(0,0,0,0.12);';
+      'position:absolute;top:0;right:0;width:320px;height:100%;background:var(--panel-solid);' +
+      'border-left:1px solid var(--border);display:flex;flex-direction:column;z-index:3;box-shadow:var(--shadow);';
 
     const hint = el('div');
     hint.style.cssText = 'padding:8px 10px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);line-height:1.5;';
-    hint.textContent = '白名单：勾选的模块才会显示在地图，未勾选的不显示。「应用显示」后持久化并自动归纳方法。';
+    hint.textContent = '勾选的模块才会显示在地图。扫描、分段和查看结构均在本地完成，不调用模型；只有点击「更新 AI 摘要」或节点里的摘要按钮才会使用模型。';
     panel.appendChild(hint);
 
     // 计算每个节点的入度（被多少边指向），入度为 0 即疑似孤立/未引用
@@ -96,7 +94,7 @@
     let mode = 'all';
     const modes = [['all', '全部'], ['ref', '已引用'], ['unref', '未引用']];
     const modeBox = el('div');
-    modeBox.style.cssText = 'display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;';
+    modeBox.style.cssText = 'display:flex;border:1px solid var(--border);border-radius:var(--sub-r);overflow:hidden;';
     const modeBtns = modes.map(([id, label]) => {
       const b = el('button', { textContent: label });
       b.onclick = () => { mode = id; paintModes(); renderList(); };
@@ -107,7 +105,7 @@
       for (const [id, b] of modeBtns) {
         const on = id === mode;
         b.style.cssText = 'border:0;padding:3px 8px;cursor:pointer;font-size:12px;'
-          + (on ? 'background:var(--accent);color:var(--accent-fg);' : 'background:var(--hover);color:inherit;');
+          + (on ? 'background:var(--primary-bg);color:var(--primary-fg);' : 'background:var(--map-button-bg,var(--btn-bg));color:inherit;');
       }
     }
     paintModes();
@@ -115,15 +113,15 @@
     const visible = (n) => mode === 'all' || (mode === 'ref' ? !!inDeg[n.id] : !inDeg[n.id]);
 
     const selAll = el('button', { textContent: '全选' });
-    selAll.style.cssText = 'border:1px solid var(--border);background:var(--hover);border-radius:6px;padding:3px 8px;cursor:pointer;font-size:12px;';
+    selAll.style.cssText = 'border:1px solid var(--border);background:var(--map-button-bg,var(--btn-bg));border-radius:var(--sub-r);padding:3px 8px;cursor:pointer;font-size:12px;';
     bar.appendChild(selAll);
 
     const clearAll = el('button', { textContent: '清空' });
-    clearAll.style.cssText = 'border:1px solid var(--border);background:var(--hover);border-radius:6px;padding:3px 8px;cursor:pointer;font-size:12px;';
+    clearAll.style.cssText = 'border:1px solid var(--border);background:var(--map-button-bg,var(--btn-bg));border-radius:var(--sub-r);padding:3px 8px;cursor:pointer;font-size:12px;';
     bar.appendChild(clearAll);
 
     const applyBtn = el('button', { textContent: '应用显示' });
-    applyBtn.style.cssText = 'margin-left:auto;border:1px solid var(--border);background:var(--accent);color:var(--accent-fg);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:12px;';
+    applyBtn.style.cssText = 'margin-left:auto;border:1px solid var(--border);background:var(--primary-bg);color:var(--primary-fg);border-radius:var(--sub-r);padding:3px 10px;cursor:pointer;font-size:12px;';
     bar.appendChild(applyBtn);
 
     panel.appendChild(bar);
@@ -215,15 +213,15 @@
     let include = { initialized: false, includes: [] };
     try { include = await api.indexGetInclude() || include; } catch (_) {}
     showCanvas(map, include);
-    try { if (api.indexSummarize) api.indexSummarize().catch(() => {}); } catch (_) {}
+    // 打开地图只读缓存；查看具体节点时才按需归纳。
   }
 
   function showCanvas(map, include) {
     let modal = document.getElementById('map-modal');
     if (!modal) {
-      modal = el('div', { id: 'map-modal', className: 'hidden' });
+      modal = el('div', { id: 'map-modal', className: 'hidden map-modal' });
       modal.style.cssText =
-        'position:fixed;inset:0;z-index:90;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;';
+        'position:fixed;inset:0;z-index:90;background:var(--overlay);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;';
       document.body.appendChild(modal);
     }
     modal.classList.remove('hidden');
@@ -231,8 +229,8 @@
 
     const card = el('div', { className: 'map-card' });
     card.style.cssText =
-      'position:relative;width:min(94vw,1120px);height:min(88vh,840px);background:var(--panel);border:1px solid var(--border);' +
-      'border-radius:14px;display:flex;flex-direction:column;overflow:hidden;box-shadow:var(--shadow);';
+      'position:relative;width:min(94vw,1120px);height:min(88vh,840px);background:var(--panel-solid);border:1px solid var(--border);' +
+      'border-radius:var(--sub-r-lg);display:flex;flex-direction:column;overflow:hidden;box-shadow:var(--shadow);';
 
     const head = el('div', { className: 'map-head' });
     head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);';
@@ -243,10 +241,26 @@
     close.style.cssText = 'border:0;background:none;font-size:20px;cursor:pointer;color:var(--muted);';
 
     const filterBtn = el('button', { textContent: '筛选' });
-    filterBtn.style.cssText = 'margin-right:10px;border:1px solid var(--border);background:var(--hover);border-radius:8px;padding:4px 12px;cursor:pointer;font-size:12px;';
+    filterBtn.style.cssText = 'margin-right:10px;border:1px solid var(--border);background:var(--map-button-bg,var(--btn-bg));border-radius:var(--sub-r);padding:4px 12px;cursor:pointer;font-size:12px;';
 
     const headRight = el('div');
     headRight.style.cssText = 'display:flex;align-items:center;';
+    const summaryBtn = el('button', { textContent: '更新 AI 摘要' });
+    summaryBtn.style.cssText = filterBtn.style.cssText;
+    summaryBtn.title = '可选，会消耗模型额度：为所选文件补充作用说明；结构分段已在本地完成，未变化的摘要复用缓存。';
+    summaryBtn.onclick = async () => {
+      summaryBtn.disabled = true;
+      try {
+        const result = await api.indexSummarize();
+        title.textContent = result?.ok ? '项目地图 · 摘要已更新'
+          : result?.reason === 'no-include' ? '项目地图 · 请先在筛选中勾选需要归纳的模块'
+          : '项目地图 · 摘要未全部完成，请重试或查看模型配置';
+        refreshMethodsFromDisk();
+      } catch (e) {
+        title.textContent = '项目地图 · 摘要更新失败：' + (e?.message || e);
+      } finally { summaryBtn.disabled = false; }
+    };
+    headRight.appendChild(summaryBtn);
     headRight.appendChild(filterBtn);
     headRight.appendChild(close);
 
@@ -301,8 +315,8 @@
       if (!kinds.size) return;
       legend = el('div', { className: 'map-legend' });
       legend.style.cssText =
-        'position:absolute;right:12px;bottom:12px;z-index:5;background:var(--panel);' +
-        'border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow);' +
+        'position:absolute;right:12px;bottom:12px;z-index:5;background:var(--panel-solid);' +
+        'border:1px solid var(--border);border-radius:var(--sub-r);box-shadow:var(--shadow);' +
         'padding:8px 10px;font-size:11px;line-height:1.7;pointer-events:none;';
       const t = el('div');
       t.style.cssText = 'font-weight:600;margin-bottom:4px;';
@@ -336,16 +350,16 @@
       renderLegend(m);
     }
 
-    // 点击节点后弹出的归纳漂浮窗（方法名 + 作用 + 关键值）
-    const explainTried = new Set();
+    // 节点默认只展示本地结构；语义摘要必须由用户明确点击。
     const explainingIds = new Set();
     function hasStoredExplain(n) {
       return !!(n && n.methodsMtime != null && n.methodsMtime === n.mtime && Array.isArray(n.methods));
     }
     function kickExplain(node) {
-      if (!node || !node.id || explainTried.has(node.id) || hasStoredExplain(node)) return;
-      explainTried.add(node.id);
+      if (!node || !node.id || explainingIds.has(node.id)) return;
+      delete node._explainError;
       explainingIds.add(node.id);
+      renderPopover(node);
       const id = node.id;
       const done = (res) => {
         explainingIds.delete(id);
@@ -364,18 +378,32 @@
       activePopoverNode = node || null;
       if (activePopover) { activePopover.remove(); activePopover = null; }
       if (!node) return;
-      if (!hasStoredExplain(node) && !explainTried.has(node.id)) explainingIds.add(node.id);
       const methods = mergeMethods(node);
       const pop = el('div', { className: 'map-popover' });
-      pop.style.cssText = 'position:absolute;right:12px;top:54px;z-index:6;width:300px;max-height:62%;overflow:auto;background:var(--panel);border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow);padding:10px 12px;font-size:12px;line-height:1.55;';
+      pop.style.cssText = 'position:absolute;right:12px;top:54px;z-index:6;width:300px;max-height:62%;overflow:auto;background:var(--panel-solid);border:1px solid var(--border);border-radius:var(--sub-r);box-shadow:var(--shadow);padding:10px 12px;font-size:12px;line-height:1.55;';
       const h = el('div');
       h.style.cssText = 'font-weight:600;margin-bottom:6px;word-break:break-all;';
       h.textContent = node.path;
       pop.appendChild(h);
+      const localHint = el('div', { textContent: '本地结构 · 不消耗模型 token。行号由代码规则提取，复杂语法请核对源码。' });
+      localHint.style.cssText = 'color:var(--muted);margin-bottom:8px;';
+      pop.appendChild(localHint);
+      if (methods.length) {
+        const explainBtn = el('button', { className: 'map-button', textContent: explainingIds.has(node.id) ? '正在生成摘要…' : hasStoredExplain(node) ? '检查 / 更新此文件 AI 摘要' : '生成此文件 AI 摘要（消耗额度）' });
+        explainBtn.disabled = explainingIds.has(node.id);
+        explainBtn.title = '可选：用模型解释方法用途；不会改变本地提取的代码分段。';
+        explainBtn.onclick = () => kickExplain(node);
+        pop.appendChild(explainBtn);
+      }
+      if (node._explainError) {
+        const error = el('div', { textContent: node._explainError + '，可点击摘要按钮重试。' });
+        error.style.color = 'var(--danger)';
+        pop.appendChild(error);
+      }
       if (!methods.length) {
         const tip = el('div');
         tip.style.cssText = 'color:var(--muted);';
-        tip.textContent = '该模块未解析出方法（非源码文件，或正在归纳中）。';
+        tip.textContent = '本地规则未识别出方法；这不代表文件没有实现，请搜索或读取源码。';
         pop.appendChild(tip);
       } else {
         for (const m of methods) {
@@ -383,23 +411,48 @@
           item.style.cssText = 'margin-bottom:8px;padding-bottom:6px;border-bottom:1px dashed var(--border);';
           const name = el('div');
           name.style.cssText = 'font-weight:600;color:var(--accent);';
-          name.textContent = m.name || '(未命名)';
+          name.textContent = (m.name || '(未命名)') + (m.line ? ' · L' + m.line + '–' + (m.endLine || m.line) : '');
           item.appendChild(name);
+          const commentTitle = el('div', { textContent: m.title ? '源码注释：' + m.title : '无注释 · 可展开源码判断用途' });
+          commentTitle.style.cssText = 'margin-top:3px;color:var(--text);';
+          item.appendChild(commentTitle);
+          const details = el('details');
+          const summary = el('summary', { textContent: '查看注释与整段源码（本地）' });
+          summary.style.cursor = 'pointer';
+          const source = el('pre');
+          source.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text);background:var(--bg);padding:8px;border:1px solid var(--border);border-radius:var(--sub-r);font-size:11px;';
+          details.append(summary, source);
+          let loading = false;
+          // 每次重新展开都核对磁盘版本，避免沿用上一次展开时的旧源码。
+          details.ontoggle = async () => {
+            if (!details.open || loading) return;
+            loading = true;
+            source.textContent = '正在读取本地源码…';
+            try {
+              const result = await api.indexSourceItem({ module: node.path, symbol: m.name, startLine: m.line });
+              source.textContent = result?.ok
+                ? (result.commentRaw ? result.commentRaw + '\n\n' : '')
+                  + (result.rangeKind === 'estimated' ? '区间由规则估算，复杂语法需核对边界。\n' : '')
+                  + result.source.split('\n').map((line, i) => (result.startLine + i) + ': ' + line).join('\n')
+                : result?.reason || '源码读取失败';
+            } catch (error) { source.textContent = '读取失败：' + (error?.message || error); }
+            finally { loading = false; }
+          };
+          item.appendChild(details);
           const pending = explainingIds.has(node.id) && !m.desc;
           const kv = el('div');
           kv.style.cssText = 'margin-top:2px;';
           kv.textContent = '关键值：' + (m.keyValues || (pending ? '正在归纳…' : '—'));
-          item.appendChild(kv);
+          if (m.keyValues || pending) item.appendChild(kv);
           const ds = el('div');
           ds.style.cssText = 'margin-top:2px;color:var(--muted);';
           ds.textContent = '作用：' + (m.desc || (pending ? '正在归纳…' : (node._explainError || '—')));
-          item.appendChild(ds);
+          if (m.desc || pending) item.appendChild(ds);
           pop.appendChild(item);
         }
       }
       card.appendChild(pop);
       activePopover = pop;
-      if (!hasStoredExplain(node)) kickExplain(node);
     }
 
     // 把某个模块的最新方法摘要写进原始数据和画布上的渲染节点，漂浮窗开着就一并重绘
@@ -409,11 +462,11 @@
       for (const list of [map.nodes, currentMap.nodes]) {
         const n = (list || []).find((x) => x.id === id);
         if (!n) continue;
-        if (methods) n.methods = methods;
-        if (desc) n.desc = desc;
+        if (Object.hasOwn(patch, 'methods')) n.methods = methods;
+        if (Object.hasOwn(patch, 'desc')) n.desc = desc;
         if (patch.symbols) n.symbols = patch.symbols;
         if (patch.mtime != null) n.mtime = patch.mtime;
-        if (patch.methodsMtime != null) n.methodsMtime = patch.methodsMtime;
+        if (Object.hasOwn(patch, 'methodsMtime')) n.methodsMtime = patch.methodsMtime;
       }
       const drawn = drawCleanup && drawCleanup.updateNode
         ? drawCleanup.updateNode(id, patch || {})
@@ -514,15 +567,17 @@
     if (!sym.length) return [];
     const aiByName = new Map();
     for (const m of ai) {
-      const key = String(m.name || '').toLowerCase();
+      const key = String(m.name || '');
       if (key && !aiByName.has(key)) aiByName.set(key, m);
     }
     const trust = n.methodsMtime != null && n.methodsMtime === n.mtime;
     return sym.map((s) => {
-      const extra = trust ? aiByName.get(String(s.name || '').toLowerCase()) : null;
+      const extra = trust ? aiByName.get(String(s.name || '')) : null;
       return {
         name: s.name,
         line: s.line,
+        endLine: s.endLine,
+        title: s.title || '',
         keyValues: extra ? String(extra.keyValues || '') : '',
         desc: extra ? String(extra.desc || '') : ''
       };
@@ -563,9 +618,7 @@
     const nodes = allNodes;
     const shownEdges = edges;
 
-    const accent = cssVar('--accent') || '#3b6cff';
-    const textColor = cssVar('--text') || '#111';
-    const selColor = '#ff7a3c';
+    let textColor, panelBg, borderColor, muted, selColor;
     const pad = 40;
     let W = 960, H = 640;
     let scale = 1, panX = 0, panY = 0;
@@ -686,6 +739,12 @@
     }
 
     function render() {
+      const theme = getComputedStyle(document.documentElement);
+      textColor = theme.getPropertyValue('--text').trim();
+      panelBg = theme.getPropertyValue('--panel-solid').trim();
+      borderColor = theme.getPropertyValue('--border-strong').trim();
+      muted = theme.getPropertyValue('--muted').trim();
+      selColor = theme.getPropertyValue('--accent').trim();
       const ctx = canvas.getContext('2d');
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -697,7 +756,8 @@
 
       // 目录骨架连线：思维导图分支形（父目录右侧 -> 子左侧的贝塞尔曲线）
       ctx.setLineDash([]);
-      ctx.strokeStyle = selectedNode ? 'rgba(150,170,200,0.08)' : 'rgba(150,170,200,0.30)';
+      ctx.strokeStyle = muted;
+      ctx.globalAlpha = selectedNode ? 0.08 : 0.30;
       ctx.lineWidth = 1 / scale;
       for (const t of treeEdges) {
         const ra = t.a.r || 5;
@@ -711,6 +771,7 @@
         ctx.stroke();
       }
 
+      ctx.globalAlpha = 1;
       // 关系连线：颜色区分类型（见图例）；未选择时虚线，选择后相关实线高亮、无关淡出
       const hasSel = !!selectedNode;
       for (const e of shownEdges) {
@@ -730,13 +791,15 @@
           ctx.lineWidth = 1.8 / scale;
         } else {
           ctx.setLineDash([]);
-          ctx.strokeStyle = 'rgba(150,170,200,0.10)';
+          ctx.strokeStyle = muted;
+          ctx.globalAlpha = 0.10;
           ctx.lineWidth = 1 / scale;
         }
         ctx.beginPath();
         ctx.moveTo(ax, ay);
         ctx.bezierCurveTo(mx, ay, mx, by, bx, by);
         ctx.stroke();
+        ctx.globalAlpha = 1;
       }
       ctx.setLineDash([]);
 
@@ -752,15 +815,15 @@
           ctx.font = fs + 'px "Microsoft YaHei", sans-serif';
           ctx.textAlign = 'left';
           ctx.lineWidth = Math.max(2.5, fs * 0.24);
-          ctx.strokeStyle = '#000';
+          ctx.strokeStyle = panelBg;
           ctx.strokeText(d.name, d.x + d.r + 4, d.y);
-          ctx.fillStyle = '#fff';
+          ctx.fillStyle = textColor;
           ctx.fillText(d.name, d.x + d.r + 4, d.y);
         }
         ctx.globalAlpha = 1;
       }
 
-      // 文件节点：圆形 + 右侧名字标签（同目录同色；选中橙色、邻居高亮、无关节点淡出）
+      // 文件节点：同目录同色；选中使用主题强调色、邻居高亮、无关节点淡出。
       for (const n of nodes) {
         const off = offOf(n);
         const x = n.x + off.dx, y = n.y + off.dy;
@@ -774,11 +837,11 @@
         ctx.fillStyle = isSel ? selColor : n.color;
         ctx.fill();
         if (isSel) {
-          ctx.strokeStyle = '#fff';
+          ctx.strokeStyle = textColor;
           ctx.lineWidth = 2 / scale;
           ctx.stroke();
         }
-        // 名字标签：缩放较远时只画圆点不画字（避免糊成一团）；选中/悬停显示完整路径；白字黑描边保证压线时仍可读
+        // 名字标签：远处仅画圆点；选中/悬停显示完整路径，以面板色描边隔开连线。
         const showLabel = scale >= 0.5;
         if (showLabel) {
           const fs = Math.max(9, 10 * Math.min(1.5, scale));
@@ -787,9 +850,9 @@
           ctx.font = (isSel ? '600 ' : '') + fs + 'px "Microsoft YaHei", sans-serif';
           ctx.textAlign = 'left';
           ctx.lineWidth = Math.max(2.5, fs * 0.24);
-          ctx.strokeStyle = '#000';
+          ctx.strokeStyle = panelBg;
           ctx.strokeText(text, x + r + 4, y);
-          ctx.fillStyle = '#fff';
+          ctx.fillStyle = textColor;
           ctx.fillText(text, x + r + 4, y);
           ctx.globalAlpha = 1;
         }
@@ -807,12 +870,12 @@
         let bx = lastMx + 14, by = lastMy + 14;
         if (bx + bw > W) bx = Math.max(4, W - bw - 4);
         if (by + bh > H) by = Math.max(4, H - bh - 4);
-        ctx.fillStyle = 'rgba(20,20,28,0.92)';
+        ctx.fillStyle = panelBg;
         ctx.fillRect(bx, by, bw, bh);
-        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+        ctx.strokeStyle = borderColor;
         ctx.lineWidth = 1;
         ctx.strokeRect(bx, by, bw, bh);
-        ctx.fillStyle = '#fff';
+        ctx.fillStyle = textColor;
         ctx.textBaseline = 'middle';
         ctx.fillText(text, bx + padX, by + bh / 2);
       }
@@ -928,12 +991,15 @@
     canvas.addEventListener('pointerup', onUp);
     canvas.addEventListener('pointercancel', onUp);
     window.addEventListener('resize', resize);
+    const themeObserver = new MutationObserver(render);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'style'] });
 
     resize();
     // 无节点（首次空地图）时直接通知就绪，隐藏遮罩
     if (!nodes.length && onReady) onReady();
 
     function cleanup() {
+      themeObserver.disconnect();
       canvas.removeEventListener('wheel', onWheel);
       canvas.removeEventListener('pointerdown', onDown);
       canvas.removeEventListener('pointermove', onMove);
@@ -945,11 +1011,11 @@
     cleanup.updateNode = function (id, patch) {
       const n = idMap.get(id);
       if (!n || !patch) return null;
-      if (patch.methods) n.methods = patch.methods;
-      if (patch.desc) n.desc = patch.desc;
+      if (Object.hasOwn(patch, 'methods')) n.methods = patch.methods;
+      if (Object.hasOwn(patch, 'desc')) n.desc = patch.desc;
       if (patch.symbols) n.symbols = patch.symbols;
       if (patch.mtime != null) n.mtime = patch.mtime;
-      if (patch.methodsMtime != null) n.methodsMtime = patch.methodsMtime;
+      if (Object.hasOwn(patch, 'methodsMtime')) n.methodsMtime = patch.methodsMtime;
       return n;
     };
     return cleanup;
@@ -959,7 +1025,7 @@
     const card = document.getElementById('idx-card');
     if (!card || card.querySelector('#idx-map-view')) return;
     const view = el('button', { id: 'idx-map-view', textContent: '查看项目地图' });
-    view.style.cssText = 'margin-left:8px;border:1px solid var(--border);background:var(--hover);border-radius:8px;padding:5px 12px;cursor:pointer;font-size:12px;';
+    view.style.cssText = 'margin-left:8px;border:1px solid var(--border);background:var(--map-button-bg,var(--btn-bg));border-radius:var(--sub-r);padding:5px 12px;cursor:pointer;font-size:12px;';
     view.onclick = () => openMapModal();
     card.appendChild(view);
     api.indexStatus().then((st) => {

@@ -154,37 +154,43 @@ function readRateLimitsFromAppServer(modelCfg) {
   return readAppServerRpc('account/rateLimits/read', {}).catch(() => null);
 }
 
+/** 包含服务端标记隐藏的条目，并读取全部游标页；只缓存成功取全的目录。 */
 async function fetchModelCatalog() {
   if (modelListCache && Date.now() - modelListCacheAt < MODEL_LIST_CACHE_MS) return modelListCache;
   if (modelListInFlight) return modelListInFlight;
   modelListInFlight = (async () => {
     const models = [];
     let cursor = null;
-    for (let pageNo = 0; pageNo < 10; pageNo += 1) {
+    const visited = new Set();
+    const deadline = Date.now() + 120000;
+    while (true) {
+      if (Date.now() >= deadline) throw new Error('Codex 模型分页超时，未能拉取完整列表');
       const page = await readAppServerRpc('model/list', {
         limit: 100,
-        includeHidden: false,
+        includeHidden: true,
         ...(cursor ? { cursor } : {})
       });
-      if (!Array.isArray(page?.data)) break;
+      if (!Array.isArray(page?.data)) throw new Error('Codex 模型目录读取失败，请检查本机登录状态和 Codex 版本');
       models.push(...page.data);
-      if (!page.nextCursor || page.nextCursor === cursor) break;
+      if (!page.nextCursor) break;
+      if (visited.has(page.nextCursor)) throw new Error('Codex 模型分页游标重复，未能拉取完整列表');
+      visited.add(page.nextCursor);
       cursor = page.nextCursor;
     }
     modelListCache = models
-      .filter((item) => item && item.hidden !== true)
+      .filter((item) => item)
       .map((item) => ({
         id: String(item.model || item.id || '').trim(),
         name: String(item.displayName || item.model || item.id || '').trim(),
         description: String(item.description || '').trim(),
-        isDefault: !!item.isDefault
+        isDefault: !!item.isDefault,
+        hidden: !!item.hidden
       }))
       .filter((item) => item.id);
     modelListCacheAt = Date.now();
     return modelListCache;
   })();
   try { return await modelListInFlight; }
-  catch { return []; }
   finally { modelListInFlight = null; }
 }
 
@@ -214,19 +220,20 @@ async function listModels(modelCfg) {
     fetchModelCatalog()
   ]);
   const models = [DEFAULT_MODEL];
-  const catalog = {
+  const catalog = Object.assign(Object.create(null), {
     [DEFAULT_MODEL]: { id: DEFAULT_MODEL, name: 'Codex CLI 默认模型', priceText: 'Codex CLI 默认模型', input: null, output: null }
-  };
+  });
   for (const item of remoteModels || []) {
     if (!item.id || item.id === DEFAULT_MODEL || models.includes(item.id)) continue;
     models.push(item.id);
     catalog[item.id] = {
       id: item.id,
       name: item.name || item.id,
-      priceText: 'Codex 模型',
+      priceText: item.hidden ? 'Codex 模型 · 厂商标记隐藏' : 'Codex 模型',
       input: null,
       output: null,
-      isDefault: item.isDefault
+      isDefault: item.isDefault,
+      hidden: item.hidden
     };
   }
   return {

@@ -1051,7 +1051,7 @@ input, textarea, select, [contenteditable="true"] {
   font-size: 14px; line-height: 1.5; min-height: 64px; max-height: 180px;
   user-select: text;
 }
-.composer-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; row-gap: 8px; }
+.composer-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; column-gap: 8px; row-gap: 8px; }
 .composer-bar .left, .composer-bar .right { display: flex; gap: 8px; align-items: center; }
 .composer-bar .left { flex: 1; flex-wrap: wrap; }
 .model-roster-wrap { flex: 1 1 100%; }
@@ -2643,6 +2643,18 @@ html[data-theme="dark"] {
 }
 
 /* 遮罩 + 弹窗外壳 */
+/* 独立导图窗口也使用主题的控件与语义色。 */
+html:not([data-theme="dark"]) { --success: #25844b; --warning: #996400; }
+html[data-theme="dark"] { --success: #73c997; --warning: #edbc65; }
+.map-modal { color: var(--text); }
+.map-modal input[type="checkbox"] { accent-color: var(--accent); }
+.map-button {
+  color: var(--text); font-family: inherit;
+  transition: filter 0.15s, border-color 0.15s;
+}
+.map-button:not(:disabled):hover { --map-button-bg: var(--btn-hover); filter: brightness(1.07); }
+.map-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.map-button:disabled { opacity: 0.5; cursor: not-allowed; }
 .modal.is-open { background: var(--overlay); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); }
 #modal-card { color: var(--text); border-radius: var(--sub-r-lg); box-shadow: var(--shadow); }
 html:not([data-theme="dark"]) #modal-card { background: var(--panel-solid); border: 1px solid var(--border-strong); }

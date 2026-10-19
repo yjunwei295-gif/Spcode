@@ -178,7 +178,6 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
   const slotNo = clampInt(slotIndex, 1, 99, 1);
   let win = null;
   let pageReady = false;
-  let autoShown = false;
   let userHidden = false;
   let quitting = false;
   let pendingEvent = null;
@@ -320,11 +319,6 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     win.webContents.on('did-finish-load', function () {
       pageReady = true;
       flushPending();
-      if (!autoShown) {
-        autoShown = true;
-        // 首次加载完就露面（常驻），用了 showInactive 免得抢走主窗焦点
-        if (!userHidden && win && !win.isDestroyed()) win.showInactive();
-      }
     });
     win.loadFile(path.join(__dirname, 'float-bar.html'));
     return win;

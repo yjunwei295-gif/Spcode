@@ -191,6 +191,7 @@ const api = {
   indexStatus: () => ipcRenderer.invoke('index:status'),
   indexSync: (extraFolders, opts) => ipcRenderer.invoke('index:sync', extraFolders, opts),
   indexGetMap: () => ipcRenderer.invoke('index:getMap'),
+  indexSourceItem: (request) => ipcRenderer.invoke('index:sourceItem', request),
   indexGetExcludes: () => ipcRenderer.invoke('index:getExcludes'),
   indexSetExcludes: (ids) => ipcRenderer.invoke('index:setExcludes', ids),
   indexGetInclude: () => ipcRenderer.invoke('index:getInclude'),

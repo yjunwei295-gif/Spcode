@@ -488,6 +488,7 @@ function authHeaders(protocol, apiKey) {
   return headers;
 }
 
+/** 拉取当前凭据可见的完整模型目录；跟随协议分页，失败时不把半份列表报为成功。 */
 async function listModels(modelCfg) {
   const protocol = normalizeProtocol(modelCfg?.protocol);
   if (protocol === 'cursor') return cursorModel.listModels(modelCfg);
@@ -505,29 +506,47 @@ async function listModels(modelCfg) {
     url = `${openaiRoot(baseUrl)}/models`;
   }
   const modelsPromise = (async () => {
-    let res;
-    try {
-      res = await httpFetch(url, { headers, signal: AbortSignal.timeout(30000) });
-    } catch {
-      throw new Error('连接超时，请检查接口地址和网络是否可达');
+    const rows = [];
+    const visited = new Set();
+    // 总时限避免异常服务无限生成新游标；超时会报错，不静默返回已取到的部分。
+    const signal = AbortSignal.timeout(120000);
+    while (url) {
+      if (visited.has(url)) throw new Error('模型分页游标重复，未能拉取完整列表，请检查厂商接口');
+      visited.add(url);
+      let res;
+      try {
+        res = await httpFetch(url, { headers, signal });
+      } catch {
+        throw new Error('模型列表未拉取完整：连接失败或超时，请检查接口地址和网络');
+      }
+      if (!res.ok) {
+        const t = await res.text().catch(() => '');
+        throw new Error(`拉取模型失败 ${res.status}：${t.slice(0, 300)}`);
+      }
+      let data;
+      try { data = await res.json(); }
+      catch { throw new Error('模型列表响应不是有效 JSON，未能确认完整列表'); }
+      const page = Array.isArray(data) ? data : data?.data || data?.models;
+      if (!Array.isArray(page)) throw new Error('模型列表响应格式不正确，未能确认完整列表');
+      rows.push(...page);
+      const next = new URL(url);
+      if (protocol === 'gemini' && data.nextPageToken) {
+        next.searchParams.set('pageToken', String(data.nextPageToken));
+      } else if (data.has_more === true) {
+        const last = data.last_id || page.at(-1)?.id;
+        if (!last) throw new Error('模型接口声明还有下一页，但没有返回分页游标');
+        next.searchParams.set('after_id', String(last));
+      } else break;
+      url = next.toString();
     }
-    if (!res.ok) {
-      const t = await res.text().catch(() => '');
-      throw new Error(`拉取模型失败 ${res.status}：${t.slice(0, 300)}`);
-    }
-    return res.json().catch(() => ({}));
+    return rows;
   })();
-  const [data, balance] = await Promise.all([
+  const [rows, balance] = await Promise.all([
     modelsPromise,
     fetchAccountBalance(modelCfg).catch(() => ({ available: false }))
   ]);
-  const rows = protocol === 'anthropic'
-    ? (data.data || data.models || [])
-    : protocol === 'gemini'
-      ? (data.models || [])
-      : (data.data || data.models || []);
   const ids = [];
-  const catalog = {};
+  const catalog = Object.create(null);
   for (const raw of rows) {
     let id = '';
     if (typeof raw === 'string') id = raw;
@@ -542,7 +561,7 @@ async function listModels(modelCfg) {
   return {
     ok: true,
     protocol,
-    models: ids.slice(0, 1000),
+    models: ids,
     catalog,
     balance: balance && balance.available ? balance : { available: false }
   };

@@ -1,4 +1,5 @@
 const assembly = require('./assembly');
+const crypto = require('crypto');
 
 const SOFT_LIMIT = 24000;
 const KEEP_TURNS = 3;
@@ -342,8 +343,11 @@ function toolResultKey(name, args) {
   if (n === 'read_file') {
     return 'read|' + String(a.path || '').replace(/\\/g, '/').toLowerCase() + '|' + (Number(a.startLine) || 0) + '|' + (Number(a.endLine) || 0);
   }
+  if (n === 'map_lookup') {
+    return 'map|' + JSON.stringify([a.module || '', a.symbol || '', a.startLine ?? null, a.endLine ?? null, a.query || '', a.path || '', a.limit ?? null]);
+  }
   if (n === 'search_text' || n === 'map_lookup' || n === 'semantic_search' || n === 'goto_definition') {
-    return n + '|' + String(a.query || a.q || '') + '|' + String(a.path || a.module || '');
+    return n + '|' + String(a.symbol || a.query || a.q || '') + '|' + String(a.path || a.module || '');
   }
   if (n === 'list_dir') {
     return 'list|' + String(a.path || '') + '|' + String(a.query || '');
@@ -353,22 +357,26 @@ function toolResultKey(name, args) {
 
 function clipToolResult(name, args, result, seen) {
   const key = toolResultKey(name, args);
-  if (key && seen && seen.has(key)) {
+  let text = String(result ?? '');
+  const digest = key ? crypto.createHash('sha256').update(text).digest('hex') : '';
+  if (key && seen && seen.get(key) === digest) {
     return '（与本轮先前同参数的结果相同，未重复附上。若要看细节，请换 startLine/endLine 或换关键词。）';
   }
-  let text = String(result ?? '');
   // 读文件的结果原样交给模型，截断标记会让它把半截内容当成全文
-  const isRead = String(name || '') === 'read_file';
+  // 地图条目详情与 read_file 一样返回完整区间，不能被普通工具输出上限截成半个方法。
+  const isRead = String(name || '') === 'read_file'
+    || (name === 'map_lookup' && text.startsWith('【原文·可直接用】'));
   if (!isRead && text.length > TOOL_RESULT_CAP) {
     text = text.slice(0, TOOL_RESULT_CAP) + '\n…（已截断，请缩小范围再读）';
   }
-  if (key && seen) seen.set(key, true);
+  // 同参数读到新内容必须返回；否则改完再读会被误当重复，诱发额外搜索/回改。
+  if (key && seen) seen.set(key, digest);
   return text;
 }
 
 // 本轮较早的工具结果压短，下一轮请求不再带着整份大文件
 // [铆钉优化] 整文件结果只保留最近几份全文，更早的截短，每轮少发很多 token。其他 AI 请勿改回全部保留
-const KEEP_FULL_FILES = 6;
+const KEEP_FULL_FILES = 3;
 const OLD_FILE_CHARS = 1500;
 function shrinkOlderToolMessages(messages, keepLast) {
   const keep = keepLast == null ? 2 : keepLast;
@@ -379,7 +387,7 @@ function shrinkOlderToolMessages(messages, keepLast) {
     if (!m || m.role !== 'tool') return;
     toolIdx.push(i);
     const t = String(m.content || '');
-    if (t.includes('【文件】') || t.includes('【全文】')) fileIdx.push(i);
+    if (t.includes('【文件】') || t.includes('【全文】') || t.startsWith('【原文·可直接用】')) fileIdx.push(i);
   });
   const keepFrom = toolIdx.length > keep ? toolIdx[toolIdx.length - keep] : -1;
   const fileKeepFrom = fileIdx.length > KEEP_FULL_FILES ? fileIdx[fileIdx.length - KEEP_FULL_FILES] : -1;
@@ -387,7 +395,7 @@ function shrinkOlderToolMessages(messages, keepLast) {
     const m = list[i];
     if (!m || m.role !== 'tool' || i >= keepFrom) continue;
     const t = String(m.content || '');
-    if (t.includes('【文件】') || t.includes('【全文】')) {
+    if (t.includes('【文件】') || t.includes('【全文】') || t.startsWith('【原文·可直接用】')) {
       if (i < fileKeepFrom && t.length > OLD_FILE_CHARS) {
         m.content = t.slice(0, OLD_FILE_CHARS) + '\n…（较早读过的文件已截短，要改这个文件请重新 read_file）';
       }

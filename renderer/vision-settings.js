@@ -8,32 +8,12 @@ const api = window.simple || window.sinpo;
 
 // —— 内联注入视觉设置弹窗样式 ——
 // 放在本模块内而不是 styles.css，避免样式表缓存/加载顺序导致弹窗退化成白底；
-// 深色主题下强制使用黑色调，与主界面黑色风格一致。
+// 颜色和圆角复用主界面的主题变量，避免模块加载顺序覆盖全局主题。
 (function injectVsStyles() {
   const css = `
 .vs-card { background: var(--panel); }
 .vs-head { border-bottom: 1px solid var(--border); }
-.vs-model-row { background: var(--bg); border: 1px solid var(--border); }
-
-/* ===== 全局滚动条（跟随主题，深色下为黑色调） ===== */
-*::-webkit-scrollbar { width: 10px; height: 10px; }
-*::-webkit-scrollbar-track { background: transparent; }
-*::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 999px;
-  border: 2px solid transparent;
-  background-clip: content-box;
-}
-*::-webkit-scrollbar-thumb:hover { background: var(--muted); }
-*::-webkit-scrollbar-corner { background: transparent; }
-html[data-theme="dark"] *::-webkit-scrollbar { width: 10px; height: 10px; }
-html[data-theme="dark"] *::-webkit-scrollbar-track { background: #141414; }
-html[data-theme="dark"] *::-webkit-scrollbar-thumb {
-  background: #3a3a3a;
-  border: 2px solid transparent;
-  background-clip: content-box;
-}
-html[data-theme="dark"] *::-webkit-scrollbar-thumb:hover { background: #555; }
+.vs-model-row { background: var(--sub-surface); border: 1px solid var(--border); }
 
 /* ===== 弹窗按钮组（与主界面 pill / modal-actions 风格协调） ===== */
 .vs-actions {
@@ -46,8 +26,9 @@ html[data-theme="dark"] *::-webkit-scrollbar-thumb:hover { background: #555; }
 }
 .vs-btn {
   border: 1px solid var(--border);
-  background: var(--hover);
-  border-radius: 9px;
+  background: var(--btn-bg);
+  color: var(--text);
+  border-radius: var(--sub-r);
   padding: 8px 18px;
   min-height: 36px;
   cursor: pointer;
@@ -59,16 +40,16 @@ html[data-theme="dark"] *::-webkit-scrollbar-thumb:hover { background: #555; }
   gap: 6px;
   transition: background 0.15s, border-color 0.15s, color 0.15s, transform 0.06s;
 }
-.vs-btn:hover { background: #e8e8e8; border-color: #c8c8c8; }
+.vs-btn:hover { background: var(--btn-hover); border-color: var(--accent); }
 .vs-btn:active { transform: scale(0.97); }
 .vs-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .vs-btn.primary {
-  background: var(--accent);
-  color: var(--accent-fg);
+  background: var(--primary-bg);
+  color: var(--primary-fg);
   border-color: var(--accent);
 }
-.vs-btn.primary:hover { background: #5a86ff; border-color: #5a86ff; }
-.vs-btn.primary:active { background: #3560e8; }
+.vs-btn.primary:hover { background: var(--primary-bg); filter: brightness(1.07); }
+.vs-btn.primary:active { filter: brightness(0.97); }
 .vs-close {
   border: 0;
   background: none;
@@ -78,7 +59,7 @@ html[data-theme="dark"] *::-webkit-scrollbar-thumb:hover { background: #555; }
   color: var(--muted);
   width: 30px;
   height: 30px;
-  border-radius: 8px;
+  border-radius: var(--sub-r);
   flex-shrink: 0;
   display: inline-flex;
   align-items: center;
@@ -87,40 +68,9 @@ html[data-theme="dark"] *::-webkit-scrollbar-thumb:hover { background: #555; }
 }
 .vs-close:hover { background: var(--hover); color: var(--text); }
 
-/* ===== 深色主题：黑色调强化 ===== */
-html[data-theme="dark"] .vs-card { background: #161616; }
-html[data-theme="dark"] .vs-head { border-bottom-color: #2a2a2a; }
-html[data-theme="dark"] .vs-body { background: #161616; }
-html[data-theme="dark"] .vs-sub { color: #8a8a8a; }
-html[data-theme="dark"] .vs-close:hover { background: #262626; color: #f0f0f0; }
-html[data-theme="dark"] .vs-sec-title { color: #e8e8e8; }
-html[data-theme="dark"] .vs-sec-hint { color: #8a8a8a; }
-html[data-theme="dark"] .vs-model-row { background: #1e1e1e; border-color: #2a2a2a; }
-html[data-theme="dark"] .vs-model-name { color: #f0f0f0; }
-html[data-theme="dark"] .vs-model-sub { color: #8a8a8a; }
-html[data-theme="dark"] .vs-badge { background: #2a2a2a; color: #9a9a9a; }
-html[data-theme="dark"] .vs-badge.on { background: rgba(77, 124, 255, 0.18); color: #7fa0ff; }
-html[data-theme="dark"] .vs-track { background: #3a3a3a; }
-html[data-theme="dark"] .vs-track::after { background: #f0f0f0; box-shadow: 0 1px 3px rgba(0,0,0,0.6); }
-html[data-theme="dark"] .vs-switch input:checked + .vs-track { background: var(--accent); }
-html[data-theme="dark"] .vs-empty { border-color: #2a2a2a; color: #8a8a8a; }
-html[data-theme="dark"] .vs-tip { background: #1b1b1b; border-color: #2a2a2a; color: #9a9a9a; }
-html[data-theme="dark"] .vs-field-label { color: #e0e0e0; }
-html[data-theme="dark"] .vs-field input,
-html[data-theme="dark"] .vs-field select { background: #1e1e1e; border-color: #2a2a2a; color: #e8e8e8; }
-html[data-theme="dark"] .vs-field input::placeholder { color: #5a5a5a; }
-html[data-theme="dark"] .vs-field input:focus,
-html[data-theme="dark"] .vs-field select:focus { border-color: var(--accent); }
-html[data-theme="dark"] .vs-field-hint { color: #8a8a8a; }
-html[data-theme="dark"] .vs-actions { border-top-color: #2a2a2a; }
-html[data-theme="dark"] .vs-btn { background: #262626; border-color: #2e2e2e; color: #e8e8e8; }
-html[data-theme="dark"] .vs-btn:hover { background: #333; border-color: #454545; }
-html[data-theme="dark"] .vs-btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-html[data-theme="dark"] .vs-btn.primary:hover { background: #5a86ff; border-color: #5a86ff; }
-html[data-theme="dark"] .vs-btn.primary:active { background: #3560e8; }
-html[data-theme="dark"] .vs-start-status.running { color: #ffb454; }
-html[data-theme="dark"] .vs-start-status.ok { color: #4caf7d; }
-html[data-theme="dark"] .vs-start-status.err { color: #ff6b6b; }
+.vs-start-status.running { color: var(--warning); }
+.vs-start-status.ok { color: var(--success); }
+.vs-start-status.err { color: var(--danger); }
 .vs-bar {
   height: 4px;
   background: var(--border);
@@ -128,17 +78,16 @@ html[data-theme="dark"] .vs-start-status.err { color: #ff6b6b; }
   overflow: hidden;
 }
 .vs-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.15s; }
-html[data-theme="dark"] .vs-bar { background: #2a2a2a; }
 
 .vs-slot {
-  border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-top: 8px;
-  background: var(--bg);
+  border: 1px solid var(--border); border-radius: var(--sub-r); padding: 10px 12px; margin-top: 8px;
+  background: var(--sub-surface);
 }
 .vs-slot-head { display: flex; gap: 8px; align-items: center; }
 .vs-slot-head select { flex: 1; min-width: 0; }
 .vs-slot-del {
   border: 1px solid var(--border); background: var(--hover); color: var(--danger);
-  border-radius: 8px; padding: 4px 10px; cursor: pointer; font-size: 12px;
+  border-radius: var(--sub-r); padding: 4px 10px; cursor: pointer; font-size: 12px;
 }
 .vs-primary-name { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
 `;

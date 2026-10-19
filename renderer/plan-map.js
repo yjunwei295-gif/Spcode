@@ -2,22 +2,20 @@
 // 和项目地图、对话导图分开，不共用节点或样式名。
 (function () {
   const STATUS_COLOR = {
-    待核对: '#8a8f98',
-    可开工: '#2e9d57',
-    不一致: '#d9534f',
-    进行中: '#e69a00',
-    通过: '#2e9d57',
-    退回: '#c0392b'
+    待核对: 'var(--muted)',
+    可开工: 'var(--success)',
+    不一致: 'var(--danger)',
+    进行中: 'var(--warning)',
+    通过: 'var(--success)',
+    退回: 'var(--danger)'
   };
-  const btnCss = 'border:1px solid var(--border);background:var(--hover);border-radius:6px;padding:3px 8px;cursor:pointer;font-size:12px;color:inherit;';
+  const btnCss = 'border:1px solid var(--border);background:var(--map-button-bg,var(--btn-bg));border-radius:var(--sub-r);padding:3px 8px;cursor:pointer;font-size:12px;color:inherit;';
 
   function el(tag, props) {
     const n = document.createElement(tag);
     if (props) Object.assign(n, props);
+    if (tag === 'button') n.classList.add('map-button');
     return n;
-  }
-  function cssVar(name) {
-    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   }
   function clip(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
@@ -37,11 +35,11 @@
     const workspace = opts.workspace;
     const tabId = opts.tabId;
     const locked = !!opts.locked;
-    const modal = el('div', { id: 'plan-map-modal' });
-    modal.style.cssText = 'position:fixed;inset:0;z-index:91;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;';
+    const modal = el('div', { id: 'plan-map-modal', className: 'map-modal' });
+    modal.style.cssText = 'position:fixed;inset:0;z-index:91;background:var(--overlay);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;';
     const card = el('div');
-    card.style.cssText = 'position:relative;width:min(94vw,1120px);height:min(88vh,840px);background:var(--panel);border:1px solid var(--border);'
-      + 'border-radius:14px;display:flex;flex-direction:column;overflow:hidden;box-shadow:var(--shadow);';
+    card.style.cssText = 'position:relative;width:min(94vw,1120px);height:min(88vh,840px);background:var(--panel-solid);border:1px solid var(--border);'
+      + 'border-radius:var(--sub-r-lg);display:flex;flex-direction:column;overflow:hidden;box-shadow:var(--shadow);';
     const head = el('div');
     head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border);';
     const title = el('span', { textContent: `方案导图 · ${opts.title || ''}` });
@@ -84,7 +82,7 @@
     function showDetail(n, sx, sy) {
       hidePopover();
       popover = el('div');
-      popover.style.cssText = 'position:absolute;z-index:4;width:340px;background:var(--panel);border:1px solid var(--border);border-radius:10px;'
+      popover.style.cssText = 'position:absolute;z-index:4;width:340px;background:var(--panel-solid);border:1px solid var(--border);border-radius:var(--sub-r);'
         + 'box-shadow:var(--shadow);padding:10px 12px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;';
       popover.style.left = Math.max(8, Math.min(sx + 12, canvasWrap.clientWidth - 360)) + 'px';
       popover.style.top = Math.max(8, Math.min(sy + 12, canvasWrap.clientHeight - 160)) + 'px';
@@ -121,14 +119,14 @@
       side.appendChild(sum);
       for (const n of items) {
         const row = el('div');
-        row.style.cssText = `border-left:4px solid ${STATUS_COLOR[n.status] || 'var(--border)'};padding:4px 8px;margin-bottom:6px;background:var(--hover);border-radius:4px;cursor:pointer;`;
+        row.style.cssText = `border-left:4px solid ${STATUS_COLOR[n.status] || 'var(--border)'};padding:4px 8px;margin-bottom:6px;background:var(--hover);border-radius:var(--sub-r);cursor:pointer;`;
         const top = el('div');
         top.style.cssText = 'display:flex;align-items:center;gap:6px;';
         const t = el('div', { textContent: `${n.id}` });
         t.style.cssText = 'font-weight:600;flex:1;min-width:0;';
         // 每条右侧放删除按钮，点击 confirm 后按 no 调后端删除
         const del = el('button', { textContent: '×', title: '删除该条方案' });
-        del.style.cssText = 'border:1px solid var(--border);background:transparent;border-radius:4px;width:20px;height:20px;'
+        del.style.cssText = 'border:1px solid var(--border);background:transparent;border-radius:var(--sub-r);width:20px;height:20px;'
           + 'line-height:1;font-size:14px;cursor:pointer;color:var(--muted);flex:none;padding:0;';
         del.onclick = (e) => { e.stopPropagation(); removeItem(n); };
         top.appendChild(t);
@@ -161,9 +159,8 @@
   function drawTree(canvas, onPick) {
     const dpr = window.devicePixelRatio || 1;
     const ctx = canvas.getContext('2d');
-    const textColor = cssVar('--text') || '#111';
-    const muted = cssVar('--muted') || '#888';
-    const panelBg = cssVar('--panel') || '#fff';
+    let textColor, muted, panelBg;
+    let statusColors = {};
     const ROW = 34;
     const COL = 220;
     let nodes = [];
@@ -193,7 +190,7 @@
       }
       redraw();
     }
-    function colorOf(n) { return STATUS_COLOR[n.data && n.data.status] || muted; }
+    function colorOf(n) { return statusColors[n.data && n.data.status] || muted; }
     function boxOf(n) {
       ctx.font = (n.kind === 'leaf' ? '12px' : '600 13px') + ' sans-serif';
       return { x: n.x, y: n.y - 12, w: ctx.measureText(n.label).width + 24, h: 24 };
@@ -206,6 +203,12 @@
       redraw();
     }
     function redraw() {
+      const theme = getComputedStyle(document.documentElement);
+      textColor = theme.getPropertyValue('--text').trim();
+      muted = theme.getPropertyValue('--muted').trim();
+      panelBg = theme.getPropertyValue('--panel-solid').trim();
+      statusColors = Object.fromEntries(Object.entries(STATUS_COLOR).map(([status, color]) =>
+        [status, theme.getPropertyValue(color.slice(4, -1)).trim()]));
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
@@ -289,9 +292,12 @@
     }, { passive: false });
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);
+    const themeObserver = new MutationObserver(redraw);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'style'] });
     return {
       setData,
       dispose() {
+        themeObserver.disconnect();
         ro.disconnect();
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);

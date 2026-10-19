@@ -92,11 +92,11 @@ async function listModels(modelCfg) {
   await ensureLogin(modelCfg);
   const rows = await sdk().Cursor.models.list({ apiKey: apiKeyOf(modelCfg) });
   const models = [];
-  const catalog = {};
+  const catalog = Object.create(null);
   for (const m of rows || []) {
     if (!m?.id || catalog[m.id]) continue;
     models.push(m.id);
-    catalog[m.id] = { id: m.id, priceText: m.displayName || '', input: null, output: null };
+    catalog[m.id] = { id: m.id, name: m.displayName || m.id, priceText: m.displayName || '', input: null, output: null };
   }
   return { ok: true, protocol: CURSOR_PROTOCOL, models, catalog, balance: { available: false } };
 }

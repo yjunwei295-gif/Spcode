@@ -8,13 +8,11 @@
   function el(tag, props) {
     const n = document.createElement(tag);
     if (props) Object.assign(n, props);
+    if (tag === 'button') n.classList.add('map-button');
     return n;
   }
-  function cssVar(name) {
-    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  }
   function oneLine(t) { return String(t || '').replace(/\s+/g, ' ').trim(); }
-  const btnCss = 'border:1px solid var(--border);background:var(--hover);border-radius:6px;padding:3px 8px;cursor:pointer;font-size:12px;color:inherit;';
+  const btnCss = 'border:1px solid var(--border);background:var(--map-button-bg,var(--btn-bg));border-radius:var(--sub-r);padding:3px 8px;cursor:pointer;font-size:12px;color:inherit;';
 
   function clip(t, cap) {
     const s = String(t || '');
@@ -22,7 +20,7 @@
   }
   // 和后台 context-compact.roundTitleLine 保持一致
   function titleLine(r) {
-    return `#R${r.n} ${oneLine(r.indexTitle) || oneLine(r.userText).slice(0, 60) || '（空）'}`.slice(0, 120);
+    return `#R${r.n} ${oneLine(r.indexTitle) || oneLine(r.userText).slice(0, 60) || text('（空）', '(empty)')}`.slice(0, 120);
   }
 
   /** 按勾选算出每轮怎么发：'title' 发标题 / 'off' 不发 */
@@ -31,7 +29,12 @@
     for (const r of rounds) how.set(r.n, on.has(r.n) ? 'title' : 'off');
     return how;
   }
-  const HOW_LABEL = { title: '标题', off: '不发' };
+  function isEnglish() {
+    const lang = document.documentElement.lang || document.body.lang || '';
+    return /^en(?:-|$)/i.test(lang);
+  }
+  function text(zh, en) { return isEnglish() ? en : zh; }
+  function howLabel(how) { return text(how === 'title' ? '标题' : '不发', how === 'title' ? 'Title' : 'Not sent'); }
 
   function close() {
     const modal = document.getElementById('dialog-map-modal');
@@ -51,26 +54,26 @@
     // 本趟点过删除、等「应用」才写入 ctxRemoved 的轮次
     const pendingRemove = new Set();
 
-    const modal = el('div', { id: 'dialog-map-modal' });
-    modal.style.cssText = 'position:fixed;inset:0;z-index:91;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;';
+    const modal = el('div', { id: 'dialog-map-modal', className: 'map-modal' });
+    modal.style.cssText = 'position:fixed;inset:0;z-index:91;background:var(--overlay);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;';
     const card = el('div', { className: 'dialog-map-card' });
-    card.style.cssText = 'position:relative;width:min(94vw,1120px);height:min(88vh,840px);background:var(--panel);border:1px solid var(--border);'
-      + 'border-radius:14px;display:flex;flex-direction:column;overflow:hidden;box-shadow:var(--shadow);';
+    card.style.cssText = 'position:relative;width:min(94vw,1120px);height:min(88vh,840px);background:var(--panel-solid);border:1px solid var(--border);'
+      + 'border-radius:var(--sub-r-lg);display:flex;flex-direction:column;overflow:hidden;box-shadow:var(--shadow);';
 
     const head = el('div');
     head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);';
-    const title = el('span', { textContent: `塞给 AI 的上下文 · ${opts.title || ''}` });
+    const title = el('span', { textContent: `${text('塞给 AI 的上下文', 'Context sent to AI')} · ${opts.title || ''}` });
     title.style.cssText = 'font-size:14px;font-weight:600;';
     const right = el('div');
     right.style.cssText = 'display:flex;align-items:center;gap:8px;';
     if (opts.onPreview) {
-      const prev = el('button', { textContent: '查看实际发送' });
-      prev.title = '上一轮真正发给模型的完整内容，包括系统提示';
+      const prev = el('button', { textContent: text('查看实际发送', 'View what was sent') });
+      prev.title = text('上一轮真正发给模型的完整内容，包括系统提示', 'Full content actually sent to the model in the previous turn, including system instructions');
       prev.style.cssText = btnCss;
       prev.onclick = () => { close(); opts.onPreview(); };
       right.appendChild(prev);
     }
-    const filterBtn = el('button', { textContent: '筛选' });
+    const filterBtn = el('button', { textContent: text('筛选', 'Filter') });
     filterBtn.style.cssText = btnCss;
     right.appendChild(filterBtn);
     const x = el('button', { textContent: '×' });
@@ -96,7 +99,7 @@
     let popover = null;
     let panel = null;
     function hidePopover() { if (popover) { popover.remove(); popover = null; } }
-    const view = drawTree(canvas, opts.title || '对话', (r, how, sx, sy) => showPopover(r, how, sx, sy));
+    const view = drawTree(canvas, opts.title || text('对话', 'Conversation'), (r, how, sx, sy) => showPopover(r, how, sx, sy));
     modal._dispose = () => {
       view.dispose();
       document.removeEventListener('keydown', onEsc);
@@ -105,7 +108,8 @@
 
     function refreshTree() {
       const how = planOf(rounds, on);
-      view.setData(rounds.filter((r) => how.get(r.n) === 'title'));
+      // 导图只展示当前勾选、会发给 AI 的轮次；右侧列表仍保留全部轮次供筛选。
+      view.setData(rounds.filter((r) => on.has(r.n)), how);
       return how;
     }
     function refreshAll() {
@@ -116,28 +120,28 @@
     function showPopover(r, how, sx, sy) {
       hidePopover();
       popover = el('div');
-      popover.style.cssText = 'position:absolute;z-index:4;width:360px;max-height:60%;display:flex;flex-direction:column;background:var(--panel);'
-        + 'border:1px solid var(--border);border-radius:10px;box-shadow:var(--shadow);padding:10px 12px;font-size:12px;line-height:1.6;';
+      popover.style.cssText = 'position:absolute;z-index:4;width:360px;max-height:60%;display:flex;flex-direction:column;background:var(--panel-solid);'
+        + 'border:1px solid var(--border);border-radius:var(--sub-r);box-shadow:var(--shadow);padding:10px 12px;font-size:12px;line-height:1.6;';
       popover.style.left = Math.max(8, Math.min(sx + 12, body.clientWidth - 380)) + 'px';
       popover.style.top = Math.max(8, Math.min(sy + 12, body.clientHeight * 0.4)) + 'px';
-      const h = el('div', { textContent: `R${r.n} ${r.title} · 发${HOW_LABEL[how]}` });
+      const h = el('div', { textContent: text(`R${r.n} ${r.title} · 发${howLabel(how)}`, `R${r.n} ${r.title} · ${how === 'title' ? 'Send title' : 'Not sent'}`) });
       h.style.cssText = 'font-weight:600;margin-bottom:6px;';
       const sent = el('div', { textContent: titleLine(r) });
-      sent.style.cssText = 'white-space:pre-wrap;word-break:break-word;color:var(--text);background:var(--hover);border-radius:6px;padding:6px 8px;';
-      const label = el('div', { textContent: '原文预览（不发，AI 需要时按编号查）' });
+      sent.style.cssText = 'white-space:pre-wrap;word-break:break-word;color:var(--text);background:var(--hover);border-radius:var(--sub-r);padding:6px 8px;';
+      const label = el('div', { textContent: text('原文预览（不发，AI 需要时按编号查）', 'Original text preview (not sent; AI can look it up by number when needed)') });
       label.style.cssText = 'margin:8px 0 4px;color:var(--muted);';
-      const pre = el('div', { textContent: `【用户】\n${clip(r.userText, PREVIEW_CHARS)}\n\n【助手】\n${clip(r.asstText, PREVIEW_CHARS)}` });
-      pre.style.cssText = 'flex:1;overflow:auto;white-space:pre-wrap;word-break:break-word;color:var(--muted);border:1px solid var(--border);border-radius:6px;padding:6px 8px;';
+      const pre = el('div', { textContent: `${text('【用户】', '[User]')}\n${clip(r.userText, PREVIEW_CHARS)}\n\n${text('【助手】', '[Assistant]')}\n${clip(r.asstText, PREVIEW_CHARS)}` });
+      pre.style.cssText = 'flex:1;overflow:auto;white-space:pre-wrap;word-break:break-word;color:var(--muted);border:1px solid var(--border);border-radius:var(--sub-r);padding:6px 8px;';
       const btns = el('div');
       btns.style.cssText = 'display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;';
-      const t = el('button', { textContent: '标成不适用' });
+      const t = el('button', { textContent: text('标成不适用', 'Mark as not applicable') });
       t.style.cssText = btnCss;
       t.onclick = () => {
         on.delete(r.n);
         hidePopover();
         refreshAll();
       };
-      const del = el('button', { textContent: '从上下文删除' });
+      const del = el('button', { textContent: text('从上下文删除', 'Remove from context') });
       del.style.cssText = btnCss;
       del.onclick = () => { hidePopover(); removeRounds([r.n]); };
       btns.appendChild(t);
@@ -154,7 +158,7 @@
     function removeRounds(ns) {
       const list = [...new Set(ns)].filter((n) => rounds.some((r) => r.n === n));
       if (!list.length) return;
-      if (!confirm(`将从上下文去掉 ${list.length} 轮，聊天记录保留。确定？`)) return;
+      if (!confirm(text(`将从上下文去掉 ${list.length} 轮，聊天记录保留。确定？`, `Remove ${list.length} round(s) from context? Chat history will be kept.`))) return;
       for (const n of list) {
         pendingRemove.add(n);
         on.delete(n);
@@ -164,11 +168,14 @@
       refreshAll();
     }
 
-    panel = buildFilterPanel(rounds, on, refreshAll, () => {
+    panel = buildFilterPanel(rounds, on, refreshAll, async () => {
       const skipSet = new Set(rounds.filter((r) => !on.has(r.n)).map((r) => r.n));
+      const removeSet = new Set(pendingRemove);
+      if (opts.onApply && await opts.onApply({ skipSet, removeSet }) === false) return false;
       for (const r of rounds) r.skip = skipSet.has(r.n);
-      if (opts.onApply) opts.onApply({ skipSet, removeSet: new Set(pendingRemove) });
+      for (const n of removeSet) pendingRemove.delete(n);
       refreshAll();
+      return true;
     }, removeRounds, refreshTree);
     body.appendChild(panel.node);
     filterBtn.onclick = () => {
@@ -180,9 +187,9 @@
   // 筛选列表：勾选 = 塞给 AI；按住拖选；可多选后点「删除所选」。全选 / 清空只作用于当前筛选看得到的轮次
   function buildFilterPanel(rounds, on, onChange, onApply, onRemove, onTree) {
     const node = el('div', { className: 'dialog-map-filter' });
-    node.style.cssText = 'position:absolute;top:0;right:0;width:300px;height:100%;background:var(--panel);border-left:1px solid var(--border);'
-      + 'display:flex;flex-direction:column;z-index:3;box-shadow:-4px 0 12px rgba(0,0,0,0.12);';
-    const hint = el('div', { textContent: '勾选的轮次塞给 AI，没勾的不发。按住左键拖过列表可连续勾选/取消。可多选后点「删除所选」从上下文去掉（聊天保留）。点「应用」才保存；不点应用直接关掉就不改。' });
+    node.style.cssText = 'position:absolute;top:0;right:0;width:300px;height:100%;background:var(--panel-solid);border-left:1px solid var(--border);'
+      + 'display:flex;flex-direction:column;z-index:3;box-shadow:var(--shadow);';
+    const hint = el('div', { textContent: text('勾选的轮次塞给 AI，没勾的不发。按住左键拖过列表可连续勾选/取消。可多选后点「删除所选」从上下文去掉（聊天保留）。点「应用」才保存；不点应用直接关掉就不改。', 'Checked rounds are sent to AI; unchecked rounds are omitted. Hold the left mouse button and drag across the list to check or uncheck multiple rounds. Select multiple rounds and choose “Delete selected” to remove them from context (chat history is kept). Changes are saved only when you click “Apply”; closing without applying discards them.') });
     hint.style.cssText = 'padding:8px 10px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);line-height:1.5;';
     node.appendChild(hint);
 
@@ -190,8 +197,8 @@
     bar.style.cssText = 'display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid var(--border);flex-wrap:wrap;align-items:center;';
     let mode = 'all';
     const modeBox = el('div');
-    modeBox.style.cssText = 'display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;';
-    const modeBtns = [['all', '全部'], ['on', '适用'], ['off', '不适用']].map(([id, label]) => {
+    modeBox.style.cssText = 'display:flex;border:1px solid var(--border);border-radius:var(--sub-r);overflow:hidden;';
+    const modeBtns = [['all', text('全部', 'All')], ['on', text('适用', 'Applicable')], ['off', text('不适用', 'Not applicable')]].map(([id, label]) => {
       const b = el('button', { textContent: label });
       b.onclick = () => { mode = id; paintModes(); renderList(); };
       modeBox.appendChild(b);
@@ -200,22 +207,22 @@
     function paintModes() {
       for (const [id, b] of modeBtns) {
         b.style.cssText = 'border:0;padding:3px 8px;cursor:pointer;font-size:12px;'
-          + (id === mode ? 'background:var(--accent);color:var(--accent-fg);' : 'background:var(--hover);color:inherit;');
+          + (id === mode ? 'background:var(--primary-bg);color:var(--primary-fg);' : 'background:var(--map-button-bg,var(--btn-bg));color:inherit;');
       }
     }
     paintModes();
     bar.appendChild(modeBox);
     // 筛选按已保存的状态分，勾选中途改动不会让行跳走
     const visible = (r) => mode === 'all' || (mode === 'on' ? !r.skip : r.skip);
-    const selAll = el('button', { textContent: '全选' });
+    const selAll = el('button', { textContent: text('全选', 'Select all') });
     selAll.style.cssText = btnCss;
-    const clearAll = el('button', { textContent: '清空' });
+    const clearAll = el('button', { textContent: text('清空', 'Clear') });
     clearAll.style.cssText = btnCss;
-    const delSel = el('button', { textContent: '删除所选' });
-    delSel.title = '把当前勾上的轮次从上下文去掉，聊天记录保留';
+    const delSel = el('button', { textContent: text('删除所选', 'Delete selected') });
+    delSel.title = text('把当前勾上的轮次从上下文去掉，聊天记录保留', 'Remove the checked rounds from context while keeping chat history');
     delSel.style.cssText = btnCss;
-    const apply = el('button', { textContent: '应用' });
-    apply.style.cssText = 'margin-left:auto;border:1px solid var(--border);background:var(--accent);color:var(--accent-fg);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:12px;';
+    const apply = el('button', { textContent: text('应用', 'Apply') });
+    apply.style.cssText = 'margin-left:auto;border:1px solid var(--border);background:var(--primary-bg);color:var(--primary-fg);border-radius:var(--sub-r);padding:3px 10px;cursor:pointer;font-size:12px;';
     bar.appendChild(selAll);
     bar.appendChild(clearAll);
     bar.appendChild(delSel);
@@ -238,8 +245,8 @@
       if (text) text.style.color = want ? '' : 'var(--muted)';
       const tag = row.querySelector('[data-round-tag]');
       if (tag) {
-        tag.textContent = HOW_LABEL[want ? 'title' : 'off'];
-        tag.style.cssText = 'font-size:10px;padding:0 5px;border-radius:4px;border:1px solid var(--border);'
+        tag.textContent = howLabel(want ? 'title' : 'off');
+        tag.style.cssText = 'font-size:10px;padding:0 5px;border-radius:var(--sub-r);border:1px solid var(--border);'
           + (want ? 'color:var(--accent);border-color:var(--accent);' : 'color:var(--muted);');
       }
       return had !== want;
@@ -269,16 +276,16 @@
         chk.tabIndex = -1;
         // 勾选改走拖选 / 按下，避免和拖选抢 change
         chk.addEventListener('click', (e) => e.preventDefault());
-        const text = el('span', { textContent: `R${r.n} ${r.title}` });
-        text.dataset.roundText = '1';
-        text.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' + (on.has(r.n) ? '' : 'color:var(--muted);');
+        const rowText = el('span', { textContent: `R${r.n} ${r.title}` });
+        rowText.dataset.roundText = '1';
+        rowText.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' + (on.has(r.n) ? '' : 'color:var(--muted);');
         const h = how.get(r.n);
-        const tag = el('span', { textContent: HOW_LABEL[h] });
+        const tag = el('span', { textContent: howLabel(h) });
         tag.dataset.roundTag = '1';
-        tag.style.cssText = 'font-size:10px;padding:0 5px;border-radius:4px;border:1px solid var(--border);'
+        tag.style.cssText = 'font-size:10px;padding:0 5px;border-radius:var(--sub-r);border:1px solid var(--border);'
           + (h === 'title' ? 'color:var(--accent);border-color:var(--accent);' : 'color:var(--muted);');
-        const del = el('button', { type: 'button', textContent: '删' });
-        del.title = '从上下文删除这一轮';
+        const del = el('button', { type: 'button', textContent: text('删', 'Del') });
+        del.title = text('从上下文删除这一轮', 'Remove this round from context');
         del.style.cssText = 'border:0;background:none;color:var(--muted);cursor:pointer;font-size:12px;padding:0 2px;';
         del.onclick = (e) => { e.preventDefault(); e.stopPropagation(); if (onRemove) onRemove([r.n]); };
         function hitPaint(want) {
@@ -299,7 +306,7 @@
           hitPaint(dragPaint);
         };
         lab.appendChild(chk);
-        lab.appendChild(text);
+        lab.appendChild(rowText);
         lab.appendChild(tag);
         row.appendChild(lab);
         row.appendChild(del);
@@ -311,10 +318,26 @@
     clearAll.onclick = () => { for (const r of rounds) if (visible(r)) on.delete(r.n); onChange(); };
     delSel.onclick = () => {
       const ns = rounds.filter((r) => visible(r) && on.has(r.n)).map((r) => r.n);
-      if (!ns.length) { alert('先勾选要删的轮次'); return; }
+      if (!ns.length) { alert(text('先勾选要删的轮次', 'Select the rounds to delete first')); return; }
       if (onRemove) onRemove(ns);
     };
-    apply.onclick = onApply;
+    apply.onclick = async () => {
+      if (apply.disabled) return;
+      const label = text('应用', 'Apply');
+      apply.disabled = true;
+      try {
+        const result = onApply ? await onApply() : true;
+        if (result === false) return;
+        apply.textContent = text('已应用', 'Applied');
+        setTimeout(() => {
+          if (apply.isConnected) apply.textContent = label;
+        }, 1400);
+      } catch (err) {
+        alert(err && err.message ? err.message : String(err));
+      } finally {
+        apply.disabled = false;
+      }
+    };
     const _disposePanel = node._dispose;
     node._dispose = () => {
       window.removeEventListener('mouseup', endDrag);
@@ -334,10 +357,7 @@
   function drawTree(canvas, rootTitle, onPick) {
     const dpr = window.devicePixelRatio || 1;
     const ctx = canvas.getContext('2d');
-    const textColor = cssVar('--text') || '#111';
-    const muted = cssVar('--muted') || '#888';
-    const accent = cssVar('--accent') || '#3b6cff';
-    const panelBg = cssVar('--panel') || '#fff';
+    let textColor, muted, accent, panelBg, hoverBg;
     const ROW = 30;
     const COL = 200;
     let nodes = [];
@@ -346,11 +366,10 @@
     let scale = 1;
     let ox = 40;
     let oy = 0;
-    let placed = false;
 
     function clip(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
-    function setData(titleRounds) {
+    function setData(rounds, how) {
       nodes = [];
       links = [];
       root = { label: clip(rootTitle, 24), x: 0, y: 0, kind: 'root' };
@@ -359,7 +378,7 @@
       function leafCol(col, list) {
         const first = row;
         const leaves = list.map((r) => {
-          const leaf = { label: clip(`R${r.n} ${r.title}`, 26), x: col, y: row * ROW, kind: 'leaf', how: 'title', round: r };
+          const leaf = { label: clip(`R${r.n} ${r.title}`, 26), x: col, y: row * ROW, kind: 'leaf', how: (how && how.get(r.n)) || 'title', round: r };
           row += 1;
           nodes.push(leaf);
           return leaf;
@@ -367,36 +386,45 @@
         return { leaves, y: ((first + row - 1) / 2) * ROW };
       }
       let branch;
-      if (!titleRounds.length) {
-        branch = { label: '没有上下文会塞给 AI', x: COL, y: 0, kind: 'branch', how: 'off' };
+      const branchHow = rounds.some((r) => how && how.get(r.n) === 'title') ? 'title' : 'off';
+      if (!rounds.length) {
+        branch = { label: text('没有上下文会塞给 AI', 'No context will be sent to AI'), x: COL, y: 0, kind: 'empty', how: 'off' };
         nodes.push(branch);
-      } else if (titleRounds.length <= GROUP_SIZE) {
-        const part = leafCol(COL * 2, titleRounds);
-        branch = { label: `标题（${titleRounds.length} 轮）`, x: COL, y: part.y, kind: 'branch', how: 'title' };
+      } else if (rounds.length <= GROUP_SIZE) {
+        const part = leafCol(COL * 2, rounds);
+        branch = { label: text(`轮次（${rounds.length} 轮）`, `Rounds (${rounds.length})`), x: COL, y: part.y, kind: 'branch', how: branchHow };
         nodes.push(branch);
         for (const leaf of part.leaves) links.push([branch, leaf]);
       } else {
         const groups = [];
-        for (let g = 0; g * GROUP_SIZE < titleRounds.length; g++) {
-          const list = titleRounds.slice(g * GROUP_SIZE, (g + 1) * GROUP_SIZE);
+        for (let g = 0; g * GROUP_SIZE < rounds.length; g++) {
+          const list = rounds.slice(g * GROUP_SIZE, (g + 1) * GROUP_SIZE);
           const part = leafCol(COL * 3, list);
-          const grp = { label: `R${list[0].n}-R${list[list.length - 1].n}`, x: COL * 2, y: part.y, kind: 'group', how: 'title' };
+          const grp = { label: `R${list[0].n}-R${list[list.length - 1].n}`, x: COL * 2, y: part.y, kind: 'group', how: branchHow };
           nodes.push(grp);
           for (const leaf of part.leaves) links.push([grp, leaf]);
           groups.push(grp);
           row += 0.4;
         }
-        branch = { label: `标题（${titleRounds.length} 轮）`, x: COL, y: groups.reduce((s, g) => s + g.y, 0) / groups.length, kind: 'branch', how: 'title' };
+        branch = { label: text(`轮次（${rounds.length} 轮）`, `Rounds (${rounds.length})`), x: COL, y: groups.reduce((s, g) => s + g.y, 0) / groups.length, kind: 'branch', how: branchHow };
         nodes.push(branch);
         for (const g of groups) links.push([branch, g]);
       }
+      // 根标题长度不固定；固定 COL 会让长标题和分支节点压在一起。把整棵子树
+      // 一起向右移，给根节点留出完整宽度和间距，同时保持后续列之间的距离不变。
+      const branchX = Math.max(COL, boxOf(root).w + 36);
+      const shiftX = branchX - COL;
+      for (const node of nodes) {
+        if (node !== root) node.x += shiftX;
+      }
       root.y = branch.y;
       links.push([root, branch]);
-      if (!placed) {
-        const rect = canvas.getBoundingClientRect();
-        if (rect.height) { oy = rect.height / 2 - root.y; placed = true; }
-      }
+      console.log('[上下文应用诊断] 导图数据已更新', { roundCount: rounds.length, nodeCount: nodes.length, linkCount: links.length });
+      fitToData();
+      console.log('[上下文应用诊断] 开始重绘');
       redraw();
+      console.log('[上下文应用诊断] 重绘是否发生', true);
+      console.log('[上下文应用诊断] 重绘完成');
     }
 
     function colorOf(n) {
@@ -407,16 +435,41 @@
     function boxOf(n) {
       ctx.font = (n.kind === 'leaf' ? '12px' : '600 13px') + ' sans-serif';
       const w = ctx.measureText(n.label).width + 20;
-      return { x: n.x, y: n.y - 11, w, h: 22 };
+      const h = n.kind === 'empty' ? 30 : 22;
+      return { x: n.x, y: n.y - h / 2, w, h };
     }
     function resize() {
       const r = canvas.getBoundingClientRect();
       canvas.width = Math.max(1, r.width * dpr);
       canvas.height = Math.max(1, r.height * dpr);
-      if (!placed && root && r.height) { oy = r.height / 2 - root.y; placed = true; }
+      if (root && nodes.length) fitToData();
       redraw();
     }
+    function fitToData() {
+      const rect = canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height || !nodes.length) return;
+      const boxes = nodes.map(boxOf);
+      const minX = Math.min(...boxes.map((b) => b.x));
+      const maxX = Math.max(...boxes.map((b) => b.x + b.w));
+      const minY = Math.min(...boxes.map((b) => b.y));
+      const maxY = Math.max(...boxes.map((b) => b.y + b.h));
+      const contentWidth = Math.max(1, maxX - minX);
+      const contentHeight = Math.max(1, maxY - minY);
+      // 右侧筛选面板覆盖画布，按左侧约 72% 的可视宽度适配。
+      const availableWidth = rect.width * 0.72;
+      const padding = 36;
+      scale = Math.min(1.4, Math.max(0.25,
+        Math.min((availableWidth - padding * 2) / contentWidth, (rect.height - padding * 2) / contentHeight)));
+      ox = (availableWidth - contentWidth * scale) / 2 - minX * scale;
+      oy = (rect.height - contentHeight * scale) / 2 - minY * scale;
+    }
     function redraw() {
+      const theme = getComputedStyle(document.documentElement);
+      textColor = theme.getPropertyValue('--text').trim();
+      muted = theme.getPropertyValue('--muted').trim();
+      accent = theme.getPropertyValue('--accent').trim();
+      panelBg = theme.getPropertyValue('--panel-solid').trim();
+      hoverBg = theme.getPropertyValue('--hover').trim();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
@@ -434,7 +487,7 @@
       ctx.globalAlpha = 1;
       for (const n of nodes) {
         const bx = boxOf(n);
-        ctx.fillStyle = panelBg;
+        ctx.fillStyle = n.kind === 'empty' ? hoverBg : panelBg;
         ctx.strokeStyle = colorOf(n);
         ctx.beginPath();
         if (ctx.roundRect) ctx.roundRect(bx.x, bx.y, bx.w, bx.h, 6); else ctx.rect(bx.x, bx.y, bx.w, bx.h);
@@ -494,9 +547,12 @@
     }, { passive: false });
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);
+    const themeObserver = new MutationObserver(redraw);
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'style'] });
     return {
       setData,
       dispose() {
+        themeObserver.disconnect();
         ro.disconnect();
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);

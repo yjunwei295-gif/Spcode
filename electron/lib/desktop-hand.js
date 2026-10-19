@@ -1,16 +1,12 @@
-// 虚拟光标与桌面操作。平时慢半拍跟随用户鼠标；接到命令后停住，自己去点、去打字。
+// AGI 桌面操作：按已观察画面的坐标执行系统鼠标和键盘动作。
 // [铆钉优化] AGI（原「活过来」）重做：坐标锁定到画面帧、操作后自动回看画面、用户动鼠标时让路、焦点防误打到 SimpleCode 自己、窗口切换。其他 AI 请勿改回 lastLook 被后台刷新覆盖的写法。
-const { app, BrowserWindow, screen, clipboard } = require('electron');
+const { app, screen, clipboard } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const diag = require('./diag');
 
 const SIGHT_MAX = 50;
-// [铆钉优化] 跟手降到约 12fps，减轻 AGI 开着时整机卡顿。其他 AI 请勿改回 45
-const FOLLOW_MS = 80;
-const FOLLOW_BLEND = 0.2;
-const CURSOR_GAP = 20;
 const SETTLE_MS = 450;
 const USER_IDLE_WAIT_MS = 2500;
 const UNICODE_TYPE_MAX = 400;
@@ -18,10 +14,6 @@ const FRAME_STALE_MS = 60 * 1000;
 
 let alive = false;
 let busy = false;
-let cursorWin = null;
-let followTimer = null;
-let vx = null;
-let vy = null;
 let helper = null;
 let helperQueue = Promise.resolve();
 let lastFrame = null;
@@ -38,88 +30,6 @@ function isAlive() {
 
 function isBusy() {
   return busy;
-}
-
-function placeCursor(x, y) {
-  if (!cursorWin || cursorWin.isDestroyed()) return;
-  // 蓝箭头放在真鼠标右下方，避免透明窗压住鼠标尖导致系统光标消失
-  cursorWin.setPosition(Math.round(x) + CURSOR_GAP, Math.round(y) + CURSOR_GAP);
-}
-
-function pierceCursor() {
-  if (!cursorWin || cursorWin.isDestroyed()) return;
-  try { cursorWin.setIgnoreMouseEvents(true, { forward: true }); }
-  catch { /* 窗口尚未就绪时忽略，显示后再设一次 */ }
-}
-
-function showCursor() {
-  if (!alive || !cursorWin || cursorWin.isDestroyed()) return;
-  pierceCursor();
-  cursorWin.showInactive();
-}
-
-function stepFollow() {
-  if (!alive || busy) return;
-  let point;
-  try { point = screen.getCursorScreenPoint(); } catch { return; }
-  if (vx == null || vy == null) {
-    vx = point.x;
-    vy = point.y;
-  } else {
-    vx += (point.x - vx) * FOLLOW_BLEND;
-    vy += (point.y - vy) * FOLLOW_BLEND;
-    if (Math.abs(point.x - vx) < 0.6 && Math.abs(point.y - vy) < 0.6) {
-      vx = point.x;
-      vy = point.y;
-    }
-  }
-  placeCursor(vx, vy);
-}
-
-function cursorHtml() {
-  return `<!doctype html><html><head><meta charset="utf-8"></head><body style="margin:0;background:transparent;overflow:hidden">
-<svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
-  <path d="M4 3 L4 22 L9 17 L13 25 L16 23 L12 15 L20 15 Z" fill="#2f6fed" stroke="#fff" stroke-width="1.4"/>
-</svg></body></html>`;
-}
-
-function ensureCursor() {
-  if (cursorWin && !cursorWin.isDestroyed()) {
-    showCursor();
-    return;
-  }
-  const point = screen.getCursorScreenPoint();
-  vx = point.x;
-  vy = point.y;
-  cursorWin = new BrowserWindow({
-    width: 28,
-    height: 28,
-    x: Math.round(vx) + CURSOR_GAP,
-    y: Math.round(vy) + CURSOR_GAP,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    skipTaskbar: true,
-    focusable: false,
-    resizable: false,
-    movable: false,
-    hasShadow: false,
-    show: false,
-    backgroundColor: '#00000000',
-    webPreferences: { nodeIntegration: false, contextIsolation: true }
-  });
-  pierceCursor();
-  cursorWin.setAlwaysOnTop(true, 'pop-up-menu');
-  cursorWin.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(cursorHtml()));
-  cursorWin.once('ready-to-show', showCursor);
-  cursorWin.webContents.once('did-finish-load', showCursor);
-  cursorWin.on('closed', () => { cursorWin = null; });
-}
-
-function hideCursor() {
-  try {
-    if (cursorWin && !cursorWin.isDestroyed()) cursorWin.hide();
-  } catch { /* 退出时窗口可能已经销毁 */ }
 }
 
 function stopHelper() {
@@ -216,15 +126,10 @@ function setAlive(on) {
     lastFrame = null;
     uiaFails = 0;
     uiaPausedUntil = 0;
-    if (followTimer) { clearInterval(followTimer); followTimer = null; }
-    hideCursor();
     stopHelper();
     screenText.reset();
     return false;
   }
-  ensureCursor();
-  if (!followTimer) followTimer = setInterval(stepFollow, FOLLOW_MS);
-  stepFollow();
   return true;
 }
 
@@ -422,18 +327,6 @@ function lastObserved() {
   try { return require('./screen-text-map').lastFrame(); } catch { return null; }
 }
 
-async function moveTo(x, y) {
-  const denied = gate();
-  if (denied) return denied;
-  hold();
-  const frame = await ensureFrame();
-  const p = toScreen(frame, x, y);
-  vx = p.x;
-  vy = p.y;
-  placeCursor(vx, vy);
-  return `虚拟光标已移到画面 ${frame.id} 的 (${Math.round(Number(x) || 0)}, ${Math.round(Number(y) || 0)})。`;
-}
-
 async function clickAt(x, y, button, times) {
   const denied = gate();
   if (denied) return denied;
@@ -442,9 +335,6 @@ async function clickAt(x, y, button, times) {
   if (!await waitUserIdle()) return '用户正在使用鼠标，这次点击已放弃。等用户停下后再试。';
   const before = lastObserved();
   const p = toScreen(frame, x, y);
-  vx = p.x;
-  vy = p.y;
-  placeCursor(vx, vy);
   const phys = toPhysical(p.x, p.y);
   const res = await winInput({
     op: 'click',
@@ -489,18 +379,11 @@ async function dragStroke(rawPoints, button) {
   const before = lastObserved();
   const screenPts = used.map((p) => toScreen(frame, p.x, p.y));
   const physical = screenPts.map((p) => toPhysical(p.x, p.y));
-  vx = screenPts[0].x;
-  vy = screenPts[0].y;
-  placeCursor(vx, vy);
   const res = await winInput({
     op: 'drag',
     button: button === 'right' || button === 'middle' ? button : 'left',
     points: physical
   }, 60000);
-  const end = screenPts[screenPts.length - 1];
-  vx = end.x;
-  vy = end.y;
-  placeCursor(vx, vy);
   if (!res || res.ok === false) return `拖动失败：${(res && res.message) || '未知原因'}`;
   const a = used[0];
   const b = used[used.length - 1];
@@ -516,9 +399,6 @@ async function scrollAt(x, y, delta) {
   if (!await waitUserIdle()) return '用户正在使用鼠标，这次滚动已放弃。';
   const before = lastObserved();
   const p = toScreen(frame, x, y);
-  vx = p.x;
-  vy = p.y;
-  placeCursor(vx, vy);
   const phys = toPhysical(p.x, p.y);
   const wheel = Math.max(-2400, Math.min(2400, Math.round(Number(delta) || -120)));
   const res = await winInput({ op: 'scroll', x: phys.x, y: phys.y, delta: wheel });
@@ -749,6 +629,6 @@ function importClipboardImage() {
 module.exports = {
   isAlive, isBusy, setAlive, hold, release, noteLook, currentFrame, listWindows, scanControls,
   assessRisk, allowRiskyThisTurn, controlLabel, TYPE_ZH,
-  moveTo, clickAt, dragStroke, scrollAt, typeText, tapKeys, windowList, windowFocus, uiAct,
+  clickAt, dragStroke, scrollAt, typeText, tapKeys, windowList, windowFocus, uiAct,
   captureScreen, importClipboardImage, nameSightFile
 };

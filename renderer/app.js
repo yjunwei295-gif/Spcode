@@ -387,6 +387,334 @@ function showWelcome() {
   $('view-chat').classList.add('hidden');
 }
 
+let onboardingModulesResume = false;
+let localGuideContinueOnboarding = false;
+
+async function startOnboarding() {
+  const wizard = { step: 'providers', presets: [], selected: [], keyed: [], modelIndex: 0, remote: null, choices: new Map() };
+  const describeElement = (el) => el ? {
+    tag: el.tagName?.toLowerCase() || '',
+    id: el.id || '',
+    className: typeof el.className === 'string' ? el.className : ''
+  } : null;
+  const logOnboarding = (event, details = {}) => api.reportError?.('引导诊断', {
+    event,
+    step: wizard.step,
+    modalVisible: !$('modal')?.classList.contains('hidden'),
+    modalOpen: $('modal')?.classList.contains('is-open'),
+    eventTarget: details.eventTarget || null,
+    activeElement: describeElement(document.activeElement),
+    ...details
+  });
+  let loggedStep = null;
+  logOnboarding('start');
+  try {
+    wizard.presets = await api.listProviderPresets();
+  } catch {
+    wizard.presets = [];
+  }
+
+  const render = () => {
+    const currentPosition = {
+      step: wizard.step,
+      keyIndex: wizard.keyIndex ?? null,
+      modelIndex: wizard.modelIndex
+    };
+    const positionKey = `${currentPosition.step}:${currentPosition.keyIndex ?? ''}:${currentPosition.modelIndex}`;
+    if (loggedStep !== positionKey) {
+      logOnboarding('step-change', { previousPosition: loggedStep, currentPosition });
+      loggedStep = positionKey;
+    }
+    logOnboarding('render', currentPosition);
+    if (wizard.step === 'providers') {
+      openModal(`<h3>${t('onboardingStepProvider')}</h3>
+        <div id="onboarding-providers">${wizard.presets.map((p, i) => `
+          <label class="check-row"><input type="checkbox" data-onboarding-provider="${i}" ${wizard.selected.includes(i) ? 'checked' : ''} />
+            ${escapeHtml(p.name || p.id)} <span class="hint">${escapeHtml(p.protocol || '')}</span></label>`).join('') || `<p class="hint">${t('noProviders')}</p>`}</div>
+        <div class="modal-actions"><button type="button" id="onboarding-skip">${t('onboardingSkip')}</button><button type="button" class="primary" id="onboarding-next">${t('onboardingNext')}</button></div>`);
+      $('onboarding-skip').onclick = () => {
+        closeModal();
+        localStorage.setItem('spcode.onboarding.completed', 'true');
+      };
+      $('onboarding-next').onclick = () => {
+        wizard.selected = [...document.querySelectorAll('[data-onboarding-provider]:checked')].map((el) => Number(el.dataset.onboardingProvider));
+        wizard.keyed = [];
+        wizard.keyIndex = 0;
+        wizard.step = 'keys';
+        render();
+      };
+      return;
+    }
+    if (wizard.step === 'keys') {
+      if (wizard.keyIndex >= wizard.selected.length) {
+        wizard.keyed = wizard.keyed.filter((p) => p.apiKey || ['cursor', 'codex'].includes(p.protocol));
+        if (!wizard.keyed.length) {
+          wizard.step = 'empty';
+          render();
+          return;
+        }
+        const byName = new Map((state.providers || []).map((p) => [p.name, p]));
+        wizard.keyed = wizard.keyed.map((p) => {
+          const existing = byName.get(p.name);
+          return { ...existing, ...p, id: existing?.id || uid().replace(/^s_/, 'prov_'), timeout: existing?.timeout || 120, maxRetries: existing?.maxRetries ?? 3, retryInterval: existing?.retryInterval ?? 5 };
+        });
+        for (const p of wizard.keyed) {
+          const idx = state.providers.findIndex((x) => x.id === p.id);
+          if (idx >= 0) state.providers[idx] = { ...state.providers[idx], ...p };
+          else state.providers.push(p);
+        }
+        persistModels().then(() => {
+          wizard.step = 'models';
+          wizard.modelIndex = 0;
+          render();
+        }).catch((err) => alert(err?.message || err));
+        return;
+      }
+      const preset = wizard.presets[wizard.selected[wizard.keyIndex]];
+      const saved = (state.providers || []).find((p) => p.name === preset.name);
+      const usesLocalLogin = ['cursor', 'codex'].includes(preset.protocol);
+      const keyStepContent = usesLocalLogin
+        ? `<p class="hint">${escapeHtml(preset.protocol === 'cursor' ? 'Cursor 无需填写 API Key，下一步将直接使用本机 Cursor SDK 登录。' : 'Codex 无需填写 API Key，下一步将直接使用本机 Codex CLI 登录。')}</p>`
+        : `<label>${t('apiKey')}</label><input id="onboarding-key" type="password" value="${escapeHtml(saved?.apiKey || '')}" placeholder="sk-..." />`;
+      openModal(`<h3>${t('onboardingStepKey')}（${wizard.keyIndex + 1}/${wizard.selected.length}）</h3>
+        <p class="hint">${escapeHtml(preset.name || preset.id)}</p>
+        ${keyStepContent}
+        <div class="modal-actions"><button type="button" id="onboarding-skip">${t('onboardingSkip')}</button><button type="button" class="primary" id="onboarding-next">${t('onboardingNext')}</button></div>`);
+      const keyInput = $('onboarding-key');
+      if (keyInput) {
+        ['mousedown', 'click', 'focus', 'blur'].forEach((event) => keyInput.addEventListener(event, (e) => {
+          logOnboarding(`api-key-${event}`, {
+            inputPresent: Boolean($('onboarding-key')),
+            eventTarget: describeElement(e.target)
+          });
+        }));
+      }
+      logOnboarding('api-key-input-ready', { inputPresent: Boolean(keyInput) });
+      const continueKey = (skip) => {
+        const key = skip || usesLocalLogin ? '' : $('onboarding-key').value.trim();
+        if (!skip && (key || usesLocalLogin)) wizard.keyed.push({ ...preset, apiKey: key });
+        wizard.keyIndex++;
+        render();
+      };
+      $('onboarding-skip').onclick = () => continueKey(true);
+      $('onboarding-next').onclick = () => continueKey(false);
+      return;
+    }
+    if (wizard.step === 'empty') {
+      openModal(`<h3>${t('onboardingFinish')}</h3><p class="hint">${t('onboardingKeyMissing')}</p>
+        <div class="modal-actions"><button type="button" class="primary" id="onboarding-finish">${t('onboardingFinish')}</button></div>`);
+      $('onboarding-finish').onclick = () => {
+        closeModal();
+        openOnboardingModules();
+      };
+      return;
+    }
+    if (wizard.step === 'models') {
+      if (wizard.modelIndex >= wizard.keyed.length) {
+        const selectedModels = [...wizard.choices.values()].flat();
+        for (const model of selectedModels) {
+          const existing = state.models.find((m) => m.type !== 'local' && m.providerId === model.providerId && m.model === model.model);
+          if (!existing) state.models.push(model);
+        }
+        persistModels().then(() => enterConfig()).catch((err) => alert(err?.message || err));
+        return;
+      }
+      const provider = wizard.keyed[wizard.modelIndex];
+      const remote = wizard.remote;
+      const items = remote?.providerId === provider.id ? remote.models : [];
+      const picked = wizard.choices.get(provider.id) || [];
+      openModal(`<h3>${t('onboardingStepModel')}（${wizard.modelIndex + 1}/${wizard.keyed.length}）</h3>
+        <p class="hint">${escapeHtml(provider.name)}</p>
+        <button type="button" id="onboarding-fetch">${t('fetchModels')}</button>
+        <div id="onboarding-model-list" class="remote-model-list">${items.length ? items.map((id) => `<label class="remote-model-item"><input type="checkbox" data-onboarding-model="${escapeHtml(id)}" ${picked.some((m) => m.model === id) ? 'checked' : ''} /> <span>${escapeHtml(remote.catalog?.[id]?.name || id)}</span></label>`).join('') : `<p class="hint">${t('fetchModelsEmpty')}</p>`}</div>
+        <div class="modal-actions"><button type="button" id="onboarding-back">${t('onboardingBack')}</button><button type="button" class="primary" id="onboarding-next">${wizard.modelIndex + 1 === wizard.keyed.length ? t('onboardingFinish') : t('onboardingNext')}</button></div>`);
+      $('onboarding-fetch').onclick = async () => {
+        const btn = $('onboarding-fetch');
+        btn.disabled = true;
+        try {
+          const result = await api.listRemoteModels(provider.id);
+          wizard.remote = { providerId: provider.id, models: result.models || [], catalog: result.catalog || {} };
+          render();
+        } catch (err) {
+          alert(err?.message || err);
+        } finally {
+          if ($('onboarding-fetch')) $('onboarding-fetch').disabled = false;
+        }
+      };
+      $('onboarding-model-list').onchange = (e) => {
+        const id = e.target.closest('[data-onboarding-model]')?.dataset.onboardingModel;
+        if (!id) return;
+        const catalog = remote?.catalog?.[id] || {};
+        const selected = wizard.choices.get(provider.id) || [];
+        if (e.target.checked) {
+          if (!selected.some((m) => m.model === id)) selected.push({ id: uid(), name: catalog.name || id, model: id, type: 'api', providerId: provider.id, vision: false, enabled: true, pricing: catalog.priceText ? { text: catalog.priceText, input: catalog.input, output: catalog.output } : null });
+        } else {
+          const index = selected.findIndex((m) => m.model === id);
+          if (index >= 0) selected.splice(index, 1);
+        }
+        wizard.choices.set(provider.id, selected);
+      };
+      $('onboarding-back').onclick = () => {
+        wizard.modelIndex = Math.max(0, wizard.modelIndex - 1);
+        wizard.remote = null;
+        render();
+      };
+      $('onboarding-next').onclick = () => {
+        if (remote?.providerId === provider.id) {
+          wizard.modelIndex++;
+          wizard.remote = null;
+          render();
+        } else {
+          alert(t('fetchModelsEmpty'));
+        }
+      };
+    }
+  };
+
+  const enterConfig = () => {
+    const previousPosition = loggedStep;
+    wizard.step = 'config';
+    loggedStep = 'config::0';
+    logOnboarding('step-change', {
+      previousPosition,
+      currentPosition: { step: wizard.step, keyIndex: null, modelIndex: wizard.modelIndex }
+    });
+    openOnboardingModules();
+  };
+  render();
+}
+
+// 引导第三步：配置 8 个能力模块的默认 / 备用模型；总结、代码、规划三项必选
+function openOnboardingModules() {
+  const caps = state.capabilityDefaults || {};
+  // 必选的三项：总结、代码、规划
+  const requiredRoles = ['summary', 'code', 'planning'];
+  // 是否存在任何可选模型：API 模型或本地 gguf
+  const hasAnyModel = (state.models || []).some((m) => m && m.type !== 'local') || (state.localFiles || []).length > 0;
+
+  // 生成 8 行模块配置：每行两个下拉，必选的三项标题后加红字标记
+  const buildRows = () => {
+    const parts = [];
+    for (const role of CAP_ROLES) {
+      const pack = caps[role.id] || {};
+      const primary = capValOf(pack.primary);
+      const fallback = capValOf((pack.fallbacks || [])[0]);
+      const required = requiredRoles.indexOf(role.id) >= 0;
+      const mark = required
+        ? `<span style="color:var(--danger);font-size:12px;margin-left:6px">${t('onboardingRequired')}</span>`
+        : '';
+      parts.push(`<div class="model-row" style="align-items:flex-start;gap:8px;margin:8px 0">
+        <div style="min-width:96px;padding-top:8px"><b>${t(role.key)}</b>${mark}</div>
+        <div style="flex:1">
+          <label class="hint">${t('capabilityPrimary')}</label>
+          <select data-cap-role="${role.id}" data-cap-which="primary">${capSelectOptionsHtml(primary)}</select>
+          <label class="hint">${t('capabilityFallback')}</label>
+          <select data-cap-role="${role.id}" data-cap-which="fallback">${capSelectOptionsHtml(fallback)}</select>
+        </div>
+      </div>`);
+    }
+    return parts.join('');
+  };
+
+  openModal(`<h3>${t('onboardingModulesTitle')}</h3>
+    <p class="hint">${t('onboardingModulesHint')}</p>
+    <div id="onboarding-modules-list">${buildRows()}</div>
+    <p class="hint" id="onboarding-modules-tip"></p>
+    <div class="modal-actions">
+      <button type="button" id="onboarding-modules-settings">${t('onboardingGoSettings')}</button>
+      <button type="button" class="primary" id="onboarding-modules-done">${t('onboardingModulesDone')}</button>
+    </div>`);
+  // openModal 会清掉 wide 类，这里打开后再加回来
+  $('modal-card').classList.add('wide');
+
+  const box = $('onboarding-modules-list');
+  const tipEl = $('onboarding-modules-tip');
+  const doneBtn = $('onboarding-modules-done');
+
+  // 找出必选项里还没选默认模型的角色
+  const missingRoles = () => {
+    const missing = [];
+    if (!box) return missing;
+    for (const role of CAP_ROLES) {
+      if (requiredRoles.indexOf(role.id) < 0) continue;
+      const sel = box.querySelector(`select[data-cap-role="${role.id}"][data-cap-which="primary"]`);
+      if (!sel || !String(sel.value || '').trim()) missing.push(role);
+    }
+    return missing;
+  };
+
+  // 刷新「完成」按钮的可用状态与提示行
+  const syncDone = () => {
+    if (!doneBtn) return;
+    if (!hasAnyModel) {
+      if (tipEl) tipEl.textContent = t('onboardingModulesNoModel');
+      doneBtn.disabled = true;
+      return;
+    }
+    const missing = missingRoles();
+    if (missing.length) {
+      const names = [];
+      for (const role of missing) names.push(t(role.key));
+      if (tipEl) tipEl.textContent = `${t('onboardingModulesMissing')}${names.join('、')}`;
+      doneBtn.disabled = true;
+      return;
+    }
+    if (tipEl) tipEl.textContent = '';
+    doneBtn.disabled = false;
+  };
+
+  if (box) box.addEventListener('change', syncDone);
+  syncDone();
+
+  // 完成：读值 → 保存能力默认 → 持久化模型 → 标记引导已完结 → 关闭并进对话
+  doneBtn.onclick = async () => {
+    try {
+      const read = readCapFromContainer(box);
+      state.capabilityDefaults = await api.saveCapabilityDefaults(read);
+      await persistModels();
+    } catch (err) {
+      alert(err && err.message ? err.message : t('saveFail'));
+      return;
+    }
+    // 能力默认模型改变后重绘底部模型栏；否则引导页刚载入时的“大脑”单标签会残留。
+    renderModelMenu();
+    localStorage.setItem('spcode.onboarding.completed', 'true');
+    closeModal();
+    showChat();
+  };
+
+  // 前往设置：配好模型后由设置页保存（m-ok）自动回到这个界面
+  $('onboarding-modules-settings').onclick = () => {
+    closeModal();
+    onboardingModulesResume = true;
+    openSettings();
+  };
+}
+
+function showLocalModelGuide(firstRun = false) {
+  openModal(`<h3>本地模型指南</h3>
+    <p class="hint">你可以在下载界面中选择并下载 <code>.gguf</code> 模型，或选择已有模型所在的目录。完成后，从顶部的模型菜单中选择本地模型即可使用。</p>
+    <p class="hint">点击“前往下载”选择并下载本地模型；也可以跳过，继续配置在线模型。关闭此指南可继续使用软件。</p>
+    <div class="modal-actions">
+      <button type="button" id="local-guide-close">关闭</button>
+      <button type="button" id="local-guide-skip">跳过</button>
+      <button type="button" class="primary" id="local-guide-settings">前往下载</button>
+    </div>`);
+  $('local-guide-close').onclick = closeModal;
+  $('local-guide-skip').onclick = () => {
+    closeModal();
+    if (firstRun) {
+      showWelcome();
+      startOnboarding();
+    }
+  };
+  $('local-guide-settings').onclick = () => {
+    closeModal();
+    localGuideContinueOnboarding = firstRun;
+    openDownloader();
+  };
+}
+
 function showChat() {
   $('view-welcome').classList.add('hidden');
   $('view-chat').classList.remove('hidden');
@@ -499,7 +827,22 @@ function openModal(html) {
   modal.classList.remove('hidden');
   modal.classList.remove('is-open');
   void modal.offsetWidth;
-  requestAnimationFrame(() => modal.classList.add('is-open'));
+  requestAnimationFrame(() => {
+    modal.classList.add('is-open');
+    api.reportError?.('弹窗状态诊断', {
+      event: 'open',
+      visible: !modal.classList.contains('hidden'),
+      open: modal.classList.contains('is-open'),
+      onboarding: Boolean(card.querySelector('[id^="onboarding-"]')),
+      heading: card.querySelector('h3')?.textContent || '',
+      eventTarget: { tag: modal.tagName?.toLowerCase() || '', id: modal.id || '', className: modal.className || '' },
+      activeElement: document.activeElement ? {
+        tag: document.activeElement.tagName?.toLowerCase() || '',
+        id: document.activeElement.id || '',
+        className: typeof document.activeElement.className === 'string' ? document.activeElement.className : ''
+      } : null
+    });
+  });
 }
 function closeModal() {
   const modal = $('modal');
@@ -860,8 +1203,8 @@ function slimMessagesForSave(messages) {
   });
 }
 
-function persistTab(tab) {
-  if (!state.autoSave || !tab) return Promise.resolve();
+function persistTab(tab, force = false) {
+  if ((!state.autoSave && !force) || !tab) return Promise.resolve();
   rememberComposer(tab);
   if (!tab.messages?.length && !tab.composer) return Promise.resolve();
   return api.saveSession({
@@ -3238,9 +3581,13 @@ async function sendOne(tab, text, draft) {
   // 带上轮次编号、不适用标记和索引：后台更早的轮次只发索引，不适用的整轮跳过
   const history = tab.messages.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => {
     const r = roundByMsg.get(m);
+    const landed = m.role === 'assistant' && Array.isArray(m.changes)
+      ? m.changes.map((change) => `${change.action || '修改'} ${change.path || ''}`.trim()).filter(Boolean)
+      : [];
+    const content = [m.text || '', landed.length ? `【程序记录的文件变更】\n${landed.join('\n')}` : ''].filter(Boolean).join('\n\n');
     return {
       role: m.role,
-      content: m.text || '',
+      content,
       round: r ? r.n : undefined,
       skip: !!(r && r.user.ctxSkip && !r.user.ctxRemoved),
       removed: !!(r && r.user.ctxRemoved),
@@ -3596,8 +3943,11 @@ function fillDialogIndex(tab, asst, modelId) {
 function openDialogMap(turnId) {
   const tab = activeSession();
   if (!tab || !window.DialogMap) return;
+  const latestAssistantTurn = [...(tab.messages || [])].reverse().find((m) => m.role === 'assistant' && m.turnId);
+  const previewTurnId = turnId || latestAssistantTurn?.turnId || null;
   const one = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-  const rounds = dialogRounds(tab).filter((r) => !r.user.ctxRemoved).map((r) => {
+  const editableRounds = dialogRounds(tab).filter((r) => !r.user.ctxRemoved);
+  const rounds = editableRounds.map((r) => {
     const idx = r.asst && r.asst.dialogIndex;
     return {
       n: r.n,
@@ -3612,10 +3962,14 @@ function openDialogMap(turnId) {
   window.DialogMap.open({
     title: tab.title || t('newChat'),
     rounds,
-    onApply: (payload) => {
+    onApply: async (payload) => {
       const skipSet = payload && payload.skipSet ? payload.skipSet : payload;
       const removeSet = (payload && payload.removeSet) || new Set();
-      for (const r of dialogRounds(tab)) {
+      const previous = editableRounds.map(({ user }) => ({
+        user, skip: user.ctxSkip, removed: user.ctxRemoved
+      }));
+      // 只修改打开导图时的轮次，避免把期间新增消息的筛选状态覆盖掉。
+      for (const r of editableRounds) {
         if (removeSet.has(r.n)) {
           r.user.ctxRemoved = true;
           continue;
@@ -3623,10 +3977,19 @@ function openDialogMap(turnId) {
         if (r.user.ctxRemoved) continue;
         r.user.ctxSkip = skipSet.has(r.n);
       }
+      try {
+        await persistTab(tab, true);
+      } catch (err) {
+        for (const { user, skip, removed } of previous) {
+          if (skip === undefined) delete user.ctxSkip; else user.ctxSkip = skip;
+          if (removed === undefined) delete user.ctxRemoved; else user.ctxRemoved = removed;
+        }
+        throw err;
+      }
       renderMessages();
-      persistTab(tab);
+      return true;
     },
-    onPreview: turnId ? () => openContextPreview(turnId) : null
+    onPreview: previewTurnId ? () => openContextPreview(previewTurnId) : null
   });
 }
 
@@ -4225,6 +4588,118 @@ function paintIndexCard(st) {
   if (delBtn) delBtn.disabled = noWs;
 }
 
+// ===== 能力槽位公用配置项与小工具：设置页和引导界面共用同一套，避免两处各写一份 =====
+
+// 八项能力角色；key 是界面文案的 i18n 键（与 roleLabel 里的映射一致）
+const CAP_ROLES = [
+  { id: 'vision', key: 'roleVision' },
+  { id: 'summary', key: 'roleSummary' },
+  { id: 'code', key: 'roleCode' },
+  { id: 'planning', key: 'rolePlanning' },
+  { id: 'imageGen', key: 'roleImageGen' },
+  { id: 'videoGen', key: 'roleVideoGen' },
+  { id: 'model3d', key: 'roleModel3d' },
+  { id: 'docGen', key: 'roleDocGen' }
+];
+
+// 把一条能力引用压成下拉框的取值：API 模型 → api:<模型id>，本地模型 → local:<文件名>
+function capValOf(ref) {
+  if (!ref || typeof ref !== 'object') return '';
+  const apiId = String(ref.apiId || '').trim();
+  if (apiId) return `api:${apiId}`;
+  const model = String(ref.model || '').trim();
+  if (model) return `local:${model}`;
+  const file = String(ref.modelPath || '').split(/[\\/]/).pop() || '';
+  if (file) return `local:${file}`;
+  return '';
+}
+
+// 把下拉框取值还原成能力引用；空值表示未设置
+function parseCapRef(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return null;
+  const sep = s.indexOf(':');
+  if (sep < 0) return null;
+  const kind = s.slice(0, sep);
+  const body = s.slice(sep + 1).trim();
+  if (!body) return null;
+  if (kind === 'local') return { type: 'local', model: body };
+  if (kind !== 'api') return null;
+  const found = (state.models || []).find((x) => x.id === body);
+  const ref = {
+    type: 'api',
+    apiId: body,
+    model: found ? String(found.model || '') : '',
+    name: found ? String(found.name || '') : ''
+  };
+  if (found && found.type !== 'local') {
+    const provider = providerById(found.providerId);
+    ref.protocol = String((provider && provider.protocol) || 'openai');
+  }
+  return ref;
+}
+
+// 生成一颗能力下拉框的全部选项：未设置 + 本地模型 + API 模型
+function capSelectOptionsHtml(selected) {
+  const cur = String(selected == null ? '' : selected);
+  const html = [`<option value=""${cur ? '' : ' selected'}>${t('capabilityUnset')}</option>`];
+  let found = !cur;
+  const locals = state.localFiles || [];
+  for (const f of locals) {
+    const name = String((f && f.name) || '');
+    if (!name) continue;
+    const value = `local:${name}`;
+    if (value === cur) found = true;
+    html.push(`<option value="${escapeHtml(value)}"${value === cur ? ' selected' : ''}>${t('local')} · ${escapeHtml(name)}</option>`);
+  }
+  const apis = (state.models || []).filter((m) => m && m.type !== 'local');
+  for (const m of apis) {
+    const value = `api:${String(m.id || '')}`;
+    if (!m.id) continue;
+    if (value === cur) found = true;
+    html.push(`<option value="${escapeHtml(value)}"${value === cur ? ' selected' : ''}>${escapeHtml(String(m.name || ''))} · ${escapeHtml(String(m.model || ''))}</option>`);
+  }
+  // 模型目录尚未读完或模型暂时不可用时，保留原选项，不能静默改成「未设置」。
+  if (!found) html.push(`<option value="${escapeHtml(cur)}" selected>${escapeHtml(cur.slice(cur.indexOf(':') + 1))} · ${t('capabilityUnavailable')}</option>`);
+  return html.join('');
+}
+
+// 从指定容器里按 select[data-cap-role][data-cap-which] 读取全部能力槽位，得到 { 角色id: { primary, fallbacks } }
+function readCapFromContainer(container, previous = state.capabilityDefaults || {}) {
+  if (!container) {
+    throw new Error(t('saveFail'));
+  }
+  const out = {};
+  for (const role of CAP_ROLES) {
+    out[role.id] = { primary: null, fallbacks: [] };
+  }
+  const selects = container.querySelectorAll('select[data-cap-role][data-cap-which]');
+  if (selects.length !== CAP_ROLES.length * 2) {
+    throw new Error(t('saveFail'));
+  }
+  const seen = new Set();
+  for (const sel of selects) {
+    const roleId = String(sel.getAttribute('data-cap-role') || '');
+    const which = String(sel.getAttribute('data-cap-which') || '');
+    const key = `${roleId}:${which}`;
+    if (!Object.hasOwn(out, roleId) || !['primary', 'fallback'].includes(which) || seen.has(key)) {
+      throw new Error(t('saveFail'));
+    }
+    seen.add(key);
+    const pack = previous[roleId] || {};
+    const oldRef = which === 'primary' ? pack.primary : (pack.fallbacks || [])[0];
+    const unchanged = !!sel.value && sel.value === capValOf(oldRef);
+    const ref = unchanged ? oldRef : parseCapRef(sel.value);
+    if (sel.value && !ref) throw new Error(t('saveFail'));
+    if (which === 'primary') {
+      out[roleId].primary = ref;
+    } else if (which === 'fallback') {
+      out[roleId].fallbacks = unchanged ? [...pack.fallbacks] : (ref ? [ref] : []);
+    }
+  }
+  return out;
+}
+
 function openSettings() {
   const protocolLabel = (p) => {
     if (p === 'anthropic') return t('protocolAnthropic');
@@ -4306,6 +4781,8 @@ function openSettings() {
     <div class="sep-line"></div>
     <h3>${t('capabilityDefaults')}</h3>
     <p class="hint">${t('capabilityDefaultsHint')}</p>
+    <label for="m-brain">大脑（当前对话模型）</label>
+    <select id="m-brain"></select>
     <div id="cap-defaults-list"></div>
 
     <div class="sep-line"></div>
@@ -4325,7 +4802,8 @@ function openSettings() {
       <option value="codex">${t('protocolCodex')}</option>
     </select>
     <label>${t('apiUrl')}</label><input id="p-url" placeholder="https://api.openai.com/v1" />
-    <label>${t('apiKey')}</label><input id="p-key" type="password" placeholder="sk-..." />
+    <label id="p-key-label">${t('apiKey')}</label><input id="p-key" type="password" placeholder="sk-..." />
+    <div id="p-key-hint" style="display:none">Cursor / Codex 无需填写 Key，直接使用本机登录态</div>
     <div class="model-row" style="gap:8px;margin-top:8px">
       <div style="flex:1"><label>${t('timeoutSec')}</label><input id="p-timeout" type="number" min="5" value="120" /></div>
       <div style="flex:1"><label>${t('maxRetries')}</label><input id="p-retries" type="number" min="0" value="3" /></div>
@@ -4407,76 +4885,31 @@ function openSettings() {
     };
   }
 
-  const CAP_ROLES = [
-    { id: 'vision', key: 'roleVision' },
-    { id: 'summary', key: 'roleSummary' },
-    { id: 'code', key: 'roleCode' },
-    { id: 'planning', key: 'rolePlanning' },
-    { id: 'imageGen', key: 'roleImageGen' },
-    { id: 'videoGen', key: 'roleVideoGen' },
-    { id: 'model3d', key: 'roleModel3d' },
-    { id: 'docGen', key: 'roleDocGen' }
-  ];
-  const capVal = (ref) => {
-    if (!ref) return '';
-    if (ref.apiId) return `api:${ref.apiId}`;
-    if (ref.model) return `local:${ref.model}`;
-    return '';
-  };
-  const capSelectOpts = (selected) => {
-    const local = (state.localFiles || []).map((f) => {
-      const name = f.name || f;
-      const tag = f.purposeLabel || (f.meta?.purpose ? purposeLabel(f.meta.purpose) : '');
-      const label = tag ? `${t('local')} · ${name} · ${tag}` : `${t('local')} · ${name}`;
-      const v = `local:${name}`;
-      return `<option value="${escapeHtml(v)}" ${selected === v ? 'selected' : ''}>${escapeHtml(label)}</option>`;
-    }).join('');
-    const apis = (state.models || []).filter((m) => m.type !== 'local').map((m) => {
-      const v = `api:${m.id}`;
-      return `<option value="${escapeHtml(v)}" ${selected === v ? 'selected' : ''}>API · ${escapeHtml(m.name || m.model)} · ${escapeHtml(m.model || '')}</option>`;
-    }).join('');
-    return `<option value="">${t('capabilityUnset')}</option>${local}${apis}`;
-  };
   let capPainted = false;
+  let capDraft = state.capabilityDefaults || {};
+  const capBox = $('cap-defaults-list');
   const paintCapDefaults = () => {
-    const box = $('cap-defaults-list');
-    if (!box) return;
+    const box = capBox;
+    if (!box || !box.isConnected) return;
     if (capPainted) {
-      try { state.capabilityDefaults = readCapDefaultsFromDom(); } catch { /* 忽略 */ }
+      try { capDraft = readCapFromContainer(box, capDraft); } catch { return; }
     }
-    const caps = state.capabilityDefaults || {};
+    const caps = capDraft;
     box.innerHTML = CAP_ROLES.map((r) => {
       const pack = caps[r.id] || {};
-      const primary = capVal(pack.primary);
-      const fb = capVal((pack.fallbacks || [])[0]);
+      const primary = capValOf(pack.primary);
+      const fb = capValOf((pack.fallbacks || [])[0]);
       return `<div class="model-row" style="align-items:flex-start;gap:8px;margin:8px 0">
         <div style="min-width:72px;padding-top:8px"><b>${t(r.key)}</b></div>
         <div style="flex:1">
           <label class="hint">${t('capabilityPrimary')}</label>
-          <select data-cap-role="${r.id}" data-cap-which="primary">${capSelectOpts(primary)}</select>
+          <select data-cap-role="${r.id}" data-cap-which="primary">${capSelectOptionsHtml(primary)}</select>
           <label class="hint">${t('capabilityFallback')}</label>
-          <select data-cap-role="${r.id}" data-cap-which="fallback">${capSelectOpts(fb)}</select>
+          <select data-cap-role="${r.id}" data-cap-which="fallback">${capSelectOptionsHtml(fb)}</select>
         </div>
       </div>`;
     }).join('');
     capPainted = true;
-  };
-  const readCapDefaultsFromDom = () => {
-    const out = {};
-    const parse = (v) => {
-      if (!v) return null;
-      if (v.startsWith('api:')) return { apiId: v.slice(4), type: 'api' };
-      if (v.startsWith('local:')) return { type: 'local', model: v.slice(6) };
-      return null;
-    };
-    for (const r of CAP_ROLES) {
-      const pEl = document.querySelector(`#cap-defaults-list select[data-cap-role="${r.id}"][data-cap-which="primary"]`);
-      const fEl = document.querySelector(`#cap-defaults-list select[data-cap-role="${r.id}"][data-cap-which="fallback"]`);
-      const primary = parse(pEl?.value || '');
-      const fb = parse(fEl?.value || '');
-      out[r.id] = { primary, fallbacks: fb ? [fb] : [] };
-    }
-    return out;
   };
   paintCapDefaults();
   api.listLocalModels?.().then((loc) => {
@@ -4522,7 +4955,8 @@ function openSettings() {
     if (filter) {
       ids = ids.filter((id) => {
         const price = String(remoteCatalog[id]?.priceText || '').toLowerCase();
-        return id.toLowerCase().includes(filter) || price.includes(filter);
+        const name = String(remoteCatalog[id]?.name || '').toLowerCase();
+        return id.toLowerCase().includes(filter) || name.includes(filter) || price.includes(filter);
       });
     }
     if (count) count.textContent = remoteIds.length
@@ -4549,6 +4983,35 @@ function openSettings() {
     }).join('');
   };
 
+  const paintBrainSelect = () => {
+    const select = $('m-brain');
+    if (!select) return;
+    const selected = state.currentModelId || currentModel()?.id || '';
+    select.innerHTML = (state.models || []).map((m) =>
+      `<option value="${escapeHtml(m.id)}">${escapeHtml(m.name || m.model || m.id)}</option>`
+    ).join('') || `<option value="">${t('noApiModels')}</option>`;
+    select.value = selected;
+  };
+  paintBrainSelect();
+  $('m-brain').onchange = async () => {
+    const modelId = $('m-brain').value;
+    if (!modelId) return;
+    const previous = state.currentModelId;
+    const session = activeSession();
+    const previousSessionModel = session?.modelId;
+    try {
+      if (session) session.modelId = modelId;
+      await persistModels(modelId);
+      renderModelMenu();
+      paintSavedModels();
+    } catch (err) {
+      state.currentModelId = previous;
+      if (session) session.modelId = previousSessionModel;
+      if ($('m-brain')) $('m-brain').value = previous;
+      alert(err && err.message ? err.message : t('saveFail'));
+    }
+  };
+
   const paintSavedModels = () => {
     const rows = state.models.filter((m) => m.type !== 'local').map((m) => `
       <div class="model-row" data-model-id="${escapeHtml(m.id)}">
@@ -4562,6 +5025,8 @@ function openSettings() {
         </div>
       </div>`).join('');
     $('api-model-list').innerHTML = rows || `<p class="hint">${t('noApiModels')}</p>`;
+    paintBrainSelect();
+    paintCapDefaults();
   };
 
   const paintWalletForm = () => {
@@ -4623,18 +5088,29 @@ function openSettings() {
     sel.innerHTML = `<option value="">${t('providerCustom')}</option>`
       + presets.map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join('');
   })();
+  const syncProviderKeyVisibility = () => {
+    const needsNoKey = ['cursor', 'codex'].includes($('p-protocol').value);
+    $('p-key-label').style.display = needsNoKey ? 'none' : '';
+    $('p-key').style.display = needsNoKey ? 'none' : '';
+    $('p-key-hint').style.display = needsNoKey ? '' : 'none';
+  };
   $('p-preset').onchange = () => {
     const id = $('p-preset').value;
     const p = presets.find((x) => x.id === id);
-    if (!p) return;
+    if (!p) {
+      syncProviderKeyVisibility();
+      return;
+    }
     $('p-name').value = p.name;
     $('p-protocol').value = p.protocol || 'openai';
     $('p-url').value = p.baseUrl || '';
+    syncProviderKeyVisibility();
   };
   // Cursor 和 Codex 走 SDK，没有真实接口地址，填固定占位地址
   $('p-protocol').onchange = () => {
     if ($('p-protocol').value === 'cursor') $('p-url').value = 'cursor://sdk';
     else if ($('p-protocol').value === 'codex') $('p-url').value = 'codex://sdk';
+    syncProviderKeyVisibility();
   };
 
   let editingProvId = null;
@@ -4651,6 +5127,7 @@ function openSettings() {
     $('p-interval').value = String(p?.retryInterval ?? 5);
     $('p-save').textContent = p ? t('saveEdit') : t('add');
     $('p-cancel').style.display = p ? '' : 'none';
+    syncProviderKeyVisibility();
   };
   const readProvForm = () => ({
     id: editingProvId || uid().replace(/^s_/, 'prov_'),
@@ -4700,6 +5177,7 @@ function openSettings() {
   };
 
   $('mm-provider').onchange = () => {
+    $('mm-filter').value = '';
     remoteIds = [];
     remoteCatalog = {};
     remoteBalance = null;
@@ -4737,6 +5215,8 @@ function openSettings() {
   $('mm-fetch').onclick = async () => {
     let pid = $('mm-provider').value;
     if (!pid) return alert(t('needProvider'));
+    // 拉取完整目录时清掉上一轮搜索词，避免新结果看起来缺模型。
+    $('mm-filter').value = '';
     const btn = $('mm-fetch');
     const old = btn.textContent;
     btn.disabled = true;
@@ -4778,6 +5258,7 @@ function openSettings() {
         $('mm-provider').value = pid;
         r = await api.listRemoteModels(pid);
       }
+      if ($('mm-provider')?.value !== pid) return;
       remoteIds = r.models || [];
       remoteCatalog = r.catalog || {};
       remoteBalance = r.balance || null;
@@ -4887,6 +5368,8 @@ function openSettings() {
       btn.textContent = t('saving');
     }
     try {
+      // $ 按 ID 查找，不接受带 # 的选择器。先读取完整表单，读取失败时不写入任何设置。
+      const caps = readCapFromContainer(capBox, capDraft);
       const lines = ($('m-sites')?.value || '').split(/\r?\n/);
       state.searchSites = await api.saveSearchSites(lines);
       state.proxy = ($('m-proxy')?.value || '').trim();
@@ -4897,15 +5380,25 @@ function openSettings() {
       });
       state.maxAgentRounds = await api.saveMaxAgentRounds($('m-agent-rounds')?.value);
       syncRoundsInput(activeSession());
-      const caps = readCapDefaultsFromDom();
-      state.capabilityDefaults = await api.saveCapabilityDefaults(caps);
+      // 先保存模型清单，再保存引用这些模型 ID 的能力槽位，确保最终持久化的是刚选择的配置。
       await persistModels();
+      state.capabilityDefaults = await api.saveCapabilityDefaults(caps);
+      renderModelMenu();
       if ($('m-theme')) {
         state.themePref = $('m-theme').value;
         applyTheme(await api.setTheme(state.themePref));
       }
       $('modal-card').classList.remove('wide', 'settings-modal');
       closeModal();
+      if (onboardingModulesResume) {
+        onboardingModulesResume = false;
+        openOnboardingModules();
+      }
+      if (localGuideContinueOnboarding) {
+        localGuideContinueOnboarding = false;
+        showWelcome();
+        startOnboarding();
+      }
     } catch (err) {
       alert(err && err.message ? err.message : t('saveFail'));
       if (btn) {
@@ -4977,7 +5470,14 @@ function openDownloader() {
   $('modal-card').classList.add('wide');
   $('dl-back').onclick = () => dlGoBack();
   $('dl-title-back').onclick = () => dlGoBack();
-  $('dl-close').onclick = closeModal;
+  $('dl-close').onclick = () => {
+    closeModal();
+    if (localGuideContinueOnboarding) {
+      localGuideContinueOnboarding = false;
+      showWelcome();
+      startOnboarding();
+    }
+  };
   $('dl-src-recheck').onclick = () => refreshDownloadSource(true);
   renderPurposeStep();
   refreshDownloadSource(false);
@@ -5665,6 +6165,14 @@ async function startGoTurn(value, note) {
 
 function bind() {
   bindDownloadPanel();
+  $('btn-guide')?.addEventListener('click', () => startOnboarding());
+  // 「上下文」按钮打开塞给 AI 的上下文导图。
+  $('btn-context-map')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openDialogMap();
+  });
+  // 底部按钮 id 必须与 index.html 一致。
+  $('btn-local-deployment-guide')?.addEventListener('click', () => showLocalModelGuide());
   document.querySelectorAll('.menu-btn').forEach((btn) => {
     btn.onclick = (e) => {
       e.stopPropagation();
@@ -5723,6 +6231,10 @@ function bind() {
   $('btn-clone').onclick = openClone;
   $('btn-ssh').onclick = openSsh;
   $('btn-view-all').onclick = () => renderRecents(true);
+  $('btn-dialog-map')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openDialogMap();
+  });
 
   $('btn-new-tab').onclick = () => {
     newTab();
@@ -6183,17 +6695,17 @@ function bind() {
       steps.innerHTML = thinkStepsHtml(tab.messages[i]);
     }
   }, true);
+  document.body.addEventListener('click', (e) => {
+    const mapBtn = e.target.closest('[data-dialog-map]');
+    if (!mapBtn) return;
+    e.stopPropagation();
+    openDialogMap(mapBtn.getAttribute('data-dialog-map'));
+  });
   $('messages').onclick = async (e) => {
     const ctxBtn = e.target.closest('[data-ctx-turn]');
     if (ctxBtn) {
       e.stopPropagation();
       openContextPreview(ctxBtn.getAttribute('data-ctx-turn'));
-      return;
-    }
-    const mapBtn = e.target.closest('[data-dialog-map]');
-    if (mapBtn) {
-      e.stopPropagation();
-      openDialogMap(mapBtn.getAttribute('data-dialog-map'));
       return;
     }
     const askCard = e.target.closest('[data-ask-card]');
@@ -6811,7 +7323,7 @@ api.onIndexProgress(paintIndexCard);
   } catch {
     state.globalMemory = null;
   }
-  if (s.workspace) {
+  if (s.workspace && localStorage.getItem('spcode.onboarding.completed') === 'true') {
     await refreshMeta();
     await restoreLastSession(s.workspace);
     showChat();
@@ -6825,6 +7337,7 @@ api.onIndexProgress(paintIndexCard);
   } else {
     showWelcome();
     syncAgentBtn();
+    if (localStorage.getItem('spcode.onboarding.completed') !== 'true') startOnboarding();
   }
   syncRoundsInput(activeSession());
   initClipboardPanel();

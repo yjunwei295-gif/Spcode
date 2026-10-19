@@ -11,6 +11,8 @@ const localLlm = require("./local-llm");
 const apiProtocol = require("./api-protocol");
 const zbaingAi = require("./zbaingAi");
 const jsonSplit = require("./json-split");
+const summaryCache = require('./map-summary-cache');
+const { attachComments } = require('./code-map-comments');
 
 const MAP_VERSION = 1;
 const MAX_FILE_BYTES = 400 * 1024;
@@ -594,23 +596,30 @@ function pushSymbol(out, seen, name, line, endLine) {
   out.push({ name: n, line: start, endLine: endLine && endLine >= start ? endLine : start });
 }
 // 去掉行内字符串与注释，方便数 { }（不追求完整词法，够估方法边界）
-function stripLineNoise(line) {
+function stripLineNoise(line, state = {}) {
   let out = "";
-  let inStr = null;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
     const n = line[i + 1];
-    if (inStr) {
-      if (c === "\\") { i++; continue; }
-      if (c === inStr) inStr = null;
+    if (state.block) {
+      if (c === '*' && n === '/') { state.block = false; i++; }
       continue;
     }
-    if (c === '"' || c === "'" || c === "`") { inStr = c; continue; }
+    if (state.quote) {
+      if (state.verbatim && c === '"' && n === '"') { i++; continue; }
+      if (!state.verbatim && c === "\\") { i++; continue; }
+      if (c === state.quote) { state.quote = null; state.verbatim = false; }
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      state.quote = c;
+      state.verbatim = c === '"' && /@\$?$/.test(line.slice(0, i));
+      continue;
+    }
     if (c === "/" && n === "/") break;
     if (c === "/" && n === "*") {
-      const end = line.indexOf("*/", i + 2);
-      if (end < 0) break;
-      i = end + 1;
+      state.block = true;
+      i++;
       continue;
     }
     out += c;
@@ -622,14 +631,14 @@ function isIndentLang(ext) {
   const kind = symbolKind(ext);
   return lang === "py" || kind === "yaml" || kind === "yml";
 }
-// 括号语言：从符号行起找配对 }，单次最多跨 SPAN_MAX_LINES 行
-const SPAN_MAX_LINES = 800;
+// 本地查找区段；不因方法超过固定行数就截掉尾部。
 function findBraceBlockEnd(lines, startIdx) {
   let depth = 0;
   let seen = false;
-  const limit = Math.min(lines.length, startIdx + SPAN_MAX_LINES);
+  const state = {};
+  const limit = lines.length;
   for (let i = startIdx; i < limit; i++) {
-    const raw = stripLineNoise(lines[i] || "");
+    const raw = stripLineNoise(lines[i] || "", state);
     if (i === startIdx && /;\s*$/.test(raw.trim()) && raw.indexOf("{") < 0) return startIdx;
     for (let j = 0; j < raw.length; j++) {
       const ch = raw[j];
@@ -648,7 +657,7 @@ function findIndentBlockEnd(lines, startIdx) {
   const base = ((lines[startIdx] || "").match(/^(\s*)/) || ["", ""])[1].length;
   let end = startIdx;
   let sawBody = false;
-  const limit = Math.min(lines.length, startIdx + SPAN_MAX_LINES);
+  const limit = lines.length;
   for (let i = startIdx + 1; i < limit; i++) {
     const s = lines[i] || "";
     if (!s.trim()) { end = i; continue; }
@@ -674,8 +683,8 @@ function attachSymbolSpans(text, symbols, ext) {
       : lines.length;
     let endIdx = indent ? findIndentBlockEnd(lines, startIdx) : findBraceBlockEnd(lines, startIdx);
     if (endIdx == null || endIdx < startIdx) endIdx = Math.max(startIdx, nextIdx - 1);
-    // 同级下一个符号更近时，以更近者为界（避免类方法误吞到下一个方法）
-    if (nextIdx > startIdx && endIdx >= nextIdx) endIdx = nextIdx - 1;
+    // 已匹配出的块可能包含局部函数，不能用下一个符号把外层块截断。
+    s.rangeKind = 'estimated';
     s.endLine = Math.min(lines.length, Math.max(s.line || 1, endIdx + 1));
   }
   return symbols;
@@ -749,7 +758,7 @@ function extractSymbols(text, ext) {
       }
     }
   }
-  return attachSymbolSpans(text, out, ext);
+  return attachComments(text, attachSymbolSpans(text, out, ext), ext);
 }
 function resolveDepToFile(workspace, dir, dep) {
   if (!dep.startsWith(".")) return null;
@@ -827,6 +836,7 @@ function getMap(workspace) {
   if (!map || !Array.isArray(map.nodes)) return map;
   const extra = (map.roots || []).filter((r) => r && path.resolve(r) !== path.resolve(workspace));
   ensureFresh(workspace, extra, map);
+  for (const node of map.nodes) ensureSymbolSpans(node);
   return map;
 }
 async function scanWorkspace(workspace, extra, signal) {
@@ -860,7 +870,7 @@ async function scanWorkspace(workspace, extra, signal) {
     let mtime = 0;
     try { mtime = fileStamp(fs.statSync(f.abs)); } catch {}
     // symbols 为静态兜底（名字+行号，不花 token）；methods 留空表示尚未 AI 归纳
-    const node = { id: key, path: key, abs: f.abs.replace(/\\/g, "/"), ext, size: f.size, mtime, deps: resolved, desc: "", symbols: extractSymbols(text, ext) };
+    const node = { id: key, path: key, abs: f.abs.replace(/\\/g, "/"), ext, size: f.size, mtime, contentHash: summaryCache.hash(text), deps: resolved, desc: "", symbols: extractSymbols(text, ext) };
     nodes.push(node);
     identsById.set(key, collectIdents(identsText(text, ext)));
     if (inclSet.size) includesById.set(key, inclSet);
@@ -907,19 +917,24 @@ function writeMarkdown(file, mapData) {
 async function buildMap(workspace, extra, opts, signal) {
   opts = opts || {};
   const scanned = await scanWorkspace(workspace, extra, signal);
-  // 重绘保留旧归纳：源码 size+mtime 没变的节点直接沿用 methods/desc，省 token；变了的清空等待重归纳
+  // 重绘按源码内容和依赖校验旧摘要；只改时间戳也能复用，依赖变化则失效。
   const prev = loadJson(jsonPath(workspace), null);
   if (prev && Array.isArray(prev.nodes)) {
     const old = new Map(prev.nodes.map((n) => [n.id, n]));
     for (const n of scanned.nodes) {
       const o = old.get(n.id);
       if (!o) continue;
-      const same = o.size === n.size && (o.mtime || 0) === (n.mtime || 0);
+      const same = o.contentHash && o.contentHash === n.contentHash;
       if (same && Array.isArray(o.methods)) {
         n.methods = o.methods;
         // 重绘没把 methodsMtime 带上时，说明会被当成过期丢掉。文件没变就沿用这次的时间
-        n.methodsMtime = o.methodsMtime != null ? o.methodsMtime : n.mtime;
-        if (!n.desc && o.desc) n.desc = o.desc;
+        n.methodsMtime = o.methodsMtime === o.mtime ? n.mtime : undefined;
+        n.methodsInputKey = o.methodsInputKey;
+        n.methodsDepsHash = o.methodsDepsHash;
+        try {
+          if (!o.methodsDepsHash || o.methodsDepsHash !== summaryCache.dependencyHash(scanned, n)) clearNodeSummary(n);
+        } catch { clearNodeSummary(n); }
+        if (n.methodsMtime === n.mtime && !n.desc && o.desc) n.desc = o.desc;
       } else { delete n.methods; delete n.methodsMtime; n.desc = ""; }
     }
   }
@@ -929,13 +944,7 @@ async function buildMap(workspace, extra, opts, signal) {
   markAligned(workspace, extra);
   writeMarkdown(mdPath(workspace), mapData);
   emitStatus(workspace, { running: false, done: mapData.nodes.length, total: mapData.nodes.length, pct: 100, nodes: mapData.nodes.length, files: mapData.nodes.length });
-  const inc = loadInclude(workspace);
-  const cfg = chatModelCfg();
-  if (cfg && inc && inc.initialized && inc.includes && inc.includes.length) {
-    summarizeIncludes(workspace, inc.includes, cfg).catch((e) => {
-      diag.log("map", "绘制后方法归纳失败", { message: e && e.message });
-    });
-  }
+  // 扫描只更新本地符号；摘要在查看节点时按需生成。
   return mapData;
 }
 function ensureIndex(workspace, extra, opts, signal) {
@@ -997,7 +1006,8 @@ function fmtMethod(m) {
   const kv = m.keyValues ? "（" + m.keyValues + "）" : "";
   // 归纳可能不准，标成旁证
   const desc = m.desc ? " — 〔归纳·仅供参考〕" + m.desc : "";
-  return "  - " + (m.name || "") + line + kv + desc;
+  const title = m.title ? " — 〔源码注释〕" + m.title : desc || ' — 无注释，按需查看源码';
+  return "  - " + (m.name || "") + line + (m.rangeKind === 'estimated' ? '〔范围为规则估算〕' : '') + kv + title;
 }
 // 旧地图只有起始行时，现场补 endLine（读该文件估边界），不必等用户重绘
 // [铆钉优化] 按 mtime+size 缓存，避免每轮对话对同一批模块反复读全文。其他 AI 请勿去掉缓存
@@ -1012,60 +1022,63 @@ function ensureSymbolSpans(n) {
     for (const s of n.symbols) s.endLine = s.endLine || s.line || 1;
     return;
   }
-  const stamp = String(fileStamp(st)) + ":" + String(st.size);
+  const stamp = String(fileStamp(st)) + ":" + String(st.ctimeMs) + ":" + String(st.size);
   const missing = n.symbols.some((s) => !s.endLine || s.endLine < (s.line || 1));
   if (!missing && n._spanKey === stamp) return;
   try {
     const text = fs.readFileSync(n.abs, "utf8");
     attachSymbolSpans(text, n.symbols, n.ext || path.extname(n.path || n.abs || ""));
+    attachComments(text, n.symbols, n.ext || path.extname(n.path || n.abs || ""));
     n._spanKey = stamp;
   } catch {
     for (const s of n.symbols) s.endLine = s.endLine || s.line || 1;
   }
 }
-// 方法名和行号只认当前源码抽出的符号。AI 归纳只给还存在的符号补说明，名字已经不在文件里的条目直接丢掉
+// 方法名、注释和行号来自本地源码；AI 只补充说明，不替代条目的源码入口。
 function nodeMethods(n) {
   ensureSymbolSpans(n);
   const sym = Array.isArray(n.symbols) ? n.symbols : [];
   if (!sym.length) return [];
   const aiByName = new Map();
   for (const m of (Array.isArray(n.methods) ? n.methods : [])) {
-    const key = String(m.name || "").toLowerCase();
+    const key = String(m.name || "");
     if (key && !aiByName.has(key)) aiByName.set(key, m);
   }
   // 旧索引可能已经把 mtime 写成新的，说明却还是上一版实现。没有 methodsMtime 对齐就不采用说明
   const trust = n.methodsMtime != null && n.methodsMtime === n.mtime;
   return sym.map((s) => {
-    const extra = trust ? aiByName.get(String(s.name || "").toLowerCase()) : null;
+    const extra = trust ? aiByName.get(String(s.name || "")) : null;
     const start = s.line || 1;
     const end = s.endLine && s.endLine >= start ? s.endLine : start;
     return {
       name: s.name,
       line: start,
       endLine: end,
+      rangeKind: s.rangeKind || 'estimated',
+      title: s.title || '',
+      comment: s.comment || '',
+      commentRaw: s.commentRaw || '',
+      commentLine: s.commentLine,
       keyValues: extra ? String(extra.keyValues || "") : "",
       desc: extra ? String(extra.desc || "") : ""
     };
   });
 }
-// 没有方法，或有名字但作用和关键值都空：只给路径与方法名行号，不塞全文。全文每轮进提示词会爆 token。其他 AI 请勿改回自动附全文
+// 判断是否缺少模型摘要；即使缺摘要，标题索引仍可使用源码注释定位。
 function needsFullRead(n) {
   const methods = nodeMethods(n);
   if (!methods.length) return true;
   return !methods.some((m) => String(m.desc || "").trim() || String(m.keyValues || "").trim());
 }
-function appendChewedOnly(lines, n, hit, { attachBelow = false } = {}) {
+function appendChewedOnly(lines, n, hit) {
   const shown = hit && hit.length ? hit : nodeMethods(n);
   if (shown.length) {
-    const note = attachBelow
-      ? "；命中方法完整原文见下方【原文·可直接用】"
-      : "；要看正文用 read_file(startLine,endLine)";
-    lines.push("  方法（" + shown.length + "，起止行为源码边界" + note + "）：");
+    lines.push("  方法索引（" + shown.length + "；先按注释筛选，再用 map_lookup 的 module + symbol 或 startLine/endLine 读取详情）：");
     for (const m of shown) lines.push(fmtMethod(m));
   } else {
     lines.push("  （该模块未解析出方法）");
   }
-  lines.push("  有 :起-止 时按区间读代码为准；归纳可能不准，禁止整文件通读。");
+  lines.push("  注释和归纳仅供定位；修改前读取目标源码，不能凭无注释判断方法无关。");
 }
 const bodyCache = new Map();
 const BODY_CACHE_MAX = 32;
@@ -1076,7 +1089,7 @@ function fileBodyForNode(n) {
   catch (e) { return "（读取失败：" + ((e && e.message) || "") + "）"; }
   const mtime = fileStamp(st);
   const cached = bodyCache.get(n.abs);
-  if (cached && cached.mtime === mtime && cached.size === st.size) return cached.text;
+  if (cached && cached.mtime === mtime && cached.ctime === st.ctimeMs && cached.size === st.size) return cached.text;
   let buf;
   try { buf = fs.readFileSync(n.abs); }
   catch (e) { return "（读取失败：" + ((e && e.message) || "") + "）"; }
@@ -1085,7 +1098,7 @@ function fileBodyForNode(n) {
     if (buf[i] === 0) return "（二进制文件，没有文本正文）";
   }
   const text = buf.toString("utf8");
-  bodyCache.set(n.abs, { mtime, size: st.size, text });
+  bodyCache.set(n.abs, { mtime, ctime: st.ctimeMs, size: st.size, text });
   if (bodyCache.size > BODY_CACHE_MAX) bodyCache.delete(bodyCache.keys().next().value);
   return text;
 }
@@ -1095,6 +1108,58 @@ function appendFullFile(lines, n) {
   lines.push(fileBodyForNode(n));
   lines.push("【全文结束】" + label);
 }
+/**
+ * 读取一个地图条目的原文。调用者明确选择符号或行区间后才加载，索引不携带全部源码。
+ * 来源始终是当前磁盘文件；返回完整请求区间、注释和内容指纹，不调用模型。
+ * 超出当前文件范围时报错，避免把已移动/删除的旧区间当作完整方法返回。
+ */
+function sourceItem(workspace, extra, request) {
+  if (!workspace) return { ok: false, reason: '请先打开项目' };
+  const map = loadMapCached(workspace);
+  if (!map?.nodes) return { ok: false, reason: '尚未生成项目地图' };
+  const n = findModule(map, request.module);
+  if (!n) return { ok: false, reason: '地图里没有该模块，请重新查询索引' };
+  if (isForeignAiSkill(n.abs)) return { ok: false, reason: '不能读取其他 AI 的技能或规则' };
+  const roots = extra?.length ? extra : (map.roots || []).filter((root) => path.resolve(root) !== path.resolve(workspace));
+  refreshNodes(workspace, roots, map, [n]);
+  if (!map.nodes.includes(n)) return { ok: false, reason: '文件已删除，请重新查询索引' };
+  const methods = nodeMethods(n);
+  let method;
+  if (request.symbol) {
+    const matches = methods.filter((m) => m.name === request.symbol);
+    method = matches.length === 1 ? matches[0] : matches.find((m) => m.line === Number(request.startLine));
+    if (!method) return { ok: false, reason: '符号不存在或有重名，请重新查询并指定起始行' };
+  }
+  const start = method ? method.line : Number(request.startLine);
+  const end = method ? method.endLine : Number(request.endLine);
+  const body = fileBodyForNode(n);
+  if (/^（[^\n]*）$/.test(body)) return { ok: false, reason: body };
+  const contentHash = summaryCache.hash(body);
+  if (n.contentHash && n.contentHash !== contentHash) return { ok: false, reason: '读取期间源码发生变化，请重新查询该条目' };
+  const jsonView = n.ext === '.json' ? jsonSplit.jsonView(n.abs) : null;
+  const lines = jsonView?.minified ? jsonView.lines : body.split(/\r?\n/);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > lines.length) {
+    return { ok: false, reason: `请指定当前文件内完整的 startLine/endLine 区间（共 ${lines.length} 行）` };
+  }
+  return {
+    ok: true, path: n.path, abs: n.abs, name: method?.name || '指定源码区段',
+    startLine: start, endLine: end, rangeKind: method?.rangeKind || 'requested',
+    comment: method?.comment || '', commentRaw: method?.commentRaw || '', commentLine: method?.commentLine,
+    source: lines.slice(start - 1, end).join('\n'), contentHash,
+    formattedJson: !!jsonView?.minified
+  };
+}
+
+/** 把按需读取的地图条目交给模型，标明来源和边界可靠性，防止把估算范围误当语法结论。 */
+function formatSourceItem(item) {
+  if (!item.ok) return item.reason;
+  const boundary = item.rangeKind === 'estimated' ? '规则估算区间，完整返回该区间；复杂语法需核对方法边界' : '完整返回指定区间';
+  const view = item.formattedJson ? '；JSON 格式化视图，编辑时须按原文件格式核对' : '';
+  const comment = item.commentRaw ? `\n【源码注释】第 ${item.commentLine} 行起\n${item.commentRaw}\n` : '\n【源码注释】无；请以实现为准。\n';
+  return `【原文·可直接用】${item.abs || item.path} 第 ${item.startLine}-${item.endLine} 行（${item.name}；${boundary}${view}）${comment}\n`
+    + item.source.split('\n').map((line, i) => `${item.startLine + i}: ${line}`).join('\n')
+    + '\n【源码区段结束】';
+}
 // 单模块完整摘要：方法全列 + 依赖 + 被依赖。没有归纳时只给名字行号，不附全文
 function moduleText(mapData, n, rev) {
   const lines = [];
@@ -1103,10 +1168,13 @@ function moduleText(mapData, n, rev) {
   const by = rev.get(n.id) || [];
   if (by.length) lines.push("  被依赖：" + by.slice(0, 12).join(", ") + (by.length > 12 ? " …" : ""));
   const all = nodeMethods(n);
+  const explained = all.filter((m) => m.desc || m.keyValues).length;
+  const documented = all.filter((m) => m.comment).length;
+  lines.push(`  源码注释 ${documented}/${all.length}；可选 AI 摘要 ${explained}/${all.length}。先按注释筛选；修改前读取目标源码，不能把无注释或未归纳的条目当作不存在。`);
   if (needsFullRead(n)) {
     appendChewedOnly(lines, n, all);
   } else if (all.length) {
-    lines.push("  方法（" + all.length + "，起止行为源码边界；要看正文用 read_file(startLine,endLine)）：");
+    lines.push("  方法索引（" + all.length + "；用 map_lookup 的 module + symbol 读取条目完整源码）：");
     for (const m of all) lines.push(fmtMethod(m));
   }
   return lines.join("\n");
@@ -1125,7 +1193,7 @@ function scoreNode(n, words) {
   let methodScore = 0;
   for (const m of nodeMethods(n)) {
     const name = (m.name || "").toLowerCase();
-    const rest = ((m.desc || "") + " " + (m.keyValues || "")).toLowerCase();
+    const rest = ((m.comment || "") + " " + (m.desc || "") + " " + (m.keyValues || "")).toLowerCase();
     let ms = 0;
     for (const w of words) {
       if (name === w) { ms += 12; covered.add(w); }
@@ -1210,46 +1278,6 @@ function topMatches(workspace, extra, mapData, query, opts) {
   top.total = scored.length;
   return top;
 }
-function methodSpan(m) {
-  const start = Number(m.line) || 0;
-  const end = Number(m.endLine) || start;
-  return { start, end, len: start && end >= start ? end - start + 1 : 0 };
-}
-// 没命中关键字时贴该模块最短的一段，避免只剩路径
-function pickFallbackMethod(n) {
-  const all = nodeMethods(n);
-  if (!all.length) return null;
-  const ranked = all.slice().sort((a, b) => methodSpan(a).len - methodSpan(b).len);
-  for (const m of ranked) {
-    const { start, len } = methodSpan(m);
-    if (start && len) return m;
-  }
-  return null;
-}
-// 列表里列到的命中方法整段贴原文（不截行数、不卡条数），和 :起-止 一致，地图不因贴码失真
-function attachHitCode(top) {
-  const out = [];
-  for (const { n, hit } of top) {
-    let methods = Array.isArray(hit) && hit.length ? hit : [];
-    if (!methods.length) {
-      const fb = pickFallbackMethod(n);
-      if (fb) methods = [fb];
-      else continue; // 模块行里已写「未解析出方法」
-    }
-    const body = fileBodyForNode(n);
-    if (/^（[^\n]*）$/.test(body)) continue;
-    const allLines = body.split(/\r?\n/);
-    for (const m of methods) {
-      const { start, end, len } = methodSpan(m);
-      if (!start || !len) continue;
-      const lines = allLines.slice(start - 1, end);
-      if (!lines.length) continue;
-      out.push("【原文·可直接用】" + String(n.abs || n.path).replace(/\\/g, "/") + " 第 " + start + "-" + (start + lines.length - 1) + " 行（" + (m.name || "") + "）\n"
-        + lines.map((l, i) => (start + i) + ": " + l).join("\n"));
-    }
-  }
-  return out;
-}
 // 地图收录的文件清单：搜代码、列目录都只走这份清单，不在磁盘上翻目录。没有地图返回 null
 function mapFiles(workspace, extra) {
   if (!workspace) return null;
@@ -1264,13 +1292,13 @@ function mapTextForQuery(workspace, extra, mapData, query, opts) {
   opts = opts || {};
   const top = topMatches(workspace, extra, mapData, query, opts);
   if (top === null) return "查询为空";
-  if (!top.length) return "项目地图无匹配模块（可换更具体的关键词，或先重新绘制地图）";
+  if (!top.length) return "项目地图未匹配到模块。部分模块可能尚未归纳，不能据此断言功能不存在；请用 search_text 搜索源码、注释或相关符号，再用 read_file 核实。";
   const rev = reverseDeps(mapData);
   const lines = top.map(({ n, hit }) => {
     const head = "`" + n.path + "`" + (n.desc ? " — 〔归纳·仅供参考〕" + n.desc : "");
     if (needsFullRead(n)) {
       const parts = [head];
-      appendChewedOnly(parts, n, hit, { attachBelow: true });
+      appendChewedOnly(parts, n, hit);
       return parts.join("\n");
     }
     if (!hit.length) return head;
@@ -1280,9 +1308,7 @@ function mapTextForQuery(workspace, extra, mapData, query, opts) {
     const tail = total > hit.length ? "\n  （共 " + total + " 个方法，传 module=\"" + n.path + "\" 查看全部）" : "";
     return head + "\n" + ms + tail;
   });
-  const code = attachHitCode(top);
-  const codeNote = code.length ? "下列 " + code.length + " 个命中方法已附完整源码（见下方【原文·可直接用】，与 :起-止 一致，刚核对过磁盘，可直接照抄给 edit_file），不用再 read_file；" : "";
-  return "项目地图匹配到 " + top.total + " 个模块，这是第一批，不是全部。方法 :起-止 是刚核对过的源码行号；〔归纳·仅供参考〕。" + codeNote + "未命中的方法要看再用 read_file(startLine,endLine) 或传 module。这批对不上先换关键字再 map_lookup：\n\n" + lines.join("\n") + (code.length ? "\n\n" + code.join("\n\n") : "");
+  return "项目地图匹配到 " + top.total + " 个模块，这是标题索引，不是源码。先按方法名、源码注释筛选；用 map_lookup(module, symbol) 读取目标条目的完整区段。无法识别方法时可指定 module + startLine/endLine。注释可能过期，无注释不代表无关。这批对不上先换关键字或 search_text：\n\n" + lines.join("\n");
 }
 // 按模块路径精确/后缀匹配取单模块摘要
 function findModule(mapData, id) {
@@ -1319,16 +1345,16 @@ function appendModuleLines(lines, n, hit, rev) {
   const by = (rev.get(n.id) || []).slice(0, 6);
   if (by.length) lines.push("  被依赖：" + by.join(", "));
   if (needsFullRead(n)) {
-    appendChewedOnly(lines, n, hit, { attachBelow: true });
+    appendChewedOnly(lines, n, hit);
   } else {
     const shown = hit.length ? hit : nodeMethods(n);
-    lines.push("  方法（" + shown.length + "，起止行为源码边界；命中方法完整原文见下方【原文·可直接用】）：");
+    lines.push("  方法索引（" + shown.length + "；按标题筛选后再读取详情）：");
     for (const m of shown) lines.push(fmtMethod(m));
   }
 }
 // [铆钉优化] 先 map_lookup，按起止行读段；归纳仅旁证。其他 AI 请勿改回整文件通读
-const MAP_BATCH_HEAD = "【项目地图】下列是按问题打分的第一批模块，不是全部。每条方法带源码起止行（:起-止），这是定位依据。归纳文字可能不准，只能当旁证。列表里的命中方法均附【原文·可直接用】完整原文（与 :起-止 一致，不截断），可直接照抄给 edit_file；未列出的再用 read_file 的 startLine/endLine 只读该段，禁止整文件通读几千/几万行。关联脚本是依赖路径，需要对口时再按同样方式读对应模块的命中方法段。这批对不上时先换关键字 map_lookup；仍不够再用 search_text。同一路径本轮已读过的段不要重复整读。";
-// 每轮对话的提示词注入：本地打分取命中模块，命中方法全列并整段贴原文，不调模型、不做向量
+const MAP_BATCH_HEAD = "【项目地图·标题索引】先读方法名和〔源码注释〕筛选相关项，再用 map_lookup(module, symbol) 读取条目详情（完整源码区段及注释）。已知行范围但未识别方法时，传 module + startLine/endLine。此处没有附源码；注释、归纳可能过期，修改前必须核对目标实现，无注释不代表无关。这批不是全部，未命中可换关键字或 search_text。已读过且未变化的区段直接复用。";
+// 每轮只注入本地方法名、注释标题和行号；模型选中条目后再读取完整源码。
 // 上一轮写过的文件单独标成地图已更新，打分规则不变
 function buildPromptBlock(workspace, query, extra) {
   if (!workspace || !String(query || "").trim()) return "";
@@ -1348,11 +1374,9 @@ function buildPromptBlock(workspace, query, extra) {
     shown.add(n.id);
   }
   const lines = [];
-  const topForCode = [];
   for (const row of top) {
     if (shown.has(row.n.id)) continue;
     appendModuleLines(lines, row.n, row.hit, rev);
-    topForCode.push(row);
   }
   const parts = [];
   if (updatedLines.length || touch.removed.length) {
@@ -1363,10 +1387,7 @@ function buildPromptBlock(workspace, query, extra) {
     if (updatedLines.length) parts.push(updatedLines.join("\n"));
   }
   if (lines.length) {
-    const code = attachHitCode(topForCode);
-    const nCode = code.filter((s) => s.startsWith("【原文")).length;
-    const codeNote = nCode ? "下列 " + nCode + " 个命中方法已附完整源码（见下方【原文·可直接用】，与 :起-止 一致，不截断）。" : "";
-    parts.push(MAP_BATCH_HEAD + (codeNote ? "\n" + codeNote : "") + "\n\n" + lines.join("\n") + (code.length ? "\n\n" + code.join("\n\n") : ""));
+    parts.push(MAP_BATCH_HEAD + "\n\n" + lines.join("\n"));
   } else if (!parts.length) return "";
   return parts.join("\n\n");
 }
@@ -1381,11 +1402,14 @@ async function search(workspace, extra, q) {
     return "尚未生成项目地图。请在设置中点击「查看项目地图」生成后再用于定位。";
   }
   if (moduleId) {
+    if (q.symbol || q.startLine != null || q.endLine != null) return formatSourceItem(sourceItem(workspace, extra, q));
     ensureFresh(workspace, extra, mapData);
     const n = findModule(mapData, moduleId);
     if (!n) return "项目地图里没有模块：" + moduleId + (query ? "；改用关键字检索：\n\n" + mapTextForQuery(workspace, extra, mapData, query, q) : "");
     const nAbs = n.abs || path.join(workspace, n.path || "");
     if (isForeignAiSkill(nAbs)) return "这是其他 AI 的技能或规则，SpCode 不读取。只使用本程序技能目录里已设置的技能。";
+    refreshNodes(workspace, extra || [], mapData, [n]);
+    if (!mapData.nodes.includes(n)) return '模块已删除，请重新查询地图';
     return moduleText(mapData, n, reverseDeps(mapData));
   }
   return mapTextForQuery(workspace, extra, mapData, query, q);
@@ -1423,9 +1447,36 @@ function rebuildEdgesFrom(mapData, node, text, inclSet) {
   const top = Array.from(hits.entries()).sort((a, b) => b[1] - a[1]).slice(0, IMPLICIT_MAX_PER_NODE);
   for (const [to] of top) mapData.edges.push({ from: node.id, to, kind: EDGE_IMPLICIT });
 }
+function clearNodeSummary(node) {
+  delete node.methods;
+  delete node.methodsMtime;
+  delete node.methodsInputKey;
+  delete node.methodsDepsHash;
+  node.desc = '';
+}
+
+// 依赖的实现变化可能使调用者摘要过时；沿反向依赖传播失效，不花模型 token。
+function invalidateDependentSummaries(mapData, id) {
+  const reverse = new Map();
+  const add = (from, to) => {
+    if (!reverse.has(to)) reverse.set(to, new Set());
+    reverse.get(to).add(from);
+  };
+  for (const n of mapData.nodes) for (const dep of n.deps || []) add(n.id, dep);
+  for (const e of mapData.edges || []) add(e.from, e.to);
+  const seen = new Set([id]), todo = [id];
+  const byId = new Map(mapData.nodes.map((n) => [n.id, n]));
+  while (todo.length) for (const caller of reverse.get(todo.pop()) || []) {
+    if (seen.has(caller)) continue;
+    seen.add(caller);
+    if (byId.has(caller)) clearNodeSummary(byId.get(caller));
+    todo.push(caller);
+  }
+}
+
 // 文件内容变了才重抽符号与依赖；没变返回 false。
 // 源码变了就丢掉 AI 归纳的 methods/desc：那些说明描述的是旧实现，留着会让检索一直命中过期功能
-function refreshNode(workspace, extra, mapData, node) {
+function refreshNode(workspace, extra, mapData, node, force = false) {
   const abs = absOf(node);
   if (!abs) return false;
   let st = null;
@@ -1434,15 +1485,21 @@ function refreshNode(workspace, extra, mapData, node) {
   const mtime = fileStamp(st);
   const stored = node.mtime || 0;
   // 旧索引把 mtime 截成 32 位。低位一致说明文件没改，不能据此把整个项目重读一遍
-  if (st.size === node.size && (stored === mtime || (stored | 0) === (mtime | 0))) return false;
+  if (!force && st.size === node.size && stored === mtime && node.ctime === st.ctimeMs && node.contentHash) return false;
   let text = "";
   try { text = fs.readFileSync(abs, "utf8"); } catch { return false; }
   node.size = st.size;
   node.mtime = mtime;
+  node.ctime = st.ctimeMs;
+  const contentHash = summaryCache.hash(text);
+  if (node.contentHash === contentHash) {
+    if (node.methodsMtime === stored) node.methodsMtime = mtime;
+    return true;
+  }
+  node.contentHash = contentHash;
   node.symbols = extractSymbols(text, node.ext);
-  delete node.methods;
-  delete node.methodsMtime;
-  node.desc = "";
+  clearNodeSummary(node);
+  invalidateDependentSummaries(mapData, node.id);
   const inclSet = new Set();
   node.deps = resolveDeps(workspace, extra, abs, text, node.ext, node.id, buildFileIndex(mapData.nodes), inclSet);
   rebuildEdgesFrom(mapData, node, text, inclSet);
@@ -1458,6 +1515,7 @@ function refreshNodes(workspace, extra, mapData, nodes) {
     else if (r) changed++;
   }
   if (gone.length) {
+    for (const id of gone) invalidateDependentSummaries(mapData, id);
     const drop = new Set(gone);
     mapData.nodes = mapData.nodes.filter((n) => !drop.has(n.id));
     mapData.edges = (mapData.edges || []).filter((e) => !drop.has(e.from) && !drop.has(e.to));
@@ -1487,7 +1545,7 @@ function addNodeFromFile(workspace, extra, mapData, abs, excludes) {
   const inclSet = new Set();
   const fresh = {
     id: key, path: key, abs: abs.replace(/\\/g, "/"), ext, size: st.size,
-    mtime: fileStamp(st), deps: [], desc: "", symbols: extractSymbols(text, ext)
+    mtime: fileStamp(st), ctime: st.ctimeMs, contentHash: summaryCache.hash(text), deps: [], desc: "", symbols: extractSymbols(text, ext)
   };
   mapData.nodes.push(fresh);
   fresh.deps = resolveDeps(workspace, extra, abs, text, ext, key, buildFileIndex(mapData.nodes), inclSet);
@@ -1590,6 +1648,7 @@ function takeDirty(roots) {
   return { full, files };
 }
 function dropNode(mapData, id) {
+  invalidateDependentSummaries(mapData, id);
   const before = mapData.nodes.length;
   mapData.nodes = mapData.nodes.filter((n) => n.id !== id);
   if (mapData.nodes.length === before) return false;
@@ -1615,7 +1674,7 @@ function applyDirtyFiles(workspace, extra, mapData, files) {
     if (!isIndexableFile(path.basename(abs))) continue;
     const node = mapData.nodes.find((n) => n.id === key);
     if (node) {
-      const r = refreshNode(workspace, extra, mapData, node);
+      const r = refreshNode(workspace, extra, mapData, node, true);
       if (r === "missing") { if (dropNode(mapData, node.id)) changed++; }
       else if (r) changed++;
     } else if (addNodeFromFile(workspace, extra, mapData, abs, excludes)) changed++;
@@ -1693,7 +1752,7 @@ function upsertFile(workspace, abs, extra) {
   const node = mapData.nodes.find((n) => n.id === key);
   const created = !node;
   if (node) {
-    if (!refreshNode(workspace, ex, mapData, node)) return false;
+    if (!refreshNode(workspace, ex, mapData, node, true)) return false;
   } else {
     if (st.size <= 0 || st.size > maxBytesOf(target) || !isIndexableFile(path.basename(target))) return false;
     if (loadExcludes(workspace).indexOf(key) >= 0) return false;
@@ -1703,7 +1762,7 @@ function upsertFile(workspace, abs, extra) {
     const inclSet = new Set();
     const fresh = {
       id: key, path: key, abs: target.replace(/\\/g, "/"), ext, size: st.size,
-      mtime: fileStamp(st), deps: [], desc: "", symbols: extractSymbols(text, ext)
+      mtime: fileStamp(st), ctime: st.ctimeMs, contentHash: summaryCache.hash(text), deps: [], desc: "", symbols: extractSymbols(text, ext)
     };
     mapData.nodes.push(fresh);
     fresh.deps = resolveDeps(workspace, ex, target, text, ext, key, buildFileIndex(mapData.nodes), inclSet);
@@ -1714,7 +1773,7 @@ function upsertFile(workspace, abs, extra) {
   scheduleMapWrite(workspace, mapData);
   if (created) ensureIncluded(workspace, key);
   noteMapTouch(workspace, key, "updated");
-  scheduleResummarize(workspace, key);
+  // 源码变化已使旧摘要失效，不在后台自动调用模型。
   return true;
 }
 // 删文件后调用：摘掉节点以及与它相关的进出边
@@ -1723,6 +1782,7 @@ function removeFile(workspace, abs, extra) {
   const mapData = loadMapCached(workspace);
   if (!mapData || !Array.isArray(mapData.nodes)) return false;
   const key = fileKey(workspace, extra || [], path.normalize(abs));
+  invalidateDependentSummaries(mapData, key);
   const before = mapData.nodes.length;
   mapData.nodes = mapData.nodes.filter((n) => n.id !== key);
   if (mapData.nodes.length === before) return false;
@@ -1807,7 +1867,7 @@ function callModelForText(modelCfg, messages, signal) {
   if (['cursor', 'codex'].includes(apiProtocol.normalizeProtocol(modelCfg && modelCfg.protocol))
     && (require('./cursor-direct').busy() || require('./codex-direct').busy())) {
     diag.log('map', '直通进行中，跳过这次归纳');
-    return Promise.resolve('');
+    return Promise.reject(new Error('直通进行中，暂缓归纳'));
   }
   // API 模型（openai/anthropic/gemini）
   return apiProtocol.complete({ modelCfg, messages, stream: false, tools: null, onDelta: noop, onReason: noop, signal })
@@ -1852,11 +1912,11 @@ function attachLines(methods, text) {
   }
   return methods;
 }
-// 大文件分批补作用/关键值：每批 SUMMARY_MAX_METHODS，合计不超过 SUMMARY_MAX_METHODS_TOTAL
-async function summarizeFileMethods(modelCfg, fileInfo, signal) {
-  const allNames = Array.isArray(fileInfo.symbols)
-    ? fileInfo.symbols.map((s) => s && s.name).filter(Boolean).slice(0, SUMMARY_MAX_METHODS_TOTAL)
-    : [];
+// 摘要影响语义检索，必须基于完整源码；节省依靠缓存和去重，不截短摘要输入。
+async function summarizeFileMethods(modelCfg, fileInfo, signal, cache) {
+  const extracted = Array.isArray(fileInfo.symbols) ? fileInfo.symbols : [];
+  const symbols = [...new Map(extracted.filter((s) => s?.name).map((s) => [s.name, s])).values()].slice(0, SUMMARY_MAX_METHODS_TOTAL);
+  const allNames = symbols.map((s) => s.name);
   if (!allNames.length) return [];
   // 大 JSON 只分段不归纳，整份发给模型太大
   if (fileInfo.ext === ".json" && String(fileInfo.text || "").length > MAX_FILE_BYTES) return [];
@@ -1864,14 +1924,22 @@ async function summarizeFileMethods(modelCfg, fileInfo, signal) {
   const merged = [];
   const seen = new Set();
   for (let i = 0; i < allNames.length; i += SUMMARY_MAX_METHODS) {
-    if (signal && signal.aborted) break;
+    if (signal && signal.aborted) throw Object.assign(new Error('已停止'), { name: 'AbortError' });
     const names = allNames.slice(i, i + SUMMARY_MAX_METHODS);
+    const validBatch = (methods) => Array.isArray(methods) && methods.length === names.length && names.every((name) => methods.some((m) => m && m.name === name && typeof m.desc === 'string' && typeof m.keyValues === 'string'));
+    const cached = cache && cache.get(names);
+    if (validBatch(cached)) {
+      merged.push(...cached);
+      for (const m of cached) seen.add(m.name);
+      continue;
+    }
     const nameHint = "\n已抽出的名字，name 必须从中原样选取，不要新造：\n" + names.join("、") + "\n";
     const user =
-      "文件：" + fileInfo.path + "\n语言扩展：" + (fileInfo.ext || "") + "\n" + nameHint +
-      "\n源码：\n```\n" + fileInfo.text + "\n```\n\n" +
+      "文件：" + fileInfo.path + "\n语言扩展：" + (fileInfo.ext || "") + "\n" +
+      "\n完整源码：\n```\n" + fileInfo.text + "\n```\n\n" +
+      nameHint +
       "请输出 JSON 数组，每个元素格式：{\"name\":\"方法名\",\"keyValues\":\"关键值，一行\",\"desc\":\"作用，一句话\"}。" +
-      "只输出 JSON，不要代码围栏或解释。本批只处理上面列出的名字。";
+      "只输出 JSON，不要代码围栏或解释。本批只处理上面列出的名字。基于完整源码核对实现和调用关系；不能确定的作用或关键值留空，不得猜测。";
     const messages = [
       { role: "system", content: sys },
       { role: "user", content: user }
@@ -1879,12 +1947,16 @@ async function summarizeFileMethods(modelCfg, fileInfo, signal) {
     let text = "";
     try {
       text = await callModelForText(modelCfg, messages, signal);
+      if (signal?.aborted) throw Object.assign(new Error('已停止'), { name: 'AbortError' });
     } catch (e) {
       diag.log("map", "调用模型归纳失败", { message: e && e.message, batch: i / SUMMARY_MAX_METHODS });
-      break;
+      throw e;
     }
-    for (const m of parseMethodsJson(text)) {
-      const key = String(m.name || "").toLowerCase();
+    const parsed = parseMethodsJson(text).filter((m) => names.includes(m.name));
+    if (!validBatch(parsed)) throw new Error('模型遗漏了本批方法，未将不完整摘要标记为完成');
+    if (cache) cache.put(names, parsed);
+    for (const m of parsed) {
+      const key = String(m.name || "");
       if (!key || seen.has(key)) continue;
       seen.add(key);
       merged.push(m);
@@ -1893,146 +1965,71 @@ async function summarizeFileMethods(modelCfg, fileInfo, signal) {
   return attachLines(merged, fileInfo.text);
 }
 
-// 统计节点方法摘要填充度（对齐当前符号）
-function methodFillStats(n) {
-  const methods = nodeMethods(n);
-  const sym = Array.isArray(n.symbols) ? n.symbols.length : 0;
-  let filled = 0;
-  for (const m of methods) {
-    if (String(m.desc || "").trim() || String(m.keyValues || "").trim()) filled++;
-  }
-  const total = Math.max(methods.length, sym);
-  return { total, filled, sym, ratio: total ? filled / total : 0 };
-}
-// 方法多但摘要少、或被旧上限截断：需要后台再嚼
-function needsGapSummary(n) {
-  if (!n || !n.abs) return false;
-  if (!Array.isArray(n.methods)) return true;
-  if (n.methodsMtime != null && n.mtime != null && n.methodsMtime !== n.mtime) return true;
-  const st = methodFillStats(n);
-  if (st.sym >= 8 && st.filled < Math.ceil(st.sym * 0.7)) return true;
-  if (st.sym > SUMMARY_MAX_METHODS && st.filled < Math.min(st.sym, SUMMARY_MAX_METHODS_TOTAL)) return true;
-  return false;
-}
-function gapPriority(n) {
-  const st = methodFillStats(n);
-  return (st.sym - st.filled) * 10 + st.sym;
-}
-
-function chatModelCfg() {
-  try {
-    const s = store.load();
-    return store.resolveModelCfg(s.currentModelId, s);
-  } catch {
-    return null;
-  }
-}
-
+// 批量和单节点共用同一文件锁，避免同时为一个文件付费。
 const summaryJobs = new Set();
 const oneSummary = new Set();
-const summaryAgain = new Set();
-// [铆钉优化] 改完文件 20 秒内再改就重新计时，停手后才重归纳，不和正在改代码的模型抢接口。其他 AI 请勿去掉
-const RESUMMARIZE_DELAY_MS = 20000;
-const resummarizeTimers = new Map();
-function scheduleResummarize(workspace, id) {
-  if (!workspace || !id) return;
-  const k = hashPath(workspace) + "\n" + id;
-  const old = resummarizeTimers.get(k);
-  if (old) clearTimeout(old);
-  resummarizeTimers.set(k, setTimeout(() => {
-    resummarizeTimers.delete(k);
-    resummarizeNow(workspace, id);
-  }, RESUMMARIZE_DELAY_MS));
-}
-// 写文件更新地图后：勾选过的模块在后台重归纳。正在归纳的同一文件只再排一次
-function resummarizeNow(workspace, id) {
-  if (!workspace || !id) return;
-  const inc = loadInclude(workspace);
-  if (!inc || !inc.initialized || !Array.isArray(inc.includes) || inc.includes.indexOf(id) < 0) return;
-  const cfg = chatModelCfg();
-  if (!cfg) return;
-  const flight = hashPath(workspace) + "\n" + id;
-  if (oneSummary.has(flight)) {
-    summaryAgain.add(flight);
-    return;
-  }
-  summarizeOne(workspace, id, cfg).catch((e) => {
-    diag.log("map", "改完重归纳失败", { id, message: e && e.message });
-  });
-}
 // 只改这一个节点再写回，避免整批归纳用内存里的旧地图盖掉刚点开的那份说明
 function saveNodePatch(workspace, node) {
   const map = loadJson(jsonPath(workspace), null);
   if (!map || !Array.isArray(map.nodes) || !node) return;
   const hit = map.nodes.find((x) => x.id === node.id);
   if (!hit) return;
-  // 归纳期间文件又被写过，这份说明对的是旧源码，不能盖掉新节点
-  if (node.methodsMtime != null && hit.mtime !== node.methodsMtime) return;
+  // 只允许同一份源码的结果写回；时间戳变化本身不代表代码变化。
+  if (hit.contentHash !== node.contentHash) return false;
   hit.symbols = node.symbols || [];
   hit.methods = node.methods || [];
   hit.methodsMtime = node.methodsMtime;
+  hit.contentHash = node.contentHash;
+  hit.methodsInputKey = node.methodsInputKey;
+  hit.methodsDepsHash = node.methodsDepsHash;
+  hit.mtime = node.mtime;
+  hit.size = node.size;
+  hit.ctime = node.ctime;
   saveJson(jsonPath(workspace), map);
   invalidateMapCache(workspace);
+  return true;
 }
 async function summarizeIncludes(workspace, includes, modelCfg, signal) {
   if (!modelCfg || !includes || !includes.length) return;
   const jobKey = hashPath(workspace);
-  if (summaryJobs.has(jobKey)) return;
+  if (summaryJobs.has(jobKey)) return { ok: false, reason: 'busy' };
   summaryJobs.add(jobKey);
   try {
   const map = loadJson(jsonPath(workspace), null);
   if (!map || !Array.isArray(map.nodes)) return;
-  const byId = new Map(map.nodes.map((n) => [n.id, n]));
-  // 未归纳 + 方法多但摘要少的缺口节点；缺口按「差多少」优先
-  const fresh = [];
-  const gaps = [];
-  for (const id of includes) {
-    const n = byId.get(id);
-    if (!n || !n.abs) continue;
-    if (!Array.isArray(n.methods)) fresh.push(n);
-    else if (needsGapSummary(n)) gaps.push(n);
-  }
-  gaps.sort((a, b) => gapPriority(b) - gapPriority(a));
-  const targets = fresh.concat(gaps);
+  const selected = new Set(includes);
+  // 即使时间戳相同，也在 summarizeOne 中核对源码和依赖哈希；缓存命中不调用模型。
+  const targets = map.nodes.filter((n) => selected.has(n.id) && n.abs);
   if (!targets.length) {
     emitStatus(workspace, { running: false, summarizing: false, summarizeDone: true, nodes: map.nodes.length, files: map.nodes.length });
-    return;
+    return { ok: true, done: 0, total: 0 };
   }
-  diag.log("map", "开始方法归纳", { fresh: fresh.length, gaps: gaps.length, total: targets.length });
+  diag.log("map", "开始方法归纳", { total: targets.length });
   emitStatus(workspace, { running: true, summarizing: true, done: 0, total: targets.length, nodes: map.nodes.length, files: map.nodes.length });
   let done = 0;
+  let failed = false;
   for (const n of targets) {
     if (signal && signal.aborted) break;
-    let text = "";
-    try { text = fs.readFileSync(n.abs, "utf8"); } catch { n.methods = []; continue; }
-    if (!text.trim()) { n.methods = []; continue; }
-    try {
-      n.symbols = extractSymbols(text, n.ext);
-      const raw = await summarizeFileMethods(modelCfg, { path: n.path, ext: n.ext, text: text, symbols: n.symbols }, signal);
-      // 落盘前按当前符号对齐：行号用符号，源码里没有的方法名丢掉
-      n.methodsMtime = n.mtime;
-      n.methods = nodeMethods(Object.assign({}, n, { methods: raw }));
-    } catch (e) {
-      diag.log("map", "方法归纳失败", { id: n.id, message: e && e.message });
-      n.methods = n.methods || [];
-    }
+    const result = await summarizeOne(workspace, n.id, modelCfg, signal);
+    if (!result?.ok) failed = true;
     done++;
-    saveNodePatch(workspace, n);
-    // 带上刚归纳完的这个模块，画布收到就能立刻更新它，不必等整批归纳结束
     emitStatus(workspace, {
       running: true, summarizing: true, done, total: targets.length,
       nodes: map.nodes.length, files: map.nodes.length,
-      justSummarized: { id: n.id, methods: n.methods || [], symbols: n.symbols || [], desc: n.desc || "", mtime: n.mtime, methodsMtime: n.methodsMtime }
+      justSummarized: result?.ok ? result : null
     });
+    // 接口失败后不继续把剩余文件逐个送往同一个故障接口。
+    if (result && ['fail', 'aborted', 'no-model'].includes(result.reason)) break;
   }
   emitStatus(workspace, { running: false, summarizing: false, summarizeDone: true, done, total: targets.length, nodes: map.nodes.length, files: map.nodes.length });
+  return { ok: !failed && !signal?.aborted && done === targets.length, done, total: targets.length };
   } finally {
     summaryJobs.delete(jobKey);
   }
 }
 
 // 点开一个节点时只归纳这一个文件，把作用和关键值补进弹窗
-async function summarizeOne(workspace, id, modelCfg) {
+async function summarizeOne(workspace, id, modelCfg, signal) {
   if (!workspace || !id) return { ok: false, reason: "no-id" };
   if (!modelCfg) return { ok: false, reason: "no-model" };
   const flight = hashPath(workspace) + "\n" + id;
@@ -2043,23 +2040,43 @@ async function summarizeOne(workspace, id, modelCfg) {
     if (!map || !Array.isArray(map.nodes)) return { ok: false, reason: "no-map" };
     const n = map.nodes.find((x) => x.id === id);
     if (!n || !n.abs) return { ok: false, reason: "no-node" };
+    if (signal?.aborted) return { ok: false, reason: "aborted" };
+    const extra = (map.roots || []).filter((r) => path.resolve(r) !== path.resolve(workspace));
+    const refreshed = refreshNode(workspace, extra, map, n, true);
+    if (refreshed === 'missing') return { ok: false, reason: 'read' };
+    if (refreshed) { saveJson(jsonPath(workspace), map); invalidateMapCache(workspace); }
     let text = "";
     try { text = fs.readFileSync(n.abs, "utf8"); } catch { return { ok: false, reason: "read" }; }
     n.symbols = extractSymbols(text, n.ext);
+    n.contentHash = summaryCache.hash(text);
+    const depsHash = summaryCache.dependencyHash(map, n);
+    const inputKey = summaryCache.inputKey(n, text, depsHash, modelCfg);
+    if (Array.isArray(n.methods) && n.methodsInputKey === inputKey && n.methodsMtime === n.mtime) {
+      return { ok: true, cached: true, id: n.id, symbols: n.symbols, methods: n.methods, mtime: n.mtime, methodsMtime: n.methodsMtime, desc: n.desc || "" };
+    }
+    n.methodsInputKey = inputKey;
+    n.methodsDepsHash = depsHash;
     if (!text.trim() || !n.symbols.length) {
       n.methods = [];
       n.methodsMtime = n.mtime;
       saveNodePatch(workspace, n);
       return { ok: true, id: n.id, symbols: n.symbols, methods: [], mtime: n.mtime, methodsMtime: n.mtime, desc: n.desc || "" };
     }
-    const raw = await summarizeFileMethods(modelCfg, { path: n.path, ext: n.ext, text: text, symbols: n.symbols }, null);
+    const cache = summaryCache.open(path.join(mapDir(workspace), 'summary-cache'), n.id, inputKey);
+    const raw = await summarizeFileMethods(modelCfg, { path: n.path, ext: n.ext, text: text, symbols: n.symbols }, signal, cache);
     n.methodsMtime = n.mtime;
     n.methods = nodeMethods(Object.assign({}, n, { methods: raw }));
     let st = null;
     try { st = fs.statSync(n.abs); } catch { st = null; }
-    if (!st || fileStamp(st) !== n.mtime || st.size !== n.size) return { ok: false, reason: "stale" };
-    saveNodePatch(workspace, n);
-    emitStatus(workspace, {
+    const latestMap = loadJson(jsonPath(workspace), null);
+    const latest = latestMap?.nodes?.find((item) => item.id === id);
+    if (!st || !latest || summaryCache.hash(fs.readFileSync(n.abs, 'utf8')) !== n.contentHash || summaryCache.dependencyHash(latestMap, latest) !== depsHash) return { ok: false, reason: "stale" };
+    n.mtime = fileStamp(st);
+    n.size = st.size;
+    n.ctime = st.ctimeMs;
+    n.methodsMtime = n.mtime;
+    if (!saveNodePatch(workspace, n)) return { ok: false, reason: 'stale' };
+    if (!summaryJobs.has(hashPath(workspace))) emitStatus(workspace, {
       running: false, summarizing: false,
       nodes: map.nodes.length, files: map.nodes.length,
       justSummarized: { id: n.id, methods: n.methods || [], symbols: n.symbols || [], desc: n.desc || "", mtime: n.mtime, methodsMtime: n.methodsMtime }
@@ -2073,10 +2090,6 @@ async function summarizeOne(workspace, id, modelCfg) {
     return { ok: false, reason: "fail" };
   } finally {
     oneSummary.delete(flight);
-    if (summaryAgain.has(flight)) {
-      summaryAgain.delete(flight);
-      scheduleResummarize(workspace, id);
-    }
   }
 }
 
@@ -2121,5 +2134,5 @@ module.exports = {
   noteDiskChange, noteWatching,
   hashPath, fileKey, sameWorkspace, isIgnored, parseIgnoreLines, jsonPath, mdPath,
   getExcludes: loadExcludes, setExcludes: saveExcludes,
-  getInclude: loadInclude, setInclude, summarizeIncludes, summarizeOne
+  getInclude: loadInclude, setInclude, summarizeIncludes, summarizeOne, sourceItem
 };

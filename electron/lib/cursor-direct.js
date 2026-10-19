@@ -49,6 +49,7 @@ function buildCustomTools(tools, session) {
         if (!ctx) return { content: [{ type: 'text', text: '本轮已结束，工具没有执行。' }], isError: true };
         try {
           const text = toolResultText(await ctx.runTool(f.name, args || {}, context?.toolCallId || ''));
+          if (ctx.stats) ctx.stats.calls.push(f.name);
           return { content: [{ type: 'text', text }] };
         } catch (e) {
           return { content: [{ type: 'text', text: `工具失败：${e?.message || e}` }], isError: true };
@@ -98,7 +99,7 @@ function untilAbort(p, signal) {
  * 跑一轮。会话按 key 复用；sig（模型、项目、技能、规则等）变了或 fresh 为真时新开会话，
  * 新会话的第一条消息带上 firstPrefix（SpCode 系统提示 + 之前对话），之后每轮只发本轮内容。
  */
-async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, turnText, userContent, tools, runTool, onEvent, signal }) {
+async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [] }) {
   await untilAbort(cursorModel.ensureLogin(modelCfg), signal);
   let session = sessions.get(key);
   if (session && (fresh || session.sig !== sig)) {
@@ -133,17 +134,22 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, turn
   }
   onEvent({ type: 'think', text: isNew ? 'Cursor 直通：新开会话，已带上 SpCode 规则' : 'Cursor 直通：沿用本对话的会话' });
 
-  const text = isNew ? `${firstPrefix}\n\n${turnText}` : turnText;
+  const currentContext = systemContext ? `【本轮 SpCode 当前规则与上下文；与旧指令冲突时以本段为准】\n${systemContext}\n\n` : '';
+  const text = `${isNew ? `${firstPrefix}\n\n` : ''}${currentContext}${turnText || ''}`.trim();
   const images = imagesOf(userContent);
   let content = '';
   let reasoning = '';
   let sendText = text;
   let sendImages = images;
-  session.ctx = { runTool };
+  const stats = { calls: [] };
+  const required = [...new Set((requiredToolNames || []).map((name) => String(name || '').trim()).filter(Boolean))];
+  session.ctx = { runTool, stats };
   activeRuns += 1;
   const transient = (message) => /stalled|ECONNRESET|socket|network|timeout|timed out/i.test(String(message || ''));
+  let networkRetries = 0;
+  let actionRetries = 0;
   try {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
       let ended = false;
       let lastAt = Date.now();
       let run = null;
@@ -186,8 +192,24 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, turn
         if (stalled) {
           diag.log('cursor', 'Cursor 直通 run 没有正常收尾', { ended, status: res.status, attempt });
           cancelRun();
-          if (ended) return { content, reasoning };
-          if (attempt < 2) {
+          if (ended) {
+            if (required.length && !required.some((name) => stats.calls.includes(name)) && actionRetries < 2) {
+              actionRetries += 1;
+              content = '';
+              reasoning = '';
+              onEvent({ type: 'rewrite_text', text: '' });
+              onEvent({ type: 'status', text: 'Cursor 还没有调用完成任务所需的 SpCode 工具，正在继续…' });
+              sendText = `上一轮只回复了文字，尚未执行任务。请立即调用当前提供的 SpCode 工具完成任务，再汇报实际结果。需要调用的工具之一：${required.join('、')}。不要重复计划或解释限制。`;
+              sendImages = [];
+              continue;
+            }
+            if (required.length && !required.some((name) => stats.calls.includes(name))) {
+              throw new Error('Cursor 未调用本轮要求的 SpCode 工具，无法确认任务已执行。');
+            }
+            return { content, reasoning };
+          }
+          if (networkRetries < 2) {
+            networkRetries += 1;
             onEvent({ type: 'status', text: 'Cursor 连接中断，正在接上…' });
             sendText = '连接中断了。按已经完成的工具结果继续，不要重做已经成功的步骤。';
             sendImages = [];
@@ -197,7 +219,8 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, turn
           throw new Error(`Cursor 模型「${modelCfg.model}」超过 ${Math.round(STALL_MS / 60000)} 分钟没有新内容，已中断。`);
         } else if (res.status !== 'finished') {
           const message = res.error?.message || res.status || '';
-          if (transient(message) && attempt < 2) {
+          if (transient(message) && networkRetries < 2) {
+            networkRetries += 1;
             diag.log('cursor', 'Cursor 直通连接中断，同一会话重试', { attempt, message });
             onEvent({ type: 'status', text: 'Cursor 连接中断，正在接上…' });
             sendText = '连接中断了。按已经完成的工具结果继续，不要重做已经成功的步骤。';
@@ -208,6 +231,19 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, turn
           throw new Error(`Cursor 模型「${modelCfg.model}」没有完成：${message}`);
         }
         if (!content && res.result) content = String(res.result);
+        if (required.length && !required.some((name) => stats.calls.includes(name)) && actionRetries < 2) {
+          actionRetries += 1;
+          content = '';
+          reasoning = '';
+          onEvent({ type: 'rewrite_text', text: '' });
+          onEvent({ type: 'status', text: 'Cursor 还没有调用完成任务所需的 SpCode 工具，正在继续…' });
+          sendText = `上一轮只回复了文字，尚未执行任务。请立即调用当前提供的 SpCode 工具完成任务，再汇报实际结果。需要调用的工具之一：${required.join('、')}。不要重复计划或解释限制。`;
+          sendImages = [];
+          continue;
+        }
+        if (required.length && !required.some((name) => stats.calls.includes(name))) {
+          throw new Error('Cursor 未调用本轮要求的 SpCode 工具，无法确认任务已执行。');
+        }
         return { content, reasoning };
       } catch (e) {
         if (signal?.aborted || e.name === 'AbortError') {
@@ -217,7 +253,8 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, turn
           closeSession(key);
           throw abortError();
         }
-        if (transient(e.message) && attempt < 2) {
+        if (transient(e.message) && networkRetries < 2) {
+          networkRetries += 1;
           diag.log('cursor', 'Cursor 直通连接中断，同一会话重试', { attempt, message: e.message });
           onEvent({ type: 'status', text: 'Cursor 连接中断，正在接上…' });
           sendText = '连接中断了。按已经完成的工具结果继续，不要重做已经成功的步骤。';

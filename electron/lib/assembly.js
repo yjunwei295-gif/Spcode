@@ -351,7 +351,7 @@ function helperPrompt(role, lang) {
     return `You are a summarization helper. Compress the user's material into key points. Keep paths, API names, and numbers. Do not call tools. Do not invent facts. ${langLine}`;
   }
   if (role === 'code') {
-    return `You are a coding helper. Give a concrete patch or draft and which files to touch. Do not call tools. ${langLine}`;
+    return `You are a coding helper. Give a concrete patch or draft and which files to touch. Do not call tools. ${langLine}${require('./code-map-comments').COMMENT_POLICY}`;
   }
   if (role === 'planning') {
     return `You are the planning module. You do not receive the user directly. Plan only from the brain's brief: steps, order, and risks. Do not call tools. ${langLine}`;
