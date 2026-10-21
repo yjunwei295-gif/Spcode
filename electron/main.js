@@ -1229,6 +1229,17 @@ ipcMain.handle('plan:tree', (e, payload) => {
   return agent.readPlanTree({ workspace: ws, tabId: String(payload?.tabId || '') });
 });
 
+/**
+ * 链路导图回读：按会话（tabId）与回复（turnId）取回已落盘的链路图。
+ * 参数 payload：{ workspace?, tabId, turnId }；workspace 缺省时用当前窗口绑定的工作目录。
+ * 返回 agent.readChainMap 的导图契约（nodes/edges 等），重开程序后前端仍可重绘链路图。
+ * 这里只做转发，不做兜底：读盘异常照常抛给前端，避免掩盖链路数据缺失。
+ */
+ipcMain.handle('chain:tree', (e, payload) => {
+  const ws = String(payload?.workspace || workspaceByWin.get(getWin(e)) || '');
+  return agent.readChainMap({ workspace: ws, tabId: String(payload?.tabId || ''), turnId: String(payload?.turnId || '') });
+});
+
 // 删除方案条目：仅未锁定条目可删除（锁定语义由 agent.removePlanItem 内部判断），删除后返回 {ok, locked/notFound/map}
 ipcMain.handle('plan:remove', (e, payload) => {
   const ws = String(payload?.workspace || workspaceByWin.get(getWin(e)) || '');

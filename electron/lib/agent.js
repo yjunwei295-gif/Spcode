@@ -2078,8 +2078,8 @@ function buildSystemPrompt({
     : '\n【本轮状态：交流与排查】用户在聊天、补充复现步骤/日志或提问。遵守所选人设和适用规则，按需调用只读工具调查并回应当前问题。用户描述自己在游戏/软件里的动作、引用开始按钮，都不是让 AI 开工。不要要求写入方案、点击按钮或回复开始；技能里的实施流程仅在用户要求实施或准备方案时适用。\n';
   // AGI 按目标自主执行；技能里的普通开工流程不能重新收紧当前模式。
   const agiContract = !agiOn ? '' : (enPrompt
-    ? '\n[AGI EXECUTION MODE] Complete the user goal autonomously: investigate, choose necessary files and tools, implement, and verify the requested outcome. Ordinary plan approval, start words, named-file-only rules, and worker handoff requirements in rules or skills do not apply in this mode. Existing plans are context, not permission locks. Respect explicit user exclusions and read-only requests. Recover from failures using tool evidence and another suitable approach. A successful status query alone does not complete an implementation task. Ask only for genuinely missing information or credentials you cannot obtain yourself. Report actual changes and outcome evidence, including unresolved blockers.\n'
-    : '\n【AGI 当前执行模式】收到目标后自主完成：查资料、选择必要文件和工具、实现、核对目标效果。规则或技能里的普通方案确认、开始口令、只能修改点名文件、模块派单流程在此模式不适用；已有方案是任务参考，不是权限锁。用户明确的任务排除范围和只读要求仍须遵守。遇到失败依据工具结果排查、换合适办法继续，不能只跑状态检查就把实现任务当完成。只在确实缺少无法自行获取的信息或凭据时提问。按实际改动和结果证据汇报，尚未解决的阻塞须如实说明。\n');
+    ? '\n[AGI EXECUTION MODE] Complete the user goal autonomously: investigate, choose necessary files and tools, implement, and verify the requested outcome. Ordinary plan approval, start words, named-file-only rules, and worker handoff requirements in rules or skills do not apply in this mode. Existing plans are context, not permission locks. Respect explicit user exclusions and read-only requests. Recover from failures using tool evidence and another suitable approach. A successful status query alone does not complete an implementation task. Ask only for genuinely missing information or credentials you cannot obtain yourself. Report actual changes and outcome evidence, including unresolved blockers.\n' + chainFormatRule(true) + '\n'
+    : '\n【AGI 当前执行模式】收到目标后自主完成：查资料、选择必要文件和工具、实现、核对目标效果。规则或技能里的普通方案确认、开始口令、只能修改点名文件、模块派单流程在此模式不适用；已有方案是任务参考，不是权限锁。用户明确的任务排除范围和只读要求仍须遵守。遇到失败依据工具结果排查、换合适办法继续，不能只跑状态检查就把实现任务当完成。只在确实缺少无法自行获取的信息或凭据时提问。按实际改动和结果证据汇报，尚未解决的阻塞须如实说明。\n' + chainFormatRule(false) + '\n');
   const agiSelfEn = '\nAGI is on. The user only accepts the result. You finish everything else yourself: understand the request, fill the gaps, read the screen, use the mouse and keyboard, edit files, run git, and run project commands. Do not wait for start, do not restate and stop, and do not hand work back. Your permissions are high. This turn is unlimited. Call screen_read first, then ui_act or the mouse and keyboard, then edit_file, write_file, or run_command as needed. Choose commands or desktop tools to open apps and web pages according to the task. Do not call call_worker. When it is done, tell the user what to check.\n';
   const agiSelfZh = '\nAGI 已打开。用户只管验收，其他所有事情都由你自己做完：看懂问题、补全需求、看屏幕、键鼠、改文件、Git、在项目里执行命令。不要等「开始」，不要复述完就停，不要把活交回用户。你的权限现在很高，基本上能干所有事情。这一轮全解放，不受思考轮次限制。必须先调用 screen_read，看完再用 ui_act 或键鼠，需要改文件或跑命令就自己调用 edit_file、write_file、run_command。打开软件和网页按任务选择命令或键鼠工具。禁止 call_worker，禁止派单。做完后只告诉用户验收什么。\n';
   const handoff = agiOn
@@ -3065,8 +3065,10 @@ function planMismatchText(tree) {
 }
 
 function planFromText(text) {
-  const body = String(text || '').slice(0, 8000);
-  return { text: body, files: filesNamedInPlan(body) };
+  const full = String(text || '');
+  // 点名文件按全文统计：方案超过 8000 字时，只用截断后的正文算白名单会漏掉后面条目点到的文件，
+  // 那些文件上的改动就会被判成「方案没点名这个文件」。text 仍然截断，避免整份方案每轮都塞进派单撑大上下文。
+  return { text: full.slice(0, 8000), files: filesNamedInPlan(full) };
 }
 
 /** 只认「文件路径 → …」箭头左边要改的文件。不动行、箭头右边顺口提到的文件名不算 */
@@ -3078,12 +3080,15 @@ function filesNamedInPlan(text) {
   for (let j = 0; j < lines.length; j++) {
     const line = lines[j];
     const low = line.toLowerCase();
-    if (/不动|不要改|不改|不用改|无需改|不应改|不应被改|别改|勿改|不得改|不修改|unchanged|do not change|不要动/.test(low)) continue;
+    // 「文件：xxx.cs · …，只加日志、不改任何行为」这种行本身就是改动清单：
+    // 行里的「不改」是在说这条改动不动别的分支，不代表这一行点名的文件属于不动范围。
+    // 之前先按「不改」整行跳过，方案点名的文件就漏出白名单，正常改动被判成「方案没点名这个文件」。
     const field = line.match(/^\s*(?:[-*]\s*)?文件\s*[:：]\s*(.+)$/);
     if (field) {
       for (const hit of field[1].match(PLAN_FILE_RE) || []) files.add(path.basename(hit).toLowerCase());
       continue;
     }
+    if (/不动|不要改|不改|不用改|无需改|不应改|不应被改|别改|勿改|不得改|不修改|unchanged|do not change|不要动/.test(low)) continue;
     const arrow = line.search(/→|->/);
     if (arrow < 0) continue;
     for (const hit of line.slice(0, arrow).match(PLAN_FILE_RE) || []) files.add(path.basename(hit).toLowerCase());
@@ -3091,11 +3096,57 @@ function filesNamedInPlan(text) {
   return files;
 }
 
-/** 取【方案】…【/方案】之间的正文；没写结尾标记就取到末尾 */
+// Markdown 形式的「方案」标题行：整行只写方案名（## 方案 / **方案** / 方案：/ 修改方案）。
+// 大脑不按【方案】标记输出时靠它认方案段；「开工方案」「方案格式」这类带前缀的句子不在此列。
+const PLAN_MD_HEAD_RE = /^\s{0,3}(#{1,6}\s*)?(\*\*|__)?\s*(?:修改)?方案\s*(\*\*|__)?\s*[：:]?\s*$/;
+// 方案段里的「文件：」字段行：只有真点了文件的段落才算改动清单，闲聊里提到「方案」两个字不会被当成方案
+const PLAN_MD_FILE_RE = /^\s*(?:[-*]\s*)?[*_]{0,2}\s*文件\s*[*_]{0,2}\s*[:：]\s*\S/m;
+
+/**
+ * 从 Markdown 标题式的「方案」段落里取出方案正文。
+ * 真实回复常把方案写成「**方案**」或「## 方案」标题，标题下面直接写「文件：…」加编号条目，
+ * 而不是【方案】…【/方案】。
+ * @param {string} text 整条回复正文
+ * @returns {string} 方案正文；没有标题式方案段、或段落里没点文件时返回空串
+ * 副作用：无。段落遇到下一个同级或更高级的 # 标题、以及独占一行的粗体小标题就收尾，
+ *   方案后面的「两点说明」之类的补充不会混进方案正文。
+ */
+function planBlockFromMarkdown(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const head = lines[i].match(PLAN_MD_HEAD_RE);
+    if (!head) continue;
+    // 标题的 # 个数，0 表示粗体或纯文字标题
+    const level = head[1] ? head[1].replace(/\s/g, '').length : 0;
+    const body = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j];
+      const hash = line.match(/^\s{0,3}(#{1,6})\s+/);
+      if (hash) {
+        const n = hash[1].length;
+        if (level === 0 || n <= level) break;
+      }
+      // 独占一行的粗体小标题（如「**两点说明**」）是方案之后的说明，遇到就收尾
+      if (level === 0 && /^\s{0,3}(\*\*|__)[^*_]+(\*\*|__)\s*[：:]?\s*$/.test(line)) break;
+      body.push(line);
+    }
+    const block = body.join('\n').trim();
+    if (!block) continue;
+    if (!PLAN_MD_FILE_RE.test(block)) continue;
+    return block;
+  }
+  return '';
+}
+
+/**
+ * 取方案正文：优先【方案】…【/方案】之间的内容，没写结尾标记就取到末尾；
+ * 没有【方案】标记时认 Markdown 标题式的方案段（大脑常写成「**方案**」），
+ * 否则这条回复里落到磁盘的改动清单会被整段丢掉，用户既看不到「写入方案」也点不到「开始」。
+ */
 function planBlockOf(text) {
   const raw = String(text || '');
   const at = raw.indexOf(PLAN_MARK);
-  if (at < 0) return '';
+  if (at < 0) return planBlockFromMarkdown(raw).slice(0, 8000);
   const from = at + PLAN_MARK.length;
   const end = raw.indexOf(PLAN_END_MARK, from);
   return raw.slice(from, end >= 0 ? end : undefined).trim().slice(0, 8000);
@@ -3158,11 +3209,12 @@ async function makeDialogIndex({ userText, assistantText }) {
  */
 function writePlanFromChat({ workspace, tabId, text }) {
   const raw = String(text || '');
-  const at = raw.indexOf(PLAN_MARK);
   const file = planFileOf(workspace, tabId);
-  // 回复里没有【方案】标记就一律不写方案文件：把整条回复当方案写进去，只会得到一堆解析不出条目的正文，
-  // 导图永远是空的，用户还以为方案已经存好了。这里直接返回 no-plan，让前端提示去要一份带【方案】段的回复。
-  if (at < 0) {
+  // 方案正文有两种来源：【方案】…【/方案】标记，或「**方案**」这类 Markdown 标题下的改动清单（见 planBlockOf）。
+  // 两种都取不到才一律不写方案文件：把整条回复当方案写进去，只会得到一堆解析不出条目的正文，
+  // 导图永远是空的，用户还以为方案已经存好了。
+  const body = planBlockOf(raw);
+  if (!body) {
     diag.log('agent', '用户写入方案', { file, chars: 0, items: 0, merged: 0, state: 'no-plan' });
     return {
       ok: false,
@@ -3172,11 +3224,9 @@ function writePlanFromChat({ workspace, tabId, text }) {
       merged: 0,
       mismatch: [],
       state: 'no-plan',
-      message: '这条回复里没有【方案】段，没有写入方案文件：先让 AI 给出【方案】…【/方案】，再点「写入方案」'
+      message: '这条回复里没有方案段（【方案】…【/方案】，或「方案」标题下的改动清单），没有写入方案文件：先让 AI 给出方案，再点「写入方案」'
     };
   }
-  // 有【方案】标记但正文为空（只写了开头标记）时，取标记后面到结尾标记之间的内容
-  const body = planBlockOf(raw) || raw.slice(at + PLAN_MARK.length).split(PLAN_END_MARK).join('').trim();
   const dir = planTreeDir(file);
   const resolve = planResolver(workspace, []);
   let tree = null;
@@ -3278,6 +3328,42 @@ function readPlanTree({ workspace, tabId }) {
   return map;
 }
 
+/**
+ * 链路导图模块：按用到处加载，不放在文件顶部。
+ * 原因：chain-tree.js 与本文件的改动属于同一批落地，加载点放在真正要用链路的几处，
+ * 少一个顶层 require 的先后绑定关系。模块缺失或内部报错都照原样抛出，这里不吞异常、不做兜底。
+ * @returns {object} chain-tree 模块，提供 parseChainItems / mapOf / save / read
+ */
+function chainLib() {
+  return require('./chain-tree');
+}
+
+/**
+ * 链路图目录：沿用方案文件所在的会话目录，链路图与方案导图放在同一处，删方案文件时一起退场。
+ * @param {string} workspace 工作区根目录；为空时由 planFileOf 落到 SpCode 自己的数据目录
+ * @param {string} sessionKey 会话键「窗口号:会话 id」，也接受裸会话 id
+ * @returns {string} 链路 JSON 所在目录（路径不带 .md）
+ */
+function chainDirOf(workspace, sessionKey) {
+  return planTreeDir(planFileOf(workspace, sessionKey));
+}
+
+/**
+ * 界面读链路导图：按会话 + 本轮回复编号取回已落盘的链路图，重开程序后前端仍能重绘。
+ * @param {object} args
+ * @param {string} args.workspace 工作区根目录，缺省时按 planFileOf 的规则落数据目录
+ * @param {string} args.tabId 会话 id（渲染层 tab.id），决定目录
+ * @param {string} args.turnId 本轮回复编号，决定文件名 chain_<tabId>_<turnId>.json
+ * @returns {object} 导图数据 nodes/edges；没落过盘时返回空节点集合并把 state 标成 no-chain，
+ *   由前端说明「这条回复没有链路图」，不在这里补建 —— 链路是一次解析的产物，没有原始正文可重算。
+ * 副作用：只读文件，不写盘、不改方案文件。
+ */
+function readChainMap({ workspace, tabId, turnId }) {
+  const map = chainLib().read(chainDirOf(workspace, tabId), tabId, turnId);
+  if (map && Array.isArray(map.nodes) && map.nodes.length) return map;
+  return { nodes: [], edges: [], state: 'no-chain', tabId: String(tabId || ''), turnId: String(turnId || '') };
+}
+
 /** 删除方案里的一条：只有方案未锁定时才允许；删掉后重写方案文件并落盘导图树，返回 {ok, locked/notFound/map} */
 function removePlanItem({ workspace, tabId, no }) {
   const file = planFileOf(workspace, tabId);
@@ -3354,25 +3440,99 @@ function evidenceHolds(workspace, line) {
   return squash(near).includes(want);
 }
 
-/** 结论里以某个标签开头、且证据核得上的行；核不上的记日志丢掉 */
+/**
+ * 按标签扫结论行，分成「证据核得上」和「以该标签开头但证据核不上」两类。
+ * 核不上的只统计条数并记日志丢掉，调用方据此把这种情况判成未验证，而不是当成通过。
+ * @param {string} verdict 总结模块的结论原文，按行扫描；空或非字符串按没有标签行处理
+ * @param {string} workspace 工作区根目录，evidenceHolds 用它解析证据「路径:行号「原文」」里的相对路径
+ * @param {RegExp} re 标签匹配规则，只对去掉行首列表符号后仍命中该规则的行做证据核对
+ * @returns {{kept:string[], dropped:number}} kept 为证据核得上的行（已去掉行首列表符号）；dropped 为核不上被丢掉的行数
+ */
 function provenLines(verdict, workspace, re) {
-  const out = [];
+  const kept = [];
+  let dropped = 0;
   for (const raw of String(verdict || '').split(/\r?\n/)) {
     const line = raw.trim().replace(/^[-*•\d.、\s]+/, '');
     if (!re.test(line)) continue;
-    if (evidenceHolds(workspace, line)) out.push(line);
-    else diag.log('agent', '总结结论证据核不上，作废', { line: line.slice(0, 300) });
+    if (evidenceHolds(workspace, line)) kept.push(line);
+    else {
+      dropped += 1;
+      diag.log('agent', '总结结论证据核不上，作废', { line: line.slice(0, 300) });
+    }
+  }
+  return { kept, dropped };
+}
+
+/**
+ * 按标签扫一遍结论行，按证据核对结果分成两堆：核得上的进 proven，核不上的进 unproven。
+ * 与 provenLines 的区别：provenLines 对核不上的行只留条数、把原文丢掉；这里把核不上的原文一并交回调用方。
+ * 为什么必须保留 unproven：总结模块既然报了「不一致 / 严重问题 / 无法与方案一致」，就不能被静默吞掉 ——
+ * 证据对不上只说明这件事没核实成，不等于没问题，所以调用方要拿它把结论判成「未核实」并进 gaps。
+ * 核不上的行在这里统一记一条日志，调用方不必重复扫、重复记。
+ * @param {string} verdict 总结模块的结论原文；空或非字符串按没有标签行处理
+ * @param {string} workspace 工作区根目录，evidenceHolds 用它解析证据「路径:行号「原文」」里的相对路径
+ * @param {RegExp} re 标签匹配规则，只对去掉行首列表符号后仍命中该规则的行做证据核对
+ * @returns {{proven:string[], unproven:string[]}} proven 为证据核得上的行（已去掉行首列表符号）；unproven 为核不上的行原文
+ */
+function splitProvenLines(verdict, workspace, re) {
+  const proven = [];
+  const unproven = [];
+  for (const raw of String(verdict || '').split(/\r?\n/)) {
+    // 先 trim 再剥行首列表符号，「- 不一致：…」「1. 不一致：…」都能被标签规则命中
+    const line = raw.trim().replace(/^[-*•\d.、\s]+/, '');
+    if (!re.test(line)) continue;
+    // 核得上：进 proven，由调用方拿去判定
+    if (evidenceHolds(workspace, line)) {
+      proven.push(line);
+      continue;
+    }
+    // 核不上：先记日志再进 unproven，两个分支都 push，绝不提前丢弃这条结论
+    diag.log('agent', '总结结论证据核不上，按未核实处理', { line: line.slice(0, 300) });
+    unproven.push(line);
+  }
+  return { proven, unproven };
+}
+
+/** 总结结论里证据核得上的「不一致：」行（核不上的行由调用方按 dropped 处理） */
+function gapLinesOf(verdict, workspace) {
+  return provenLines(verdict, workspace, /^不一致\s*[:：]/).kept;
+}
+
+/**
+ * 抓「说了不一致、却没给出核得上的证据」的结论行；这条链路专门捞这类行，禁止把它们当没问题丢掉。
+ * 逐行扫描总结结论：去掉行首列表符号与序号后，以「不一致：」「严重问题：」「无法与方案一致：」开头、
+ * evidenceHolds 核不上、且冒号后不是「无 / 没有 / 未发现 / 无此项」这类空结论的行，截到 300 字收进返回数组。
+ * 空结论行本来就没说哪里不一致，收进来只会空转回改，因此在这里排除。
+ * @param {string} verdict 总结模块的结论原文；空或非字符串按没有标签行处理
+ * @param {string} workspace 工作区根目录，evidenceHolds 用它解析证据「路径:行号「原文」」里的相对路径
+ * @returns {string[]} 证据核不上的结论行原文（每行最多 300 字），顺序与原结论一致；没有则为空数组
+ */
+function unprovenGapLines(verdict, workspace) {
+  const out = [];
+  const labelRe = /^(不一致|严重问题|无法与方案一致)\s*[:：]\s*/;
+  for (const raw of String(verdict || '').split(/\r?\n/)) {
+    const line = raw.trim().replace(/^[-*•\d.、\s]+/, '');
+    const m = line.match(labelRe);
+    if (!m) continue;
+    if (evidenceHolds(workspace, line)) continue;
+    const body = line.slice(m[0].length).trim();
+    if (!body) continue;
+    if (/^(无|没有|未发现|无此项)(?:$|[\s，。,.；;：:])/.test(body)) continue;
+    out.push(line.slice(0, 300));
   }
   return out;
 }
 
-/** 总结结论里证据核得上的「不一致：」行 */
-function gapLinesOf(verdict, workspace) {
-  return provenLines(verdict, workspace, /^不一致\s*[:：]/);
-}
-
+/**
+ * 结论里是否有证据核得上的「无法与方案一致 / 严重问题」行。
+ * 只有核得上的才算「已确认对不齐」；证据核不上的那类不在这里返回 true，
+ * 它的条数会进 judgePlanVerdict 的 unverified，避免没核对成的结论被当成已核实。
+ * @param {string} verdict 总结模块的结论原文
+ * @param {string} workspace 工作区根目录，用于核对证据行
+ * @returns {boolean} 至少有一条核得上的行时为 true
+ */
 function cannotAlignPlan(verdict, workspace) {
-  return provenLines(verdict, workspace, /^(无法与方案一致|严重问题)\s*[:：]/).length > 0;
+  return provenLines(verdict, workspace, /^(无法与方案一致|严重问题)\s*[:：]/).kept.length > 0;
 }
 
 /** 上一轮已经告诉用户方案对不齐。这轮用户写明按现有代码妥协 */
@@ -3393,16 +3553,46 @@ function latestAssistantText(history) {
   return '';
 }
 
-/** 只认核得上的结论：没有核实过的不一致或严重问题就算通过；总结没跑完或没输出，记为没完成，不回改 */
+/**
+ * 判定方案验收结论是否通过。
+ * 证据核不上的结论按未核实处理，一样判不通过；只有核得上的结论才参与判定，但核不上不等于没问题。
+ * 两处标签行（「不一致：」和「无法与方案一致 / 严重问题：」）都用 splitProvenLines 拆成核得上 / 核不上两组：
+ * cannot 只由核得上的「无法与方案一致 / 严重问题」行决定；gaps 由四部分拼接
+ * （核得上的不一致 + 核不上的不一致 + 核不上的无法与方案一致 / 严重问题 + 程序侧事实缺口），failed 按 cannot 或 gaps 非空计算，
+ * 因此证据核不上时也进回改流程，不会被当成通过。总结没跑完或没输出记为没完成（incomplete），不回改。
+ * 只写「方案验收：未通过」而不给证据时 failed 仍为 false，但 unverified 为 true、saidPass 为 false，
+ * 调用方据此不能把它当成通过（语义同既有 snap.planUnverified：没核对成，不能算通过）。
+ * @param {string} verdict 总结模块的结论原文，空或含「总结模块没有完成核对」视为没完成
+ * @param {string} workspace 工作区根目录，用于核对结论里的证据「路径:行号「原文」」
+ * @param {string[]} [factGaps] 程序侧已核实的不一致（如方案外文件），原样并入 gaps
+ * @returns {{failed:boolean, incomplete:boolean, cannot:boolean, gaps:string[], saidPass:boolean, unverified:boolean, unproven:number}}
+ *   failed 为 false 表示没查出问题；unverified 为「没核对成、不能算通过」；saidPass 只有既没 failed 又没 unverified 才为 true；
+ *   gaps 为四段拼接结果（含证据核不上的结论原文）；unproven 为证据核不上的条数（两类标签行合计），供日志使用
+ */
 function judgePlanVerdict(verdict, workspace, factGaps) {
   const text = String(verdict || '').trim();
   const facts = factGaps || [];
   const incomplete = !text || /^总结模块没有完成核对/.test(text);
-  if (incomplete && !facts.length) return { failed: false, incomplete: true, cannot: false, gaps: [], saidPass: false };
-  const cannot = cannotAlignPlan(text, workspace);
-  const gaps = gapLinesOf(text, workspace).concat(facts);
+  if (incomplete && !facts.length) return { failed: false, incomplete: true, cannot: false, gaps: [], saidPass: false, unverified: false, unproven: 0 };
+  // 两处标签行各扫一遍，都用 splitProvenLines 拆成「核得上 / 核不上」：核得上的才参与 cannot 判定，
+  // 核不上的原文也留着并入 gaps —— 证据对不上只说明没核实，不等于没问题，不能因此放行。
+  const gapSplit = splitProvenLines(text, workspace, /^不一致\s*[:：]/);
+  const cannotSplit = splitProvenLines(text, workspace, /^(无法与方案一致|严重问题)\s*[:：]/);
+  // cannot 仍只由核得上的「无法与方案一致 / 严重问题」行决定，核不上的不算已确认对不齐（但会进 gaps 让验收不通过）
+  const cannot = cannotSplit.proven.length > 0;
+  // gaps 四段拼接：核得上的不一致 + 核不上的不一致 + 核不上的无法与方案一致 / 严重问题 + 程序侧已核实的事实缺口（如方案外文件）
+  const gaps = gapSplit.proven.concat(gapSplit.unproven, cannotSplit.unproven, facts);
+  // 证据核不上的条数（两类标签行合计，作废日志已由 splitProvenLines 写过）：只用于把「没核对成」和「明确通过」区分开
+  const dropped = gapSplit.unproven.length + cannotSplit.unproven.length;
+  // 有的结论只写一行「方案验收：未通过」而不给证据行：这种明确声明必须拦下，不能因为没证据就被当成通过
+  const declaredFail = text
+    .split(/\r?\n/)
+    .some((raw) => /^[-*•\d.、\s]*方案验收\s*[:：]\s*未通过[。.]?$/.test(raw.trim()));
   const failed = cannot || gaps.length > 0;
-  return { failed, incomplete: false, cannot, gaps, saidPass: !failed };
+  // 没核实过（声明未通过或证据核不上）不等于通过，单独记成 unverified，避免「证据核不上」被 saidPass 放行
+  const unverified = !failed && (declaredFail || dropped > 0);
+  // unproven 取两类标签行里证据核不上的合计条数，与 dropped 同源：日志靠它排查「判据里有多少条没核实成」
+  return { failed, incomplete: false, cannot, gaps, saidPass: !failed && !unverified, unverified, unproven: dropped };
 }
 
 function planBlockReport(gaps, why) {
@@ -3446,11 +3636,26 @@ function planFormatRule(enPrompt) {
   return '## 方案格式\n这条只约束「怎么写」，不约束「必须写」：不是每轮都要出方案。但一旦回复里出现要给用户执行的分步改动清单，必须把整段清单包在【方案】…【/方案】之间。程序只认标记里的内容并落盘成方案文件，用户才能点「写入方案」；清单写在标记外面，程序收不到，等于这份改动清单不存在。';
 }
 
+/**
+ * 链路导图格式规则：只约束「怎么写」，不约束「必须写」。
+ * 用户问「这个功能怎么实现的 / 谁调的 / 调用链是什么」时，助手要在回复里单独写一段【链路】…【/链路】，
+ * 程序收尾只解析这一段，落盘成链路图并给界面出「链路导图」按钮；写在标记外面收不到，等于没有链路。
+ * 放在函数里给两处提示词共用：普通模式走 planPrompt，AGI 模式走 agiContract，两边格式必须完全一致。
+ * @param {boolean} enPrompt 为 true 时返回英文版规则，否则返回中文版
+ * @returns {string} 规则段落纯文本（不带首尾换行）
+ */
+function chainFormatRule(enPrompt) {
+  if (enPrompt) {
+    return 'When the user asks how a feature is implemented, who calls it, or what the call chain is, add one separate block 【链路】…【/链路】: one step per line in exactly this format:\n1. step name (入口)｜作用: what this step does｜实现: how it is done｜影响: what breaks if changed｜位置: path:line｜上游: the caller, or 无\nMark the first step (入口) and the last step (展示); middle steps use (中间). Positions must be files and lines you really read this turn; never invent them. The program only reads the 【链路】 block, and a chain written outside those markers produces no chain map. Plain Q&A needs no such block.';
+  }
+  return '用户问「这个功能是怎么实现的」「是谁调用的」「调用链是什么」这类问题时，在回复里单独写一段【链路】…【/链路】，一行一个步骤，格式固定：\n1. 步骤名（入口）｜作用：这一步干什么｜实现：具体怎么实现｜影响：改这里会影响什么｜位置：文件路径:行号｜上游：调用它的方法或「无」\n最后一条把（入口）换成（展示），中间的步骤写（中间）。位置必须是本轮真读到的文件和行号，禁止编造；程序只认【链路】段里的内容，写在标记外面不会生成链路导图。普通问答不用写这一段。';
+}
+
 function planPrompt(enPrompt) {
   if (enPrompt) {
-    return `\n## Work plan (enforced by the program)\nBefore the user says start, write the full plan in your reply between ${PLAN_MARK} and ${PLAN_END_MARK}. Write every step in exactly this format; the program splits each step into its own folder, dispatches it, and verifies it one by one:\n### N. title\n文件：path\n方法：method name (omit if none)\n需求：what to do — the goal and the change, as an instruction for the worker, not current code to compare\n验证：how to confirm it is right\nFor a new file, mark it in the 文件 line (e.g. 文件：a/b.cs（新建）) and describe what the complete file must do in 需求; later steps may keep editing that file. One step changes one spot in one file; split several spots into several steps. End with one line "不动范围：…". If unfinished items from earlier plans still exist, list them again in the same 【方案】 block together with this turn's new items; do not drop the backlog. The program merges on 写入方案. Planning does not compare against current code: every item starts green (ready). Whether the code matches the requirement is only checked at verification time after the change. The user may click 写入方案 or explicitly reply start to approve and lock the latest plan. Once the user says start, the plan file is locked and is the only basis: every call_worker task must follow it, and workers may only change files named in it. The program never reverts code. Files changed outside the plan are listed as mismatches and the worker is penalized; dispatch code to bring them back in line with the plan. The locked plan may not be changed. Only if it cannot work at all, stop and report 【方案无法通过】 with which step fails and why, and give a new ${PLAN_MARK} block for the user to review and write. Never claim the SpCode write-plan or start controls are unavailable; SpCode renders them from this plan and your closing start request. Do not repeat the plan or ask the user to click controls that are not present.\nEvery requirement must be grounded in what you actually read this turn. Never write steps you have not verified, never use vague wording such as "roughly", "should", or "try to", and never put work you cannot do into the plan.\n`;
+    return `\n## Work plan (enforced by the program)\nBefore the user says start, write the full plan in your reply between ${PLAN_MARK} and ${PLAN_END_MARK}. Write every step in exactly this format; the program splits each step into its own folder, dispatches it, and verifies it one by one:\n### N. title\n文件：path\n方法：method name (omit if none)\n需求：what to do — the goal and the change, as an instruction for the worker, not current code to compare\n验证：how to confirm it is right\nFor a new file, mark it in the 文件 line (e.g. 文件：a/b.cs（新建）) and describe what the complete file must do in 需求; later steps may keep editing that file. One step changes one spot in one file; split several spots into several steps. End with one line "不动范围：…". If unfinished items from earlier plans still exist, list them again in the same 【方案】 block together with this turn's new items; do not drop the backlog. The program merges on 写入方案. Planning does not compare against current code: every item starts green (ready). Whether the code matches the requirement is only checked at verification time after the change. The user may click 写入方案 or explicitly reply start to approve and lock the latest plan. Once the user says start, the plan file is locked and is the only basis: every call_worker task must follow it, and workers may only change files named in it. The program never reverts code. Files changed outside the plan are listed as mismatches and the worker is penalized; dispatch code to bring them back in line with the plan. The locked plan may not be changed. Only if it cannot work at all, stop and report 【方案无法通过】 with which step fails and why, and give a new ${PLAN_MARK} block for the user to review and write. Never claim the SpCode write-plan or start controls are unavailable; SpCode renders them from this plan and your closing start request. Do not repeat the plan or ask the user to click controls that are not present.\n${chainFormatRule(true)}\nEvery requirement must be grounded in what you actually read this turn. Never write steps you have not verified, never use vague wording such as "roughly", "should", or "try to", and never put work you cannot do into the plan.\n`;
   }
-  return `\n## 开工方案（程序执行）\n用户还没说开始时，把完整方案写在回复的${PLAN_MARK}…${PLAN_END_MARK}段里。每条写的是需求（要做什么），程序会把每条拆成一个文件夹逐条派工、逐条验收：\n### 编号. 标题\n文件：路径\n方法：方法名（没有可省略）\n需求：要做什么，写清目标和改动（这是给实现模型的指令，不是给程序比对的现状代码）\n验证：怎么确认改对了\n新建文件时在「文件：」那行标明（如「文件：a/b.cs（新建）」），需求里写这个文件要做什么；后面的条目可以接着改这个文件。一条只改一个文件的一处；同一文件多处就拆成多条。最后单独一行写「不动范围：…」。若会话里还有未完成的旧条目，必须和本轮新条目写进同一份【方案】，禁止只写本轮一条把旧账丢掉；点「写入方案」时程序会合并保留。定方案阶段不做现状比对，所有条目标成「可开工」（绿色）；代码和需求一致不一致，是改完后的验收阶段才比对。用户核对后可点「写入方案」，也可明确单独发送「/spcode-start」直接确认并锁定最新方案，程序会把最新方案块落盘。用户说开始后方案文件锁定，它就是唯一依据：派给代码的 task 必须照方案写，代码模块只负责实现；总结模块只核对，不能和用户对接。改了方案外的文件，程序不撤回，会处罚代码模块并把它列为不一致，大脑要派代码按方案改回去。锁定的方案不许改。只有方案完全无法走通时，才停下报告【方案无法通过】，说清哪一条走不通、为什么，并给出新的${PLAN_MARK}段等用户核对、写入。按钮由 SpCode 根据方案块和开始确认提示自动显示；禁止声称写入方案/开始按钮不可用，也不要重复方案或要求用户点不存在的按钮。每条需求都必须基于本轮真读到的内容；禁止写没核实过的步骤，禁止「大致」「应该」「尽量」这类模糊说法，自己做不到的事不许写进方案。\n禁止把调用点上已经在执行的加载、初始化改成「先记标记，等另一个对象的 Awake/Start 再执行」。方案没写明新的调用顺序、以及对象还不存在时由谁补上，就不许改执行时机。程序不会撤回代码。验收没通过时，按不一致清单把代码往方案方向改；用户中途停止，代码保持现状，下一轮按锁定的方案接着改。\n`;
+  return `\n## 开工方案（程序执行）\n用户还没说开始时，把完整方案写在回复的${PLAN_MARK}…${PLAN_END_MARK}段里。每条写的是需求（要做什么），程序会把每条拆成一个文件夹逐条派工、逐条验收：\n### 编号. 标题\n文件：路径\n方法：方法名（没有可省略）\n需求：要做什么，写清目标和改动（这是给实现模型的指令，不是给程序比对的现状代码）\n验证：怎么确认改对了\n新建文件时在「文件：」那行标明（如「文件：a/b.cs（新建）」），需求里写这个文件要做什么；后面的条目可以接着改这个文件。一条只改一个文件的一处；同一文件多处就拆成多条。最后单独一行写「不动范围：…」。若会话里还有未完成的旧条目，必须和本轮新条目写进同一份【方案】，禁止只写本轮一条把旧账丢掉；点「写入方案」时程序会合并保留。定方案阶段不做现状比对，所有条目标成「可开工」（绿色）；代码和需求一致不一致，是改完后的验收阶段才比对。用户核对后可点「写入方案」，也可明确单独发送「/spcode-start」直接确认并锁定最新方案，程序会把最新方案块落盘。用户说开始后方案文件锁定，它就是唯一依据：派给代码的 task 必须照方案写，代码模块只负责实现；总结模块只核对，不能和用户对接。改了方案外的文件，程序不撤回，会处罚代码模块并把它列为不一致，大脑要派代码按方案改回去。锁定的方案不许改。只有方案完全无法走通时，才停下报告【方案无法通过】，说清哪一条走不通、为什么，并给出新的${PLAN_MARK}段等用户核对、写入。按钮由 SpCode 根据方案块和开始确认提示自动显示；禁止声称写入方案/开始按钮不可用，也不要重复方案或要求用户点不存在的按钮。每条需求都必须基于本轮真读到的内容；禁止写没核实过的步骤，禁止「大致」「应该」「尽量」这类模糊说法，自己做不到的事不许写进方案。\n禁止把调用点上已经在执行的加载、初始化改成「先记标记，等另一个对象的 Awake/Start 再执行」。方案没写明新的调用顺序、以及对象还不存在时由谁补上，就不许改执行时机。程序不会撤回代码。验收没通过时，按不一致清单把代码往方案方向改；用户中途停止，代码保持现状，下一轮按锁定的方案接着改。\n${chainFormatRule(false)}\n`;
 }
 
 const DONE_CLAIM_RE = /补了一处|补了|已补|修好了|已经修好|已修复|修复完成|改完|改好了|可以打|交卷/;
@@ -4788,7 +4993,7 @@ async function summarizeImplementation({ vs, modelCfg, userText, assistantText, 
     ].join('\n\n')
     : [
       '你是总结模块。你不和用户对接，不问规划或代码模块，「开始」不约束你。实现已经结束，你只核对，不改文件，不给新的实现方案。下面附的差异和代码只是起点；看不全、拿不准的地方，自己用 read_file、search_text、map_lookup、goto_definition 读原文核实，查清楚再下结论，禁止凭猜测写结论。',
-      '每一条「不一致：」「严重问题：」「无法与方案一致：」都必须在同一行末尾写「证据：文件路径:行号「原文」」，原文是你在文件里亲眼读到的那一行，逐字照抄。程序会去文件里核对，核不上的结论一律作废。',
+      '每一条「不一致：」「严重问题：」「无法与方案一致：」都必须在同一行末尾写「证据：文件路径:行号「原文」」，原文是你在文件里亲眼读到的那一行，逐字照抄。程序会去文件里核对，核不上的结论按未核实处理，验收判不通过并要求改回。',
       // 汇报本轮实际改动，并依据已确认方案和改后代码核对能否通过。
       '根据下面的代码差异，用中文只输出一段「已更改：」，列出这次代码差异里实际改到的内容，一条一行，写清改了哪个文件的什么功能。没有改动就只写「已更改：无」。',
       '除「已更改：」外，再输出一段方案验收，逐字写成「方案验收：通过」或「方案验收：未通过」。',
@@ -4874,7 +5079,9 @@ async function runTurn({
   maxAgentRounds,
   unlimitedRounds,
   // 会话键：多会话各自一条插话队列，runTurn 不解析它的含义，只当字符串键用
-  interjectKey
+  interjectKey,
+  // 本轮回复编号（渲染层生成、主进程 chat 透传）：链路导图按「会话 + 本轮」落盘，重开程序后前端按它取回
+  turnId
 }) {
   // 标记本轮桌面任务进行中，结束时释放画面坐标锁。
   try { require('./desktop-hand').hold(); } catch { /* 桌面手未就绪时忽略 */ }
@@ -5951,16 +6158,42 @@ async function runTurn({
         verdict = `总结模块没有完成核对：${e.message || e}`;
       }
       const judged = judgePlanVerdict(verdict, workspace, offPlanGapLines(offPlanFiles(workspace, snap)));
+      // 记录本次验收判定的结论分布，用于排查「为什么判通过 / 为什么没通过」；只落诊断日志，不参与下面任何分支判断。
+      // unproven 是判据里证据核不上的条数，gaps/changes 取长度便于对比改动量与不一致量。
+      diag.log('agent', '方案验收判定', {
+        attempt,
+        failed: judged.failed,
+        incomplete: judged.incomplete,
+        cannot: judged.cannot,
+        gaps: judged.gaps.length,
+        unproven: judged.unproven,
+        changes: codeChanges.length
+      });
+      // 总结模块没给核对结论（incomplete）时不直接当成收工出口：先由程序自己重跑一次总结。
+      // 不推大脑消息、不改文件，只重跑总结；attempt 到 2 时下面的收口分支会标记卡住并出报告，等用户处理。
+      if (judged.incomplete && attempt < 2) continue;
       const stallKey = (judged.gaps.join('\n') || String(verdict || '').slice(0, 500)).trim();
       const stalled = !!(stallKey && seenStall.has(stallKey));
       if (judged.failed && stallKey) seenStall.add(stallKey);
       const giveUp = judged.cannot || stalled || attempt >= MAX_PLAN_RETRY;
       if (!judged.failed || signal?.aborted || !codeChanges.length || giveUp) {
         if (judged.incomplete) {
+          // 重跑一次总结仍没有核对结论：不再把「你自己看一下」当收工出口，改为标记卡住并出报告等用户处理
+          snap.planBlocked = true;
+          snap.planGaps = '总结模块连续两次没有给出核对结论';
+          finalText = [finalText, planBlockReport([snap.planGaps], '总结模块没能给出核对结论，程序不认这次通过。')].filter(Boolean).join('\n\n');
+          onEvent({ type: 'status', text: '方案验收没有结论，已停下等你处理' });
+        } else if (!judged.failed && judged.saidPass) {
+          // 只有既没核实到硬问题、总结模块也明确说了通过（saidPass）才认这次通过
+          snap.planAccepted = true;
+        } else if (judged.unverified) {
+          // 总结模块写了「有对不上的地方」但证据核不上文件原文（unverified）：既不判通过，也不把不一致派回代码，
+          // 只标记「没核对成」（语义同回改循环里的 planUnverified），出提示后停手，等用户自己看改动
           snap.planUnverified = true;
-          finalText = [finalText, '【方案验收没有完成】总结模块没有给出核对结论，代码没有回改，请你自己看一下改动。'].filter(Boolean).join('\n\n');
-        } else if (!judged.failed) snap.planAccepted = true;
-        else if (codeChanges.length && !signal?.aborted && giveUp) {
+          finalText = [finalText, '【方案验收没有通过】总结模块写明有对不上的地方，但证据核不上文件原文，没有当成通过；代码没回改，请你自己看一下改动'].filter(Boolean).join('\n\n');
+          onEvent({ type: 'status', text: '总结结论证据核不上，没有判通过' });
+          break;
+        } else if (codeChanges.length && !signal?.aborted && giveUp) {
           snap.planBlocked = true;
           snap.planGaps = judged.gaps.join('\n');
           const why = judged.cannot
@@ -6032,12 +6265,35 @@ async function runTurn({
         verdict = `总结模块没有完成核对：${e.message || e}`;
       }
       const judged = judgePlanVerdict(verdict, workspace, offPlanGapLines(offPlanFiles(workspace, snap)));
+      // 自动继续循环里的验收判定同样留痕，字段与上面的验收判定日志保持一致，便于两处结果对比；只记录，不影响分支。
+      diag.log('agent', '方案验收判定', {
+        n,
+        failed: judged.failed,
+        incomplete: judged.incomplete,
+        cannot: judged.cannot,
+        gaps: judged.gaps.length,
+        unproven: judged.unproven,
+        changes: codeChanges.length
+      });
+      // 总结模块没给核对结论（incomplete）时不直接当收工出口：
+      // 还有继续次数就回去再回改一轮（n 递增，受 MAX_FINISH 限制）；次数用完才标记卡住并出报告，等用户处理。
       if (judged.incomplete) {
-        snap.planUnverified = true;
-        finalText = [finalText, '【方案验收没有完成】程序未能取得完整核对结论，代码没有回改，请你自己看一下改动。'].filter(Boolean).join('\n\n');
+        if (n < MAX_FINISH) continue;
+        snap.planBlocked = true;
+        snap.planGaps = '总结模块没有给出核对结论';
+        finalText = [finalText, planBlockReport([snap.planGaps], '总结模块没能给出核对结论，程序不认这次通过。')].filter(Boolean).join('\n\n');
+        onEvent({ type: 'status', text: '方案验收没有结论，已停下等你处理' });
         break;
       } else if (!judged.failed && judged.saidPass) {
         snap.planAccepted = true;
+      } else if (judged.unverified) {
+        // 总结模块写了「有对不上的地方」但证据核不上文件原文（unverified，只在 !failed 时为真）：
+        // 此时 gaps 通常是空的，若落到下面的 else 就会拿空 gaps 推 planRetryPrompt 让大脑空转；
+        // 所以这里既不判通过也不派回改，只标记「没核对成」（语义同回改循环与上面验收入口的 planUnverified），出提示后停手
+        snap.planUnverified = true;
+        finalText = [finalText, '【方案验收没有通过】总结模块写明有对不上的地方，但证据核不上文件原文，没有当成通过；代码没回改，请你自己看一下改动'].filter(Boolean).join('\n\n');
+        onEvent({ type: 'status', text: '总结结论证据核不上，没有判通过' });
+        break;
       } else if (judged.cannot) {
         snap.planBlocked = true;
         snap.planGaps = judged.gaps.join('\n');
@@ -6097,6 +6353,20 @@ async function runTurn({
       askFixed: asksIfFixed(userText),
       accepted: false
     });
+  }
+  // 链路导图：收尾时把这条回复里的【链路】段解析一次，用和 plan_tree 同一条事件通道推给界面，
+  // 同时落盘到方案目录，重开程序后前端能按「会话 + 本轮」取回；没有链路段或解析不出条目就不推，界面也就不出按钮。
+  // 本函数此刻的 finalText 已是最终正文（含方案执行路径拼进去的报告），所以两条路径都只在这里解析这一次。
+  if (!signal?.aborted) {
+    const chainRaw = String(interjectKey || '');
+    // 会话键「窗口号:会话 id」里后面那段才是会话 id；前端回读链路图时也按这个 id 定位目录和文件名
+    const chainTabId = chainRaw.indexOf(':') >= 0 ? chainRaw.slice(chainRaw.indexOf(':') + 1) : chainRaw;
+    const chainItems = chainLib().parseChainItems(finalText);
+    if (chainItems.length) {
+      const chainMap = chainLib().mapOf(chainItems);
+      chainLib().save(chainDirOf(workspace, interjectKey), chainTabId, turnId, chainMap);
+      onEvent({ type: 'chain_map', map: chainMap });
+    }
   }
   const result = {
     text: finalText,
@@ -6200,4 +6470,4 @@ function parseProjectMapJsonArray(text) {
 }
 
 
-module.exports = { runTurn, listSkills, listRules, toolsSpec, describeProjectMap, pushInterjection, setFloatBarHooks, writePlanFromChat, readPlanTree, removePlanItem, makeDialogIndex };
+module.exports = { runTurn, listSkills, listRules, toolsSpec, describeProjectMap, pushInterjection, setFloatBarHooks, writePlanFromChat, readPlanTree, readChainMap, removePlanItem, makeDialogIndex };

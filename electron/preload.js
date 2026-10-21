@@ -13,6 +13,9 @@ const api = {
   setCursorDirect: (on) => ipcRenderer.invoke('app:cursorDirect', !!on),
   planWrite: (payload) => ipcRenderer.invoke('plan:write', payload),
   planTree: (payload) => ipcRenderer.invoke('plan:tree', payload),
+  // 链路导图：把 { tabId, turnId } 之类参数原样转给主进程 chain:tree，
+  // 由主进程解析本轮回答里的【链路】段并回传节点/边；preload 只做透传，不做任何解析或兜底
+  chainTree: (p) => ipcRenderer.invoke('chain:tree', p),
   // 删除方案条目：转发到主进程 plan:remove
   planRemoveItem: (payload) => ipcRenderer.invoke('plan:remove', payload),
   dialogIndex: (payload) => ipcRenderer.invoke('dialog:index', payload),

@@ -5,7 +5,7 @@ const path = require('path');
 
 const MAX_LINES = 120;
 const MAX_TEXT_CHARS = 5000;
-const MAX_CAPTURE_EDGE = 1920;
+const MAX_CAPTURE_EDGE = 2560;
 const MIN_CONFIDENCE = 45;
 const REUSE_MS = 20000;
 // 闲置 1 分钟就关 OCR 引擎，及时还内存
@@ -41,10 +41,16 @@ let ocrBrokenAt = 0;
 let ocrBrokenMsg = '';
 
 // 线程数按电脑档位走（低配 1 / 中配 2 / 高配 3），不再固定吃到 4 个
+/**
+ * 本次 OCR 开几个 worker：按电脑档位给上限，同时最多占一半核心，
+ * 留出 CPU 给用户自己的前台程序。
+ * @returns {number} 并行识别条数，至少 1
+ */
 function workerCount() {
   const cpus = require('os').cpus().length || 2;
   const tier = require('./agi-throttle').profile().ocrWorkers;
-  return Math.max(1, Math.min(tier, Math.floor(cpus / 3) || 1));
+  const cap = Math.max(1, Math.floor(cpus / 2));
+  return Math.max(1, Math.min(tier, cap));
 }
 
 async function startOcr() {
@@ -464,8 +470,11 @@ function formatBlock(frame) {
   const controlPart = controls.length
     ? `控件（${target}，用 ui_act 按编号直接操作，比按坐标点更准）：\n${controls.join('\n')}\n`
     : (frame.controlNote ? `控件读取失败：${frame.controlNote}，只能按文字坐标操作。\n` : '');
+  // 标出画面是几秒前采集的：AGI 每轮挂的可能还是上一次观察的结果，
+  // 模型据此判断要不要先 screen_read 重读，而不是拿着旧画面对着干
+  const ageText = frame.at ? `，采集于 ${Math.round(Math.max(0, Date.now() - frame.at) / 1000)} 秒前` : '';
   return `${SCREEN_BEGIN}
-画面 ${frame.id}：屏幕 ${frame.width}×${frame.height}，左上角 0,0 对应系统坐标 (${frame.originX}, ${frame.originY})。@(x,y) 是中心点，mouse_click 等直接用。
+画面 ${frame.id}：屏幕 ${frame.width}×${frame.height}${ageText}，左上角 0,0 对应系统坐标 (${frame.originX}, ${frame.originY})。@(x,y) 是中心点，mouse_click 等直接用。
 ${windowLines(frame.windows)}${experienceLines(frame)}${controlPart}${note}其他文字（OCR）：
 ${lines.join('\n') || '（没有识别到文字）'}
 ${SCREEN_END}`;

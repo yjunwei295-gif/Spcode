@@ -2655,6 +2655,27 @@ html[data-theme="dark"] { --success: #73c997; --warning: #edbc65; }
 .map-button:not(:disabled):hover { --map-button-bg: var(--btn-hover); filter: brightness(1.07); }
 .map-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .map-button:disabled { opacity: 0.5; cursor: not-allowed; }
+/* 链路导图：三列横向链路（入口 → 中间 → 展示）+ 底部节点详情六段。
+   颜色全部走主题变量，浅色/深色主题都跟着变；类名与方案导图（.map-*）分开，互不影响。 */
+.chain-map-col { display: flex; flex-direction: column; gap: 8px; min-width: 200px; max-width: 260px; }
+.chain-map-col-head { font-size: 11px; font-weight: 600; letter-spacing: 0.5px; }
+.chain-map-node {
+  display: flex; gap: 6px; align-items: flex-start; text-align: left; line-height: 1.5;
+  background: var(--map-button-bg, var(--btn-bg)); border: 1px solid var(--border);
+  border-left: 3px solid var(--border); border-radius: var(--sub-r);
+  padding: 8px 10px; font-size: 12px; font-family: inherit; color: inherit; cursor: pointer;
+}
+.chain-map-node:hover { border-color: var(--accent); }
+.chain-map-node.on { outline: 2px solid var(--accent); outline-offset: 1px; }
+.chain-map-node-no { flex: 0 0 auto; color: var(--muted); }
+.chain-map-node-title { flex: 1; word-break: break-word; }
+.chain-map-arrow { align-self: center; font-size: 16px; color: var(--muted); }
+.chain-map-badge { border: 1px solid var(--border); border-radius: 999px; padding: 0 8px; font-size: 11px; }
+.chain-map-detail-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-weight: 600; }
+.chain-map-detail-row { display: flex; gap: 10px; padding: 3px 0; border-top: 1px dashed var(--border); }
+.chain-map-detail-key { flex: 0 0 84px; color: var(--muted); }
+.chain-map-detail-val { flex: 1; word-break: break-word; }
+.chain-map-detail-empty, .chain-map-empty { color: var(--muted); font-size: 12px; }
 .modal.is-open { background: var(--overlay); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); }
 #modal-card { color: var(--text); border-radius: var(--sub-r-lg); box-shadow: var(--shadow); }
 html:not([data-theme="dark"]) #modal-card { background: var(--panel-solid); border: 1px solid var(--border-strong); }

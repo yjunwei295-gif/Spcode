@@ -1274,7 +1274,9 @@ composer: data.composer || null,
     refillRevertFiles: false,
     modelId: data.modelId || null,
     maxAgentRounds: data.maxAgentRounds != null ? clampAgentRounds(data.maxAgentRounds) : null,
-    unlimitedRounds: !!data.unlimitedRounds
+    // 全解放默认开启：只有存档里明确写了 false（用户主动点过「关」）才回到轮次模式；
+    // 旧存档缺该字段、新建会话、启动恢复的会话一律视为全解放。
+    unlimitedRounds: data.unlimitedRounds !== false
   };
 }
 
@@ -1834,17 +1836,59 @@ function parseStartOptions(text) {
   return out;
 }
 
+// Markdown 标题式的「方案」行：## 方案 / **方案** / 方案：/ 修改方案。
+// 大脑不写【方案】标记时靠它认方案段；「开工方案」「方案格式」这类带前缀的句子不算。
+const PLAN_MD_HEAD_RE = /^\s{0,3}(#{1,6}\s*)?(\*\*|__)?\s*(?:修改)?方案\s*(\*\*|__)?\s*[：:]?\s*$/;
+// 方案段里的「文件：」字段行：只有真点了文件的段落才算改动清单，闲聊里提到「方案」两个字不会被当成方案
+const PLAN_MD_FILE_RE = /^\s*(?:[-*]\s*)?[*_]{0,2}\s*文件\s*[*_]{0,2}\s*[:：]\s*\S/;
+
+/**
+ * 正文里的 Markdown 标题式方案段（没有【方案】标记时用）：标题下面必须点了文件。
+ * 段落遇到下一个同级或更高级的 # 标题、以及独占一行的粗体小标题就收尾，
+ * 与后台 agent.js 的 planBlockFromMarkdown 判定保持一致，避免出现「这头有按钮、那头说没方案」。
+ * @param {string} src 已去掉代码块的正文
+ * @returns {boolean} 有可写入的方案段返回 true
+ */
+function hasMarkdownPlan(src) {
+  const lines = String(src || '').split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const head = lines[i].match(PLAN_MD_HEAD_RE);
+    if (!head) continue;
+    // 标题的 # 个数，0 表示粗体或纯文字标题
+    const level = head[1] ? head[1].replace(/\s/g, '').length : 0;
+    const body = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j];
+      const hash = line.match(/^\s{0,3}(#{1,6})\s+/);
+      if (hash) {
+        const n = hash[1].length;
+        if (level === 0 || n <= level) break;
+      }
+      // 独占一行的粗体小标题（如「**两点说明**」）是方案之后的说明，遇到就收尾
+      if (level === 0 && /^\s{0,3}(\*\*|__)[^*_]+(\*\*|__)\s*[：:]?\s*$/.test(line)) break;
+      body.push(line);
+    }
+    if (!body.length) continue;
+    if (PLAN_MD_FILE_RE.test(body.join('\n'))) return true;
+  }
+  return false;
+}
+
 /**
  * 正文中的非空方案即可展示确认按钮，不要求模型再输出固定结尾。
  * 忽略代码示例及行内提及；与后台一致，缺少结束标记时取到回复末尾。
+ * 【方案】标记优先；没有标记时也认 Markdown 标题式的方案段（「**方案**」下面点了文件），
+ * 否则大脑换个写法写方案，界面就一颗按钮都没有，用户只能手打口令。
  */
 function hasPlanDraft(text) {
   const src = String(text || '').replace(/```[\s\S]*?(?:```|$)/g, '');
   const match = src.match(/^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?【方案】(?:\*\*)?([^\n]*(?:\n[\s\S]*)?)$/m);
-  if (!match) return false;
-  const body = match[1].split('【/方案】')[0].trim();
-  // 只有空标记、占位省略号或章节标签时，没有可供确认的方案。
-  return !!body.replace(/【[^】]*】|[\s#*_`.…-]/g, '');
+  if (match) {
+    const body = match[1].split('【/方案】')[0].trim();
+    // 只有空标记、占位省略号或章节标签时，没有可供确认的方案。
+    if (body.replace(/【[^】]*】|[\s#*_`.…-]/g, '')) return true;
+  }
+  return hasMarkdownPlan(src);
 }
 
 // [铆钉优化] 复述里如果明说本轮没有要改的东西，就不该再给开工按钮，也不该让小窗亮「开始」
@@ -1873,11 +1917,10 @@ function textSaysNoPendingWork(text) {
 // 找最近一条「方案」助手消息下标：大脑常在【方案】段后面再补一句解释，
 // 若开工按钮只认最后一条消息，方案那条就点不到了，所以这里单独定位方案消息。
 // 从数组末尾往前扫，跳过非助手消息（含 tool-note 类提示）与没有【方案】段落的消息。
-// 未写入的方案消息优先；全都点过「写入方案」时退回最近一条已写入的方案消息，
-// 避免「写入方案」一点，方案导图和开工入口跟着整段消失、用户没有开工的办法。
+// 只认「最近」这一条，不区分有没有点过「写入方案」：若让未写入的旧方案抢在前面，
+// 用户刚点完「写入方案」的那条就会从候选里掉出去，按钮跟着整段消失、当场没法开工。
 // 返回该消息下标；返回 -1 表示当前没有任何带方案的助手消息，调用方退回旧行为。
 function activePlanIdx(msgs) {
-  let writtenIdx = -1;
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
     if (!m) {
@@ -1891,16 +1934,9 @@ function activePlanIdx(msgs) {
     if (!hasPlanDraft(m.text)) {
       continue;
     }
-    // 还有没写入的方案，就用最近这一条
-    if (!m.planWritten) {
-      return i;
-    }
-    // 已写入的方案先记下来当兜底，继续往前找有没有还没写入的
-    if (writtenIdx < 0) {
-      writtenIdx = i;
-    }
+    return i;
   }
-  return writtenIdx;
+  return -1;
 }
 
 function repaintStartGo(m, i, tab) {
@@ -1918,6 +1954,22 @@ function repaintStartGo(m, i, tab) {
   const olds = host.querySelectorAll('.start-go-row');
   for (let k = 0; k < olds.length; k++) olds[k].remove();
   if (html) host.insertAdjacentHTML('beforeend', html);
+}
+
+/**
+ * 拼「写入方案 / 已写入方案 + 方案导图 + 说明」这一段按钮的 HTML。
+ * 抽出来让候选消息和历史已写入消息共用同一套按钮，避免两处各写一份、改一处漏一处。
+ * @param {object} m 消息对象：读 planWritten 决定按钮文字与有没有导图入口，读 planNote 显示灰字说明
+ * @param {number} i 消息下标：方案导图按钮带着它找回对应消息
+ * @param {boolean} en 是否英文界面
+ * @returns {string} 方案段的按钮 HTML
+ */
+function planWriteBtns(m, i, en) {
+  const planLabel = m.planWritten ? (en ? 'Plan written' : '已写入方案') : (en ? 'Write plan' : '写入方案');
+  let planBtns = `<button type="button" class="start-go-submit" data-plan-write="1">${planLabel}</button>`;
+  if (m.planWritten) planBtns += `<button type="button" class="start-go-submit" data-plan-map="${i}">${en ? 'Plan map' : '方案导图'}</button>`;
+  if (m.planNote) planBtns += `<span class="start-go-hint">${escapeHtml(String(m.planNote))}</span>`;
+  return planBtns;
 }
 
 // [铆钉优化] 开工状态上报去重：renderStartGo 是逐条消息调用的，同一次重绘会把同一个结果
@@ -1943,13 +1995,23 @@ function reportStartReady(tab, canStart, options) {
 //         并在有 api.reportError 时上报一次开工判定诊断。
 // 边界：本函数在整批渲染里逐条消息调用，只有候选那一条做判定和上报，避免一次重绘发上千次 IPC。
 function renderStartGo(m, i, lastIdx, planIdx, tab) {
-  // 方案按钮和开工按钮跟着最近一条仍未写入的【方案】消息走（planIdx）；
+  // 方案按钮和开工按钮跟着最近一条【方案】消息走（planIdx）；
   // 没有这样一条时才退回最后一条助手消息（lastIdx）。只有候选那一条决定主窗和小窗的开工状态，
   // 历史消息不得清空当前状态。
   const target = planIdx >= 0 ? planIdx : lastIdx;
-  if (i !== target || m.role !== 'assistant') return '';
+  if (m.role !== 'assistant') return '';
+  const en = getLocale() === 'en';
   const text = String(m.text || '');
   const hasPlan = hasPlanDraft(text);
+  // 生成中或等待问答时不展示；停止、重新打开会话后仍可确认已有方案/开工选项。
+  const eligible = !m.askPending && !isTabSending(tab);
+  // 不是候选、但自己已经写入过方案的消息：保留自己的「已写入方案 / 方案导图」这一段。
+  // 用户点完「写入方案」后这条不能因为开工按钮跟着别的消息走就整段消失，
+  // 否则方案导图再也点不到，用户面前只剩一条没有任何按钮的回复。
+  if (i !== target) {
+    if (!eligible || !m.planWritten) return '';
+    return `<div class="start-go-row plan-write-row">${planWriteBtns(m, i, en)}</div>`;
+  }
   // 明确列出的方案优先于正文中某个局部“无需改动”的描述。
   if (!hasPlan && textSaysNoPendingWork(text)) {
     reportStartReady(tab, false, []);
@@ -1962,8 +2024,6 @@ function renderStartGo(m, i, lastIdx, planIdx, tab) {
   //      否则整条方案没有任何开工入口，用户只能靠手打口令，一打不通就彻底卡死。
   // 仍刻意不认「正文里出现『点击开始』『/spcode-start』」这类自由文本，那种来源会让随口一提的对话也冒出按钮。
   const hasStartOffer = markerOptions.length > 0;
-  // 生成中或等待问答时不展示；停止、重新打开会话后仍可确认已有方案/开工选项。
-  const eligible = !m.askPending && !isTabSending(tab);
   const canStart = eligible && (hasStartOffer || hasPlan);
   // 有 [开工选项] 块才拆多颗按钮并上报选项；只有方案正文时用下面的单颗「开始」按钮
   const options = canStart && markerOptions.length > 0 ? parseStartOptions(text) : [];
@@ -1980,23 +2040,16 @@ function renderStartGo(m, i, lastIdx, planIdx, tab) {
   // 正文确实带【方案】正文（hasPlan）或本条已写入过方案（m.planWritten）才显示，
   // 避免像「核对后点开始」这类只有开工话术、没有方案正文的回复也冒出点了必失败的按钮。
   // 生成中 / 等回答（eligible 为假）时不给，避免把半截正文写进方案文件。
-  // AGI 开着（desktopAlive）时后台不查方案，这里也不拦。
-  // 写方案只在非 AGI 下给（AGI 后台不锁方案文件）；已经写入过的方案在两种模式下都给导图入口，
-  // 否则 AGI 一开，「方案导图」也跟着消失，用户连方案都翻不到了
-  const showPlanWrite = eligible && ((!state.desktopAlive && hasPlan) || !!m.planWritten);
+  // AGI 开着（desktopAlive）时后台不拿方案约束实现，但「写入方案」照样能用：
+  // 方案正文落进方案文件、导图照样能看，跟 AGI 开没开无关。
+  // 以前 AGI 下一律不给写入方案，结果 AGI 一开，用户连「写入方案」都点不到，只剩一颗「开始」。
+  // 已经写入过的方案在两种模式下都给方案导图入口，否则 AGI 一开方案都翻不到了。
+  const showPlanWrite = eligible && (hasPlan || !!m.planWritten);
   const planNeedsWrite = showPlanWrite && !m.planWritten && hasPlan;
   reportStartReady(tab, !!canStart, options);
-  const en = getLocale() === 'en';
   let html = '';
   // 第一段：方案写入 / 已写入后的方案导图，与下面第二段的开工选项互不影响
-  if (showPlanWrite) {
-    let planBtns = '';
-    const planLabel = m.planWritten ? (en ? 'Plan written' : '已写入方案') : (en ? 'Write plan' : '写入方案');
-    planBtns += `<button type="button" class="start-go-submit" data-plan-write="1">${planLabel}</button>`;
-    if (m.planWritten) planBtns += `<button type="button" class="start-go-submit" data-plan-map="${i}">${en ? 'Plan map' : '方案导图'}</button>`;
-    if (m.planNote) planBtns += `<span class="start-go-hint">${escapeHtml(String(m.planNote))}</span>`;
-    html += `<div class="start-go-row plan-write-row">${planBtns}</div>`;
-  }
+  if (showPlanWrite) html += `<div class="start-go-row plan-write-row">${planWriteBtns(m, i, en)}</div>`;
   // 第二段：开工选项；没有 [开工选项] 块就没有这一段，但上面那段方案按钮照样可能单独显示
   if (!canStart) return html;
   let btns = '';
@@ -2562,6 +2615,7 @@ function renderMessages(switching = false) {
         <span>
           ${m.role === 'user' ? `<button class="msg-refill" data-refill="${i}" title="${t('refillTitle')}">${t('refill')}</button>` : ''}
           ${m.role === 'assistant' && (m.planMap || m.planWritten) ? planMapBtnHtml(i) : ''}
+          ${m.role === 'assistant' && m.chainMap && Array.isArray(m.chainMap.nodes) && m.chainMap.nodes.length ? chainMapBtnHtml(i) : ''}
           <button class="msg-fork" data-fork="${i}" title="${t('forkTitle')}">${t('fork')}</button>
         </span>
       </div>
@@ -2626,6 +2680,21 @@ function planMapBtnHtml(i) {
 }
 
 /**
+ * 渲染「链路导图」按钮：只有这条 AI 回复真的解析出了链路节点（m.chainMap.nodes 非空）才会走到这里。
+ * @param {number} i 消息在会话消息数组里的下标，点击时用它回找消息、取缓存导图与 turnId
+ * @returns {string} 按钮 HTML；文案中英各一份，跟随当前界面语言
+ */
+function chainMapBtnHtml(i) {
+  const en = getLocale() === 'en';
+  // 文案中英各一份，title 里带一句说明，让用户知道点开是「这条回复从入口到展示的调用链路」
+  const label = en ? 'Chain map' : '链路导图';
+  const tip = en
+    ? 'View the call chain of this reply: entry → each step → final render'
+    : '查看这条回复的调用链路：从入口到每一步，再到最终展示';
+  return `<button class="msg-fork" data-chain-map="${i}" title="${escapeHtml(tip)}">${label}</button>`;
+}
+
+/**
  * 打开方案导图：先向后台要最新的条目状态（落在方案文件夹里），拿不到再用这条消息上缓存的推送。
  * 后台读不到条目时会带回 state（no-items=方案正文在但拆不出条目，no-file=还没写入方案），
  * 这里按具体原因提示，别把「正文已保存、只是没解析出条目」说成方案已收尾或没写入。
@@ -2676,6 +2745,46 @@ async function openPlanMap(tab, m) {
     workspace: tab.workspace || state.workspace,
     tabId: String(tab.id),
     locked: !!(map && map.locked)
+  });
+}
+
+/**
+ * 打开链路导图：先向后台要这条回复落盘的最新链路图（重开程序后仍可取回），取不到再用消息上缓存的推送。
+ * 两边都没有可用节点时开空态弹层说明原因，不弹浏览器模态框打断界面，与方案导图的行为保持一致。
+ * @param {object} tab 当前会话标签，提供 title / workspace / id
+ * @param {object} m 带链路导图按钮的那条消息，m.chainMap 是推送过的导图缓存、m.turnId 用来定位落盘文件
+ * 副作用：打开或复用链路导图弹层（window.ChainMap.open 内部会先关闭旧弹层）。
+ */
+async function openChainMap(tab, m) {
+  if (!tab || !window.ChainMap) return;
+  let map = null;
+  try {
+    if (api.chainTree) {
+      map = await api.chainTree({
+        workspace: tab.workspace || state.workspace,
+        tabId: String(tab.id || ''),
+        turnId: String((m && m.turnId) || '')
+      });
+    }
+  } catch (_) { map = null; }
+  // 后台取不到（文件不存在/节点为空）就退回这条消息缓存的推送导图
+  if (!(map && Array.isArray(map.nodes) && map.nodes.length)) map = (m && m.chainMap) || null;
+  if (!(map && Array.isArray(map.nodes) && map.nodes.length)) {
+    window.ChainMap.open({
+      title: tab.title || '',
+      emptyText: '还没有链路导图：这条回复里没有【链路】段，或链路文件已不存在',
+      workspace: tab.workspace || state.workspace,
+      tabId: String(tab.id),
+      turnId: String((m && m.turnId) || '')
+    });
+    return;
+  }
+  window.ChainMap.open({
+    title: tab.title || '',
+    map,
+    workspace: tab.workspace || state.workspace,
+    tabId: String(tab.id),
+    turnId: String((m && m.turnId) || '')
   });
 }
 
@@ -3515,6 +3624,9 @@ function forkAt(index) {
     workspace: tab.workspace || state.workspace,
     extraFolders: extraFoldersOf(tab),
     undone: [],
+    // 分叉是同一条对话的延续，用户对「全解放」的选择跟着走：
+    // 传布尔值显式继承，避免被 hydrateTab 的默认值（true）覆盖掉用户主动关闭的状态
+    unlimitedRounds: tab.unlimitedRounds,
     // 分叉不继承图片附件（附件只留在消息体 draft 里），避免图片复活
     context: { skillId: tab.context?.skillId || null, skillIds: normalizeSkillIds(tab.context || {}), contextPaths: [...(tab.context?.contextPaths || [])], attachments: [] },
     workingMemory: tab.workingMemory || emptyWorkingMemory(),
@@ -4393,6 +4505,20 @@ function onChatEvent(ev) {
         const idx = tab.messages.indexOf(last);
         const span = document.querySelector(`.msg.assistant[data-msg-i="${idx}"] > .role > span`);
         if (span && !span.querySelector('[data-plan-map]')) span.insertAdjacentHTML('afterbegin', planMapBtnHtml(idx));
+      }
+    }
+  } else if (ev.type === 'chain_map') {
+    // 链路导图：后台解析完【链路】段后推来导图，先挂到这条回复上；弹层开着就实时刷新，
+    // 新出现且有节点时把按钮补进消息头，免得整条重绘（与 plan_tree 的处理保持同一套做法）
+    if (ev.map) {
+      const fresh = !last.chainMap;
+      last.chainMap = ev.map;
+      if (window.ChainMap && window.ChainMap.isOpen()) window.ChainMap.update(ev.map);
+      const hasNodes = Array.isArray(ev.map.nodes) && ev.map.nodes.length > 0;
+      if (fresh && hasNodes && touchUi) {
+        const idx = tab.messages.indexOf(last);
+        const span = document.querySelector(`.msg.assistant[data-msg-i="${idx}"] > .role > span`);
+        if (span && !span.querySelector('[data-chain-map]')) span.insertAdjacentHTML('afterbegin', chainMapBtnHtml(idx));
       }
     }
   } else if (ev.type === 'working_memory') {
@@ -6687,7 +6813,9 @@ function bind() {
     if (!tab) return;
     tab.unlimitedRounds = !tab.unlimitedRounds;
     syncRoundsInput(tab);
-    persistTab(tab);
+    // 强制落盘：新会话还没消息、也没草稿时 persistTab 会直接返回，
+    // 用户关掉「全解放」后立刻重启就会弹回默认开启，等于关不上。
+    persistTab(tab, true);
   });
   $('btn-alive')?.addEventListener('click', async () => {
     const next = !state.desktopAlive;
@@ -7005,6 +7133,15 @@ function bind() {
       const host = planMapBtn.closest('[data-msg-i]');
       const idx = host ? Number(host.getAttribute('data-msg-i')) : NaN;
       openPlanMap(activeSession(), Number.isInteger(idx) ? activeSession()?.messages?.[idx] : null);
+      return;
+    }
+    // 链路导图：按被点按钮所在消息下标回找消息，交给 openChainMap 取最新链路并开弹层
+    const chainMapBtn = e.target.closest('[data-chain-map]');
+    if (chainMapBtn) {
+      e.stopPropagation();
+      const host = chainMapBtn.closest('[data-msg-i]');
+      const idx = host ? Number(host.getAttribute('data-msg-i')) : NaN;
+      openChainMap(activeSession(), Number.isInteger(idx) ? activeSession()?.messages?.[idx] : null);
       return;
     }
     // 写入方案：把这条回复里的【方案】段写入方案文件，方便查看导图；已确认方案也可直接开工
