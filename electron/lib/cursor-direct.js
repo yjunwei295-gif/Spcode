@@ -101,6 +101,8 @@ function untilAbort(p, signal) {
  */
 async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [] }) {
   await untilAbort(cursorModel.ensureLogin(modelCfg), signal);
+  const selectedModel = await untilAbort(cursorModel.highModelSelection(modelCfg), signal);
+  sig = `${sig}\nreasoning:${JSON.stringify(selectedModel)}`;
   let session = sessions.get(key);
   if (session && (fresh || session.sig !== sig)) {
     closeSession(key);
@@ -113,10 +115,10 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, syst
     // 模型进程只放空目录。cwd 若是整个 Unity 工程，Agent.create 会去扫盘，十几分钟没有任何输出
     const cwd = cursorModel.sandboxDir();
     onEvent({ type: 'status', text: '正在接通 Cursor 直通…' });
-    diag.log('cursor', 'Cursor 直通开始建会话', { model: modelCfg.model, cwd, 工具数: (tools || []).length });
+    diag.log('cursor', 'Cursor 直通开始建会话', { model: modelCfg.model, reasoningParams: selectedModel.params || [], cwd, 工具数: (tools || []).length });
     const created = Agent.create({
       apiKey: cursorModel.apiKeyOf(modelCfg),
-      model: { id: String(modelCfg.model) },
+      model: selectedModel,
       tools: ['mcp'],
       name: 'SpCode',
       local: cursorModel.localOptions(cwd, {

@@ -101,7 +101,235 @@ function parseItems(text) {
     i++;
   }
   const good = items.filter((it) => it.file);
+  // 只兜底无编号头、只在标准格式零命中时触发：字段块 → 列表格式 → 章节标题式，逐级尝试
+  if (!good.length) {
+    const loose = parseLooseItems(text, keep.join('\n'));
+    if (loose.ok) return loose;
+    const bullets = parseFileBullets(text);
+    if (bullets.ok) return bullets;
+    return parseFileSections(text);
+  }
   return { items: good, keep: keep.join('\n'), ok: good.length > 0 };
+}
+
+/**
+ * 兜底解析「缺编号条目头」的字段块：把以「文件：」开头的行当成新条目起点，其余字段按 FIELD_RE/readField 读取。
+ * 只兜底无编号头、只在 parseItems 标准格式零命中时由 parseItems 调用；正常写了编号的方案不会走到这里，
+ * 以免把正文里的零散字段误当成条目。赋值规则和 parseItems 保持一致（含「（新建）」去尾、反引号/星号清理）。
+ * @param {string} text 整段方案正文
+ * @param {string} keepText parseItems 已经收到的「不动范围」原文；没收到时传空串
+ * @returns {{items: Array, keep: string, ok: boolean}} 只保留带 file 的条目（导图条目没有文件就对不上出处），ok 由条目数决定
+ * 副作用：无。遇到「不动范围」行即停止建条目，它后面的非空行并入 keep。
+ */
+function parseLooseItems(text, keepText) {
+  const lines = lf(text).split('\n');
+  const items = [];
+  const base = String(keepText || '').trim();
+  const keep = [];
+  if (base) keep.push(base);
+  const tail = [];
+  let stop = false;
+  let cur = null;
+  for (let i = 0; i < lines.length;) {
+    const line = lines[i];
+    // 见到「不动范围」就封口：后面的内容只当原文保留，不再开新条目
+    if (KEEP_HEAD_RE.test(line)) {
+      stop = true;
+      cur = null;
+      const rest = line.replace(KEEP_HEAD_RE, '').replace(/^[\s*:：]+/, '').trim();
+      if (rest) tail.push(rest);
+      i++;
+      continue;
+    }
+    if (stop) {
+      if (line.trim()) tail.push(line.trim());
+      i++;
+      continue;
+    }
+    if (!FIELD_RE.test(line)) { i++; continue; }
+    const name = line.match(FIELD_RE)[1];
+    const f = readField(lines, i);
+    if (name === '文件') {
+      // 「文件：」既是字段也是条目起点，编号按已拆出的条数往后排
+      cur = { no: items.length + 1, title: '', file: '', method: '', requirement: '', before: '', beforeIsCode: false, after: '', afterIsCode: false, verify: '' };
+      // 「a/b.cs（新建）」这类括号说明不是路径的一部分，去掉后记成新建文件
+      let file = f.value.split('\n')[0].replace(/[`*]/g, '').trim();
+      const note = file.match(NEW_NOTE_RE);
+      if (note) { file = file.slice(0, note.index).trim(); cur.newFile = true; }
+      cur.file = file;
+      // 导图条目文件夹名不能为空，标题取文件路径最后一段
+      const segs = file.split(/[\\/]/);
+      cur.title = String(segs[segs.length - 1] || file).trim();
+      items.push(cur);
+    }
+    else if (cur && name === '方法') cur.method = f.value.split('\n')[0].replace(/[`*]/g, '').trim();
+    else if (cur && name === '需求') cur.requirement = f.value;
+    else if (cur && name === '现状原文') { cur.before = f.value; cur.beforeIsCode = f.code; }
+    else if (cur && name === '改成') { cur.after = f.value; cur.afterIsCode = f.code; }
+    else if (cur && name === '验证') cur.verify = f.value;
+    i = f.next;
+  }
+  // parseItems 可能已经把「不动范围」正文收进 keepText，这里只补它没收到的行，避免重复
+  for (let i = 0; i < tail.length; i++) {
+    if (!base || base.indexOf(tail[i]) < 0) keep.push(tail[i]);
+  }
+  const good = [];
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].file) good.push(items[i]);
+  }
+  return { items: good, keep: keep.join('\n'), ok: good.length > 0 };
+}
+
+// 列表条目认得的文件后缀；与实际方案里会点名的源码/资源类型保持一致
+const BULLET_EXT_RE = 'cs|js|mjs|cjs|ts|tsx|jsx|vue|py|lua|java|kt|go|rs|c|cc|cpp|h|hpp|swift|json|ya?ml|xml|md|txt|css|scss|html|shader|hlsl|compute|uss|uxml|prefab|unity|asset|ps1|bat|sh';
+/**
+ * 列表条目头：列表符号/序号 + 文件路径 + 分隔冒号 + 改动要求。
+ * 路径外面允许四种包法：裸路径、`反引号`、**粗体**、**`粗体＋反引号`**（真实方案里常出现最后一种）；
+ * 路径和冒号之间还允许一段「→ 方法名」，写成「1. `a.js` → `fn`：要求」时把箭头后点到的内容记成定位提示。
+ * 分组：1=文件路径，2=箭头后点到的方法或范围（可能没有，也可能写了几个用顿号隔开），3=改动要求。
+ */
+const BULLET_HEAD_RE = new RegExp(
+  '^\\s*(?:[-*+]|\\d+[.、)）])\\s+' +                 // 列表符号，或「1.」「2、」这类序号
+  '[`*]{0,4}' +                                       // 路径前面的反引号/粗体标记
+  '([^`\\n*]+?\\.(?:' + BULLET_EXT_RE + '))' +        // 路径本体：不含反引号和星号，免得把标记吃进路径
+  '[`*]{0,4}' +                                       // 路径后面的反引号/粗体标记
+  '(?:\\s*(?:→|->)\\s*([^\\n:：]{0,120}?))?' +        // 可选：箭头右边点到的方法或范围
+  '\\s*[:：]\\s*\\*{0,2}\\s*(.*)$',                    // 分隔冒号，冒号后是改动要求
+  'i'
+);
+
+/**
+ * 读取聊天里已有的“文件名：改动要求”列表，保留原文而不调用模型重写。
+ * 仅当标准条目格式未命中时使用；文件前的约束和列表后的说明保留到不动范围。
+ * 支持裸路径、反引号、粗体、粗体＋反引号四种路径包法，以及「路径 → 方法：要求」的写法；
+ * 箭头后点到的方法只作定位提示（多个方法之间保留原文分隔符），完整说法仍留在改动要求里。
+ */
+function parseFileBullets(text) {
+  const head = BULLET_HEAD_RE;
+  const items = [];
+  const shared = [];
+  let cur = null;
+  let footer = false;
+  let fenced = false;
+  let verify = '';
+  for (const line of lf(text).split('\n')) {
+    if (/^\s*```/.test(line)) fenced = !fenced;
+    const hit = !fenced && !footer ? line.match(head) : null;
+    if (hit) {
+      const file = hit[1].trim();
+      // 箭头右边点到的方法可能写成 `a`、`b`（用顿号隔开），去掉反引号/星号后只留文字作定位提示
+      const arrowMethod = String(hit[2] || '').replace(/[`*]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      cur = { no: items.length + 1, title: file, file, method: arrowMethod, requirement: String(hit[3] || '').trim(), before: '', beforeIsCode: false, after: '', afterIsCode: false, verify: '' };
+      items.push(cur);
+      continue;
+    }
+    if (!fenced && /^(?:\*\*)?(?:验证|验收|结果区分|不动范围)\s*[:：]/.test(line)) footer = true;
+    if (footer || !cur) {
+      shared.push(line);
+      if (/^(?:\*\*)?(?:验证|验收)\s*[:：]/.test(line)) verify = line.replace(/^(?:\*\*)?(?:验证|验收)\s*[:：]\s*/, '');
+    } else {
+      cur.requirement += `\n${line}`;
+    }
+  }
+  for (const it of items) {
+    it.requirement = it.requirement.trim();
+    // 箭头已指出方法时以它为准；否则只取明确标注的第一个方法作定位提示，多个方法的完整需求仍在原文中。
+    if (!it.method) {
+      const method = it.requirement.match(/(?:在|方法\s*[:：])\s*`([\w.]+)`/);
+      it.method = method ? method[1] : '';
+    }
+    it.verify = verify;
+  }
+  return { items, keep: shared.join('\n').trim(), ok: items.length > 0 };
+}
+
+// 章节标题行：「一、`a/b.cs`」「三、验收」「1. `OnEnable`（56-83）：…」这类行首带序号的标题。
+// 序号允许中文数字、ASCII 数字，也允许「（一）」「(1)」「[2]」这种括起来的写法；序号后跟顿号/句点/右括号，再接标题正文。
+const SECTION_HEAD_RE = new RegExp(
+  '^\\s*#{0,4}\\s*[*_]{0,2}\\s*' +
+  '(?:[(（\\[]\\s*(?:[一二三四五六七八九十]{1,3}|\\d{1,3})\\s*[)）\\]]\\s*' +   // 「（一）」「(1)」「[2]」
+  '|(?:[一二三四五六七八九十]{1,3}|\\d{1,3})\\s*[、.．)）])\\s*' +            // 「一、」「1.」「2)」
+  '(.+?)\\s*$'                                                              // 标题正文
+);
+// 标题正文里第一个带后缀的路径；后缀直接沿用 BULLET_EXT_RE，保证章节标题与列表两种写法认得同一批文件类型
+const SECTION_PATH_RE = new RegExp('([^\\s`*:：，,]+?\\.(?:' + BULLET_EXT_RE + '))', 'i');
+
+/**
+ * 章节标题式方案的第四级兜底：标题里点名文件，标题下面的行整段记成该条需求。
+ * 真实方案常写成「一、`Script/x/Foo.cs`」当章节标题，标题下面用「1. `OnEnable`（56-83）：删除日志」列方法改动，
+ * 前三路（标准条目 / 无编号字段块 / 列表）全零命中时，靠这一级按「点名文件的标题」切出条目。
+ * @param {string} text 整段方案正文
+ * @returns {{items: Array, keep: string, ok: boolean}} items 只保留 file 非空的条目（导图条目没有文件就对不上出处）；
+ *   keep 是不属于任何条目的原文（开头的说明、「不动范围」及其之后的内容）；ok 由条目数决定
+ * 只在 parseItems 的前三级全部零命中时由 parseItems 调用，不改动其它解析器的判定与优先级。
+ * 副作用：无。``` 围起来的代码块里的行一律不判标题，免得把示例正文当成条目标题。
+ */
+function parseFileSections(text) {
+  const lines = lf(text).split('\n');
+  const items = [];
+  const keep = [];
+  let cur = null;      // 当前条目：标题点名文件时新建，遇到下一个点名文件的标题再换
+  let stop = false;    // 已进入「不动范围」，后面只作原文保留
+  let fenced = false;  // 是否处在 ``` 代码块里
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // 只有围栏行本身切换代码块状态；围栏行按普通内容处理（它不可能是标题）
+    const isFence = /^\s*```/.test(line);
+    if (isFence) fenced = !fenced;
+    // 见到「不动范围」就封口：后面的内容只当原文保留，不再开新条目（与 parseItems/parseLooseItems 一致）
+    if (!isFence && !fenced && KEEP_HEAD_RE.test(line)) {
+      stop = true;
+      cur = null;
+      const rest = line.replace(KEEP_HEAD_RE, '').replace(/^[\s*:：]+/, '').trim();
+      if (rest) keep.push(rest);
+      continue;
+    }
+    if (stop) {
+      if (line.trim()) keep.push(line.trim());
+      continue;
+    }
+    const head = !isFence && !fenced ? line.match(SECTION_HEAD_RE) : null;
+    if (head) {
+      const rest = String(head[1] || '');
+      // 「四、不动范围：…」这种带序号的收尾标题，KEEP_HEAD_RE 认不出前面的序号，这里拿标题正文再判一次
+      if (KEEP_HEAD_RE.test(rest)) {
+        stop = true;
+        cur = null;
+        const tailText = rest.replace(KEEP_HEAD_RE, '').replace(/^[\s*:：]+/, '').trim();
+        if (tailText) keep.push(tailText);
+        continue;
+      }
+      // 「三、验收：…」这类整份方案的收尾标题不属于某个文件的改动，收进原文，不再并进当前条目
+      if (/^(?:\*\*)?(?:验证|验收|结果区分)\s*(?:[:：]|$)/.test(rest)) {
+        cur = null;
+        if (line.trim()) keep.push(line.trim());
+        continue;
+      }
+      const hitPath = rest.match(SECTION_PATH_RE);
+      if (!hitPath) {
+        // 标题没点文件：当前条目已开着时它是条目内的子标题（如「1. `OnEnable`（56-83）：…」），整行并进需求；
+        // 还没开条目就只当原文保留，不伪造条目
+        if (cur) cur.requirement += '\n' + line;
+        else if (line.trim()) keep.push(line.trim());
+        continue;
+      }
+      // 标题点名了文件：开新条目；标题取文件路径最后一段（导图条目文件夹名不能为空，与另外两个解析器一致）
+      const file = hitPath[1].replace(/[`*]/g, '').trim();
+      const segs = file.split(/[\\/]/);
+      cur = { no: items.length + 1, title: String(segs[segs.length - 1] || file).trim(), file, method: '', requirement: '', before: '', beforeIsCode: false, after: '', afterIsCode: false, verify: '' };
+      items.push(cur);
+      continue;
+    }
+    // 普通行：条目开着就整行并进需求（保留原换行与缩进），否则留给原文
+    if (cur) cur.requirement += '\n' + line;
+    else if (line.trim()) keep.push(line.trim());
+  }
+  const good = [];
+  for (let i = 0; i < items.length; i++) {
+    items[i].requirement = String(items[i].requirement || '').trim();
+    if (items[i].file) good.push(items[i]);
+  }
+  return { items: good, keep: keep.join('\n').trim(), ok: good.length > 0 };
 }
 
 const NEW_NOTE_RE = /\s*[(（【\[][^()（）【】\[\]]*(?:新建|新增|新文件)[^()（）【】\[\]]*[)）】\]]\s*$/;
@@ -221,12 +449,20 @@ function load(dir) {
 }
 
 function mapOf(tree) {
-  const nodes = [{ id: '需求', path: '需求', desc: String(tree.requirement || '').slice(0, 80), status: '' }];
+  const nodes = [{ id: '需求', path: '需求', desc: String(tree.requirement || ''), requirement: tree.requirement || '', keep: tree.keep || '', status: '' }];
   const edges = [];
   for (const it of tree.items.filter((item) => !DONE_STATUS.has(item.status))) {
     const id = itemDirName(it);
-    // 节点附带条目编号 no，前端删除条目时按编号精确定位
-    nodes.push({ id, path: id, no: it.no, desc: it.title, status: it.status, file: it.file, reason: it.reason || '' });
+    // 列表格式原来只用文件名作标题；展示时取需求首句，不改变已保存条目的身份或执行内容。
+    const summary = String(it.requirement || '').replace(/[`*]/g, '').split(/[\n。；]/)[0].trim();
+    const title = it.title === it.file && summary ? summary : it.title;
+    // 将原有方案详情完整传给导图，不再只传文件名与状态。
+    nodes.push({
+      id, path: id, no: it.no, title, desc: title, status: it.status, file: it.file,
+      method: it.method || '', requirement: it.requirement || '', verify: it.verify || '',
+      before: it.before || '', after: it.after || '', keep: tree.keep || '',
+      reason: it.reason || '', verdict: it.verdict || ''
+    });
     edges.push({ from: '需求', to: id });
   }
   return { version: 1, name: '方案', generatedAt: new Date().toISOString(), nodes, edges };
@@ -292,6 +528,17 @@ function serializeTree(tree) {
 }
 
 /**
+ * 删除条目后把编号压实成 1..n：先按 no 升序排，再依次重编号。
+ * 方案的「### N.」是条目标识，删掉中间一条会留下空号，方案文件、导图侧栏和派单里说的“第 N 条”就对不上了。
+ * 参数 items：方案条目数组；返回重排并重编号后的数组（条目对象本身被原地改 no，其余字段不动）。
+ */
+function renumber(items) {
+  const list = (items || []).slice().sort((a, b) => (Number(a.no) || 0) - (Number(b.no) || 0));
+  for (let i = 0; i < list.length; i += 1) list[i].no = i + 1;
+  return list;
+}
+
+/**
  * 有未完成旧条目时：新方案追加进去（同文件+同现状原文则更新改成/验证），已通过的保留。
  * 没有未完成旧条目时整份重建。返回的 tree.serialized 是应写入方案文件的全文。
  */
@@ -350,4 +597,4 @@ function merge(oldTree, planText, requirement, resolve) {
   return tree;
 }
 
-module.exports = { STATUS, DONE_STATUS, NEW_FILE, parseItems, locate, acceptItem, build, recheck, save, load, mapOf, mismatches, itemDirName, isNewFile, squash, merge, serializeTree };
+module.exports = { STATUS, DONE_STATUS, NEW_FILE, parseItems, locate, acceptItem, build, recheck, save, load, mapOf, mismatches, itemDirName, isNewFile, squash, merge, serializeTree, renumber };

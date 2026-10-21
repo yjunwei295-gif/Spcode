@@ -29,12 +29,24 @@
     current = null;
   }
 
-  /** opts: { title, map: { nodes:[{ id, desc, status, file, reason }], edges } } */
+  /**
+   * 打开方案导图窗口。
+   * opts: {
+   *   title: 头部标题（显示为「方案导图 · title」）,
+   *   map: { nodes:[{ id, desc, status, file, reason }], edges },
+   *   emptyText?: 非空时进入「只显示说明」的空态：不建 canvas / 图例 / 侧栏，body 只放一段居中说明,
+   *   workspace, tabId, locked
+   * }
+   * 空态与正常模式共用同一个弹窗、标题、× 关闭、点遮罩关闭和 Esc 关闭，只有内容区不同。
+   * 副作用：关掉上一个实例、往 document.body 挂一个 #plan-map-modal，并注册 keydown 监听（dispose 时移除）。
+   */
   function open(opts) {
     close();
     const workspace = opts.workspace;
     const tabId = opts.tabId;
     const locked = !!opts.locked;
+    // 空态文案先归一成字符串；为空即走原来的绘制流程，保证不传时行为完全不变
+    const emptyText = opts.emptyText ? String(opts.emptyText) : '';
     const modal = el('div', { id: 'plan-map-modal', className: 'map-modal' });
     modal.style.cssText = 'position:fixed;inset:0;z-index:91;background:var(--overlay);backdrop-filter:blur(3px);display:flex;align-items:center;justify-content:center;';
     const card = el('div');
@@ -44,31 +56,47 @@
     head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border);';
     const title = el('span', { textContent: `方案导图 · ${opts.title || ''}` });
     title.style.cssText = 'font-size:14px;font-weight:600;';
-    const legend = el('div');
-    legend.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;font-size:11px;color:var(--muted);margin-left:auto;';
-    for (const [name, color] of Object.entries(STATUS_COLOR)) {
-      const s = el('span', { textContent: name });
-      s.style.cssText = `border-left:8px solid ${color};padding-left:4px;`;
-      legend.appendChild(s);
-    }
     const x = el('button', { textContent: '×' });
     x.style.cssText = 'border:0;background:none;font-size:20px;cursor:pointer;color:var(--muted);';
     x.onclick = close;
     head.appendChild(title);
-    head.appendChild(legend);
+    // 空态没有节点，图例没有可解释的状态分布，整块不创建；正常模式仍按 STATUS_COLOR 渲染图例
+    if (!emptyText) {
+      const legend = el('div');
+      legend.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;font-size:11px;color:var(--muted);margin-left:auto;';
+      for (const [name, color] of Object.entries(STATUS_COLOR)) {
+        const s = el('span', { textContent: name });
+        s.style.cssText = `border-left:8px solid ${color};padding-left:4px;`;
+        legend.appendChild(s);
+      }
+      head.appendChild(legend);
+    }
     head.appendChild(x);
 
     const body = el('div');
     body.style.cssText = 'position:relative;flex:1;display:flex;overflow:hidden;';
-    const canvasWrap = el('div');
-    canvasWrap.style.cssText = 'position:relative;flex:1;overflow:hidden;';
-    const canvas = el('canvas');
-    canvas.style.cssText = 'display:block;width:100%;height:100%;cursor:grab;';
-    canvasWrap.appendChild(canvas);
-    const side = el('div');
-    side.style.cssText = 'width:320px;border-left:1px solid var(--border);overflow:auto;padding:8px 10px;font-size:12px;';
-    body.appendChild(canvasWrap);
-    body.appendChild(side);
+    // 画布容器、canvas、侧栏只在正常绘制模式下创建；空态保持 null，后面相关逻辑都靠 emptyText 跳过
+    let canvasWrap = null;
+    let canvas = null;
+    let side = null;
+    if (emptyText) {
+      // 空态说明：贴住 body 区域居中显示，沿用面板底色 / 边框 / 圆角变量，文字用 --muted 弱化
+      const note = el('div', { textContent: emptyText });
+      note.style.cssText = 'margin:auto;max-width:min(86%,600px);padding:24px 20px;box-sizing:border-box;text-align:center;'
+        + 'color:var(--muted);background:var(--panel-solid);border:1px solid var(--border);border-radius:var(--sub-r-lg);'
+        + 'font-size:13px;line-height:1.8;white-space:pre-wrap;word-break:break-word;';
+      body.appendChild(note);
+    } else {
+      canvasWrap = el('div');
+      canvasWrap.style.cssText = 'position:relative;flex:1;overflow:hidden;';
+      canvas = el('canvas');
+      canvas.style.cssText = 'display:block;width:100%;height:100%;cursor:grab;';
+      canvasWrap.appendChild(canvas);
+      side = el('div');
+      side.style.cssText = 'width:320px;border-left:1px solid var(--border);overflow:auto;padding:8px 10px;font-size:12px;';
+      body.appendChild(canvasWrap);
+      body.appendChild(side);
+    }
     card.appendChild(head);
     card.appendChild(body);
     modal.appendChild(card);
@@ -83,17 +111,39 @@
       hidePopover();
       popover = el('div');
       popover.style.cssText = 'position:absolute;z-index:4;width:340px;background:var(--panel-solid);border:1px solid var(--border);border-radius:var(--sub-r);'
-        + 'box-shadow:var(--shadow);padding:10px 12px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;';
+        + 'box-shadow:var(--shadow);padding:10px 12px;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-word;'
+        + 'max-width:calc(100% - 16px);max-height:calc(100% - 56px);overflow:auto;box-sizing:border-box;';
       popover.style.left = Math.max(8, Math.min(sx + 12, canvasWrap.clientWidth - 360)) + 'px';
       popover.style.top = Math.max(8, Math.min(sy + 12, canvasWrap.clientHeight - 160)) + 'px';
       const color = STATUS_COLOR[n.status] || 'var(--muted)';
-      popover.textContent = [`${n.id}`, `状态：${n.status || '—'}`, n.file ? `文件：${n.file}` : '', n.reason ? `说明：${n.reason}` : ''].filter(Boolean).join('\n');
+      // 所有内容用 textContent 呈现，保留完整需求与代码片段，不把方案内容当 HTML 执行。
+      const heading = el('div', { textContent: n.title || n.desc || n.id });
+      heading.style.cssText = 'font-size:14px;font-weight:600;margin-bottom:8px;';
+      popover.appendChild(heading);
+      for (const [label, value] of [
+        ['状态', n.status], ['文件', n.file], ['方法', n.method],
+        ['改动要求', n.requirement], ['现状原文', n.before], ['目标内容', n.after],
+        ['验证方式', n.verify], ['公共约束与说明', n.keep],
+        ['核对说明', n.reason], ['验收结果', n.verdict]
+      ]) {
+        if (!value) continue;
+        const section = el('div');
+        section.style.cssText = 'margin-top:10px;';
+        const labelEl = el('div', { textContent: label });
+        labelEl.style.cssText = 'font-weight:600;color:var(--muted);margin-bottom:3px;';
+        section.appendChild(labelEl);
+        section.appendChild(el('div', { textContent: String(value) }));
+        popover.appendChild(section);
+      }
       popover.style.borderLeft = `4px solid ${color}`;
       canvasWrap.appendChild(popover);
     }
-    canvas.addEventListener('mousedown', hidePopover);
-
-    const view = drawTree(canvas, (n, sx, sy) => showDetail(n, sx, sy));
+    // 透传组件只在正常模式存在；空态下不绑画布事件、不创建绘制实例，view 保持 null
+    let view = null;
+    if (!emptyText) {
+      canvas.addEventListener('mousedown', hidePopover);
+      view = drawTree(canvas, (n, sx, sy) => showDetail(n, sx, sy));
+    }
     function removeItem(n) {
       if (!confirm(`确认删除方案「${n.id}」？删除后无法恢复。`)) return;
       const api = window.simple || window.sinpo;
@@ -105,6 +155,8 @@
         .then((res) => {
           if (!res) return;
           if (res.notFound) { alert('未找到该方案，可能已被删除'); return; }
+          // 后端把删除拦在锁定时，明确告诉用户原因，不要静默无反应
+          if (res.locked) { alert('方案已锁定，不能删除'); return; }
           if (res.map) update(res.map);
         })
         .catch(() => { alert('删除失败，请稍后重试'); });
@@ -122,34 +174,59 @@
         row.style.cssText = `border-left:4px solid ${STATUS_COLOR[n.status] || 'var(--border)'};padding:4px 8px;margin-bottom:6px;background:var(--hover);border-radius:var(--sub-r);cursor:pointer;`;
         const top = el('div');
         top.style.cssText = 'display:flex;align-items:center;gap:6px;';
-        const t = el('div', { textContent: `${n.id}` });
+        const t = el('div', { textContent: n.title ? `${n.no}. ${clip(n.title, 64)}` : n.id, title: n.title || n.id });
         t.style.cssText = 'font-weight:600;flex:1;min-width:0;';
-        // 每条右侧放删除按钮，点击 confirm 后按 no 调后端删除
-        const del = el('button', { textContent: '×', title: '删除该条方案' });
+        // 每条右侧放删除按钮：方案锁定时置灰不可点，未锁定才允许删除
+        const del = el('button', { textContent: '×', title: locked ? '方案已锁定，不能删除' : '删除该条方案' });
         del.style.cssText = 'border:1px solid var(--border);background:transparent;border-radius:var(--sub-r);width:20px;height:20px;'
           + 'line-height:1;font-size:14px;cursor:pointer;color:var(--muted);flex:none;padding:0;';
-        del.onclick = (e) => { e.stopPropagation(); removeItem(n); };
+        if (locked) {
+          // 锁定后不允许删条目：按钮不可用、光标变禁止、整体变淡
+          del.disabled = true;
+          del.style.cursor = 'not-allowed';
+          del.style.opacity = '0.4';
+          del.onclick = (e) => { e.stopPropagation(); };
+        } else {
+          del.onclick = (e) => { e.stopPropagation(); removeItem(n); };
+        }
         top.appendChild(t);
         top.appendChild(del);
         const s = el('div', { textContent: `${n.status || ''}${n.reason ? ' · ' + n.reason : ''}` });
         s.style.cssText = 'color:var(--muted);';
         row.appendChild(top);
+        if (n.file) {
+          const location = el('div', { textContent: [n.file, n.method].filter(Boolean).join(' · ') });
+          location.style.cssText = 'font-family:var(--mono);font-size:11px;color:var(--muted);overflow-wrap:anywhere;margin:5px 0;';
+          row.appendChild(location);
+        }
+        if (n.requirement) {
+          const description = el('div', { textContent: clip(n.requirement, 120) });
+          description.style.cssText = 'line-height:1.6;margin-bottom:5px;white-space:pre-wrap;';
+          row.appendChild(description);
+        }
         row.appendChild(s);
         row.onclick = () => showDetail(n, 40, 40);
         side.appendChild(row);
       }
     }
+    /**
+     * 用最新的导图数据刷新画布与侧栏。
+     * 空态没有画布和侧栏，直接忽略后续数据，只保留说明文字，避免访问 null 元素。
+     */
     function update(map) {
-      if (!map) return;
+      if (!map || emptyText) return;
+      hidePopover();
       view.setData(map);
       renderSide(map);
     }
+    // 关闭时释放绘制实例并摘掉 Esc 监听；空态没有 view，需要判空后再释放
     modal._dispose = () => {
-      view.dispose();
+      if (view) view.dispose();
       document.removeEventListener('keydown', onEsc);
     };
     current = { update };
-    update(opts.map);
+    // 空态不画初始图，正常模式按传入的 opts.map 画第一次
+    if (!emptyText) update(opts.map);
   }
 
   function update(map) { if (current) current.update(map); }
@@ -177,7 +254,7 @@
       links = [];
       const root = { label: '需求', x: 0, y: 0, kind: 'root', data: (map.nodes || []).find((n) => n.id === '需求') || { id: '需求' } };
       items.forEach((n, i) => {
-        const leaf = { label: clip(n.id, 30), x: COL, y: i * ROW, kind: 'leaf', data: n };
+        const leaf = { label: clip(n.title ? `${n.no}. ${n.title}` : n.id, 30), x: COL, y: i * ROW, kind: 'leaf', data: n };
         nodes.push(leaf);
         links.push([root, leaf]);
       });

@@ -267,6 +267,7 @@ async function testConnection(modelCfg) {
   fs.mkdirSync(cwd, { recursive: true });
   const thread = codex.startThread({
     model: modelCfg?.model && !['ping', 'default'].includes(String(modelCfg.model)) ? String(modelCfg.model) : undefined,
+    modelReasoningEffort: 'high',
     workingDirectory: cwd,
     skipGitRepoCheck: true,
     sandboxMode: 'read-only',
@@ -292,6 +293,7 @@ async function complete({ modelCfg, messages, onDelta, onReason, signal }) {
   fs.mkdirSync(cwd, { recursive: true });
   const thread = codex.startThread({
     model: modelCfg?.model && modelCfg.model !== 'default' ? String(modelCfg.model) : undefined,
+    modelReasoningEffort: 'high',
     workingDirectory: cwd,
     skipGitRepoCheck: true,
     sandboxMode: 'read-only',

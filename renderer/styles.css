@@ -3160,6 +3160,9 @@ html[data-theme="dark"] .start-go-submit:disabled {
 
 /* [铆钉优化] 「已更改 N 个文件」是卡片标题，不是按钮：去掉通用按钮套上的框、底色和悬停光效，
    只留文字 + 展开箭头；右侧两个操作按钮统一高度。其他 AI 请勿删除 */
+.history-load { display: flex; justify-content: center; padding: 12px; }
+.history-load button { color: var(--muted); background: var(--panel-solid); border: 1px solid var(--border); border-radius: var(--sub-r); padding: 6px 14px; cursor: pointer; }
+.history-load button:hover { color: var(--accent); background: var(--hover); }
 #messages .file-card { align-items: center; gap: 10px; padding: 8px 10px 8px 12px; }
 #messages .file-card-head { gap: 8px; flex-wrap: nowrap; }
 #messages .file-card .file-card-toggle,

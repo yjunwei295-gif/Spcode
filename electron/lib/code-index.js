@@ -15,8 +15,14 @@ const summaryCache = require('./map-summary-cache');
 const { attachComments } = require('./code-map-comments');
 
 const MAP_VERSION = 1;
+// 400KB 只作"大 JSON 不抽标识符"的判定阈值（见 identsText），不要拿去当收录上限
 const MAX_FILE_BYTES = 400 * 1024;
-const MAX_FILES = 4000;
+// 单个非 JSON 文件纳入地图的体积上限（1MB）；与 MAX_FILE_BYTES 分开，避免放大收录时连带改变标识符抽取规则
+const MAX_INDEX_FILE_BYTES = 1024 * 1024;
+// 单次全量扫描最多收录的文件数；达到上限后剩余文件不再收录（由截断差集逻辑另行报告）
+const MAX_FILES = 20000;
+// 目录递归深度上限，防止深层符号链接/生成目录把扫描拖死
+const MAX_DEPTH = 30;
 const DEFAULT_TOP = 12;
 const MAX_TOP = 30;
 // 单次模型归纳的方法条数（大文件分多批，见 summarizeFileMethods）
@@ -197,25 +203,101 @@ function isIndexableFile(name) {
   const ext = path.extname(name).toLowerCase();
   return TEXT_EXT.has(ext);
 }
-// JSON 只分段不归纳，放宽到 20MB；其他文件仍是 400KB
+// 收录体积上限：JSON 只分段不归纳，放宽到 20MB；其他文本文件用 MAX_INDEX_FILE_BYTES（1MB）
 function maxBytesOf(name) {
-  return path.extname(name).toLowerCase() === ".json" ? jsonSplit.JSON_MAX_BYTES : MAX_FILE_BYTES;
+  return path.extname(name).toLowerCase() === ".json" ? jsonSplit.JSON_MAX_BYTES : MAX_INDEX_FILE_BYTES;
 }
 // 超过普通上限的大 JSON 不抽标识符，免得几 MB 的数据刷出一堆假引用边
 function identsText(text, ext) {
   return ext === ".json" && text.length > MAX_FILE_BYTES ? "" : text;
 }
 function yieldTick() { return new Promise((r) => setImmediate(r)); }
-function collectFiles(roots, signal) {
+// 截断明细的保留上限：超深目录留前 20 条、超大文件留前 200 条，避免记账本身把地图撑大
+const DROP_DIRS_MAX = 20;
+const DROP_FILES_MAX = 200;
+// 一次扫描的截断记账器：各计数字段含义见 collectFiles 的 stats 参数说明
+function createScanStats() {
+  return { droppedByCount: 0, droppedByDepth: 0, droppedBySize: 0, droppedDirs: [], droppedFiles: [] };
+}
+// 截断摘要：只报计数（进度事件每收一个文件就推一次，不能带明细）；路径明细由调用方从 stats 里另取
+function scanDroppedSummary(stats) {
+  const s = stats || {};
+  const byCount = s.droppedByCount || 0;
+  const byDepth = s.droppedByDepth || 0;
+  const bySize = s.droppedBySize || 0;
+  return { total: byCount + byDepth + bySize, byCount, byDepth, bySize };
+}
+/**
+ * 生成地图截断说明文案，让各工具（search_text / list_dir / map_lookup）在回包头显式告知「地图不完整」。
+ * @param {object} [mapData] 地图根对象（scanWorkspace 落盘的那份）；limit 由扫描阶段写入，旧地图可能没有。
+ * @returns {string} 一行中文说明，行尾不带换行符（换行由调用方决定）；地图为空、缺 limit/dropped 信息（旧地图）
+ *   或实际丢弃数为 0 时返回 ""，调用方用 if (limitText) 直接跳过，旧地图因此不会被误报成截断。
+ */
+function mapLimitText(mapData) {
+  const limit = mapData && mapData.limit;
+  const dropped = limit && limit.dropped;
+  if (!dropped) return "";
+  const byCount = Number(dropped.byCount) || 0;
+  const byDepth = Number(dropped.byDepth) || 0;
+  const bySize = Number(dropped.bySize) || 0;
+  let total = Number(dropped.total);
+  // total 缺失或非法时用三类计数相加兜底，只要有分类计数仍能报出总丢弃数
+  if (!Number.isFinite(total) || total <= 0) total = byCount + byDepth + bySize;
+  if (!(total > 0)) return "";
+  let text = "地图已截断：丢弃 " + total + " 个文件（超数量 " + byCount + " / 超大 " + bySize + " / 超深目录 " + byDepth + "）";
+  const dirs = Array.isArray(dropped.dirs) ? dropped.dirs : [];
+  const files = Array.isArray(dropped.files) ? dropped.files : [];
+  // 优先给目录示例（一个目录被截断往往代表整棵子树缺失），没有目录明细再退回文件示例
+  if (dirs.length) text += "，丢弃目录示例：" + dirs.slice(0, 2).join("、");
+  else if (files.length) text += "，丢弃文件示例：" + files.slice(0, 2).join("、");
+  return text;
+}
+/**
+ * 遍历索引根目录，收集可收录的文件（只读磁盘，不写任何文件）。
+ * @param {string[]} roots 索引根目录列表
+ * @param {AbortSignal} [signal] 中止信号，中止时抛 "stopped"
+ * @param {object} [stats] 可选的截断记账对象（通常来自 createScanStats()）。传入后本函数把原先静默丢弃
+ *   的三种情况记下来：文件数达到 MAX_FILES（droppedByCount，记的是"被截断的批次/目录次数"，
+ *   因为文件数满后整段剩余条目无法精确枚举）、目录层级超过 MAX_DEPTH（droppedByDepth，并把该目录
+ *   记入 droppedDirs，最多 DROP_DIRS_MAX 条）、单文件超过 maxBytesOf() 上限（droppedBySize，并把路径
+ *   记入 droppedFiles，最多 DROP_FILES_MAX 条）。不传则完全静默，行为与记账前一致
+ *   （syncMap 的增量对齐只需要补漏，不需要截断信息）。
+ * @returns {{abs: string, size: number}[]} 收录文件列表；返回结构不因 stats 改变
+ */
+function collectFiles(roots, signal, stats) {
   const files = [];
+  // 允许调用方传入空对象或不完整对象，缺的计数在这里补齐
+  if (stats) {
+    if (!Number.isFinite(stats.droppedByCount)) stats.droppedByCount = 0;
+    if (!Number.isFinite(stats.droppedByDepth)) stats.droppedByDepth = 0;
+    if (!Number.isFinite(stats.droppedBySize)) stats.droppedBySize = 0;
+    if (!Array.isArray(stats.droppedDirs)) stats.droppedDirs = [];
+    if (!Array.isArray(stats.droppedFiles)) stats.droppedFiles = [];
+  }
   const own = (roots || []).filter((r) => /[\\/](\.(simple|sinpo)[\\/])?skills$/i.test(path.resolve(r)));
   function walk(root, dir, rules, depth) {
     if (signal && signal.aborted) throw new Error("stopped");
-    if (files.length >= MAX_FILES || depth > 12) return;
+    if (files.length >= MAX_FILES) {
+      // 文件数已满：整棵剩余子树被丢弃，只记一次截断事件
+      if (stats) stats.droppedByCount++;
+      return;
+    }
+    if (depth > MAX_DEPTH) {
+      // 层级超限：整个目录不展开，记下目录便于用户知道哪一层被截断
+      if (stats) {
+        stats.droppedByDepth++;
+        if (stats.droppedDirs.length < DROP_DIRS_MAX) stats.droppedDirs.push(dir.replace(/\\/g, "/"));
+      }
+      return;
+    }
     let entries = [];
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const ent of entries) {
-      if (files.length >= MAX_FILES) return;
+      if (files.length >= MAX_FILES) {
+        // 同层剩余条目丢弃，同样只记一次
+        if (stats) stats.droppedByCount++;
+        return;
+      }
       if (shouldSkipName(ent.name)) continue;
       const abs = path.join(dir, ent.name);
       if (isForeignAiSkill(abs, own)) continue;
@@ -225,7 +307,15 @@ function collectFiles(roots, signal) {
       if (!ent.isFile() || !isIndexableFile(ent.name)) continue;
       try {
         const st = fs.statSync(abs);
-        if (st.size <= 0 || st.size > maxBytesOf(ent.name)) continue;
+        if (st.size <= 0) continue;
+        if (st.size > maxBytesOf(ent.name)) {
+          // 超大文件不收录：记路径（有上限）后跳过，不中断整次扫描
+          if (stats) {
+            stats.droppedBySize++;
+            if (stats.droppedFiles.length < DROP_FILES_MAX) stats.droppedFiles.push(abs.replace(/\\/g, "/"));
+          }
+          continue;
+        }
         files.push({ abs, size: st.size });
       } catch {}
     }
@@ -845,7 +935,9 @@ async function scanWorkspace(workspace, extra, signal) {
   const exSet = new Set(excludes);
   const dir = mapDir(workspace);
   fs.mkdirSync(dir, { recursive: true });
-  const files = collectFiles(roots, signal);
+  // stats 收集本次扫描的截断情况（文件数/层级/单文件体积），随地图根 limit 字段一起落盘
+  const stats = createScanStats();
+  const files = collectFiles(roots, signal, stats);
   const fileIndex = buildFileIndex(files);
   const total = files.length || 1;
   const nodes = [];
@@ -854,7 +946,8 @@ async function scanWorkspace(workspace, extra, signal) {
   const includesById = new Map();
   let processed = 0;
   const pushLive = (running, extraPatch) => {
-    emitStatus(workspace, Object.assign({ running, done: processed, total, error: "", nodes: nodes.length, files: nodes.length }, extraPatch || {}));
+    // 截断摘要每帧都要推，只带计数（不带明细），让界面在扫描中就能看到"收录被截断"
+    emitStatus(workspace, Object.assign({ running, done: processed, total, error: "", nodes: nodes.length, files: nodes.length, dropped: scanDroppedSummary(stats) }, extraPatch || {}));
   };
   pushLive(true);
   for (const f of files) {
@@ -883,7 +976,27 @@ async function scanWorkspace(workspace, extra, signal) {
     const parts = n.path.split("/");
     for (let i = 1; i < parts.length; i++) dirSet.add(parts.slice(0, i).join("/"));
   }
-  return { version: MAP_VERSION, workspace: String(workspace).replace(/\\/g, "/"), roots: roots.map((r) => String(r).replace(/\\/g, "/")), generatedAt: Date.now(), nodes, edges, dirs: Array.from(dirSet), updatedAt: Date.now() };
+  // 截断信息挂在根上（buildMap 直接把这个对象落盘）：limit 缺失即老地图，读取方按"无截断信息"处理，不误报成截断
+  return {
+    version: MAP_VERSION,
+    workspace: String(workspace).replace(/\\/g, "/"),
+    roots: roots.map((r) => String(r).replace(/\\/g, "/")),
+    generatedAt: Date.now(),
+    nodes,
+    edges,
+    dirs: Array.from(dirSet),
+    // 本次扫描的收录上限与实际结果：files 为实际收录数，dropped 为三类静默丢弃的计数+明细
+    limit: {
+      maxFiles: MAX_FILES,
+      // 普通文本的收录上限；.json 走 jsonSplit.JSON_MAX_BYTES 单独放宽，这里记的是主上限
+      maxFileBytes: MAX_INDEX_FILE_BYTES,
+      maxDepth: MAX_DEPTH,
+      files: files.length,
+      dropped: Object.assign(scanDroppedSummary(stats), { dirs: stats.droppedDirs.slice(), files: stats.droppedFiles.slice() }),
+      at: Date.now()
+    },
+    updatedAt: Date.now()
+  };
 }
 async function enrichWithAI(workspace, mapData, modelCfg) {
   if (!modelCfg || !mapData || !mapData.nodes || !mapData.nodes.length) return mapData;
@@ -996,8 +1109,159 @@ function reverseDeps(mapData) {
   }
   return rev;
 }
+// ---- 调用点提示：给每个方法标出「谁调用它、在第几行」，省掉大脑靠猜链路 ----
+// 口径（输出文本里也会注明，绝不假装全量）：
+//   只统计本文件自身 + 「直接 import 本文件」的调用方（最多 6 个，与下面「被依赖」展示上限一致）；
+//   字符串拼接、反射、Unity Inspector 绑定、没有 import 本文件的跨文件引用都不统计。
+// refs 只在返回文本里使用，不写进地图 JSON、不新增节点字段、不新增文件。
+const CALL_REF_CACHE_MAX = 300;      // 标识符行号表缓存的文件数上限
+const CALL_REF_MAX_CALLERS = 6;      // 每个模块最多查几个直接依赖方（与「被依赖」展示上限一致）
+const CALL_REF_MAX_PER_SYMBOL = 5;   // 每个符号最多留几处调用点行号
+const IDENT_LINES_MAX = 20000;       // 单文件「标识符→行号」表上限，防止超大文件撑爆内存
+// key=`abs|size|ctime`，value=Map<标识符, 行号数组>；文件一改 key 就变，旧表自然不再命中
+const callRefCache = new Map();
+// 按扩展名区分整行注释起始标记：只用于跳过纯注释行，避免把注释里的词当成调用点
+const HASH_COMMENT_EXTS = new Set([".py", ".r", ".rb", ".sh", ".bash", ".zsh", ".ps1", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".cmake", ".tf", ".tfvars", ".pl", ".properties", ".mk"]);
+const DASH_COMMENT_EXTS = new Set([".sql", ".lua"]);
+const BLOCK_COMMENT_EXTS = new Set([".css", ".scss", ".less"]);
+const HTML_COMMENT_EXTS = new Set([".html", ".htm", ".xml", ".vue", ".svelte", ".xaml", ".csproj", ".md"]);
+const BAT_COMMENT_EXTS = new Set([".bat", ".cmd"]);
+/** 返回该扩展名的整行注释起始标记；未收录的按 // 处理（覆盖 js/ts/cs/go/java/kt/c/cpp/swift/dart/php 等）。 */
+function wholeLineCommentMarks(ext) {
+  const e = String(ext || "").toLowerCase();
+  if (HASH_COMMENT_EXTS.has(e)) return ["#"];
+  if (DASH_COMMENT_EXTS.has(e)) return ["--"];
+  if (BLOCK_COMMENT_EXTS.has(e)) return ["/*", "*", "*/"];
+  if (HTML_COMMENT_EXTS.has(e)) return ["<!--", "-->"];
+  if (BAT_COMMENT_EXTS.has(e)) return ["::", "rem ", "@rem ", "REM ", "@REM "];
+  return ["//"];
+}
+/** 判断 trim 后的整行是否纯注释；行尾注释不剔除，交给标识符正则自然忽略。 */
+function isWholeLineComment(text, marks) {
+  for (const mk of marks) if (text.startsWith(mk)) return true;
+  return false;
+}
+/**
+ * 读取文件并建立「标识符 → 行号表」，结果按 `abs|size|ctime` 缓存，避免每轮地图注入反复读同一批文件。
+ * @param {string} abs 文件绝对路径
+ * @returns {Map<string, number[]>|null} 读不到文件时返回 null（调用方按无调用点处理）
+ * 说明：逐行跳过整行注释；单文件最多记 IDENT_LINES_MAX 个标识符，超出的新标识符丢弃，已记录的仍追加行号。
+ */
+function identLinesOf(abs) {
+  if (!abs) return null;
+  let st = null;
+  try { st = fs.statSync(abs); } catch { return null; }
+  const key = abs + "|" + st.size + "|" + Math.round(st.ctimeMs);
+  const hit = callRefCache.get(key);
+  if (hit !== undefined) {
+    // 命中后挪到队尾，让缓存按最近使用淘汰（Map 保持插入顺序）
+    callRefCache.delete(key);
+    callRefCache.set(key, hit);
+    return hit;
+  }
+  const table = new Map();
+  try {
+    const lines = fs.readFileSync(abs, "utf8").split("\n");
+    const marks = wholeLineCommentMarks(path.extname(abs));
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i].trim();
+      if (!text || isWholeLineComment(text, marks)) continue;
+      const words = text.match(/[A-Za-z_$][\w$]*/g);
+      if (!words) continue;
+      const ln = i + 1;
+      for (const w of words) {
+        let at = table.get(w);
+        if (!at) {
+          if (table.size >= IDENT_LINES_MAX) continue;
+          at = [];
+          table.set(w, at);
+        }
+        at.push(ln);
+      }
+    }
+  } catch { return null; }
+  callRefCache.set(key, table);
+  // 超出容量按最久未使用淘汰
+  while (callRefCache.size > CALL_REF_CACHE_MAX) {
+    const oldest = callRefCache.keys().next().value;
+    callRefCache.delete(oldest);
+  }
+  return table;
+}
+/** 调用点里显示的模块路径：优先用地图里的相对路径，没有就按工作区相对化。 */
+function callRefPath(node, workspace) {
+  const p = String((node && node.path) || "").replace(/\\/g, "/");
+  if (p) return p;
+  const abs = String((node && node.abs) || "");
+  if (abs && workspace) return path.relative(workspace, abs).replace(/\\/g, "/");
+  return abs || "?";
+}
+/**
+ * 汇总模块 n 的每个符号的调用点（口径见上方说明），也就是「谁调用它、在第几行」。
+ * @param {string} workspace 工作区绝对路径；为空时退回 mapData.workspace
+ * @param {object} mapData 地图 JSON（用于 id → 节点）
+ * @param {object} n 当前模块节点
+ * @param {Map<string,string[]>} rev reverseDeps() 结果（被谁依赖）
+ * @returns {Map<string,string>} 符号名 → `a/b.js:12/14, c.js:7` 形式；没有调用点的符号不出现在结果里
+ * 副作用：只读文件并写 callRefCache，不修改 mapData 与节点字段。
+ */
+function callRefsOf(workspace, mapData, n, rev) {
+  const out = new Map();
+  if (!n || !Array.isArray(n.symbols) || !n.symbols.length) return out;
+  if (!mapData || !Array.isArray(mapData.nodes)) return out;
+  const ws = workspace || mapData.workspace || "";
+  const byId = new Map();
+  for (const x of mapData.nodes) if (x && x.id) byId.set(x.id, x);
+  const from = rev && typeof rev.get === "function" ? (rev.get(n.id) || []) : [];
+  const callers = [];
+  for (const id of from.slice(0, CALL_REF_MAX_CALLERS)) {
+    const c = byId.get(id);
+    if (c && c !== n) callers.push(c);
+  }
+  // 每个候选文件预先建好标识符表和定义行集合：定义行同样出现符号名，必须剔除，否则会把定义当调用
+  const tables = [n, ...callers].map((c) => {
+    const abs = c.abs ? String(c.abs) : (ws ? path.join(ws, c.path || "") : "");
+    const defs = new Set();
+    for (const s of (Array.isArray(c.symbols) ? c.symbols : [])) {
+      const ln = Number(s && s.line);
+      if (ln) defs.add(ln);
+    }
+    return { node: c, table: abs ? identLinesOf(abs) : null, defs };
+  });
+  for (const s of n.symbols) {
+    const name = String((s && s.name) || "");
+    if (!name) continue;
+    let left = CALL_REF_MAX_PER_SYMBOL;
+    const parts = [];
+    for (const t of tables) {
+      if (left <= 0) break;
+      const at = (t.table && t.table.get(name)) || [];
+      const keep = [];
+      for (const ln of at) {
+        if (keep.length >= left) break;
+        if (t.defs.has(ln)) continue;
+        if (keep.indexOf(ln) < 0) keep.push(ln);
+      }
+      if (!keep.length) continue;
+      left -= keep.length;
+      // 同文件多行合并成 `renderer/app.js:5373/6473`
+      parts.push(callRefPath(t.node, ws) + ":" + keep.join("/"));
+    }
+    if (parts.length) out.set(name, parts.join(", "));
+  }
+  return out;
+}
+// 调用点口径说明：随方法列表一起输出，避免被当成全量调用图
+const CALL_REF_CAVEAT = "  调用点口径：只统计本文件与直接 import 本文件的调用方（最多 " + CALL_REF_MAX_CALLERS + " 个）；字符串拼接、反射、Unity Inspector 绑定、未 import 的跨文件引用不计入。";
 // 展示起止行；不截断、不暗示少读
-function fmtMethod(m) {
+/**
+ * 生成一行方法索引文本。
+ * @param {object} m nodeMethods() 产出的方法项
+ * @param {Map<string,string>} [refs] callRefsOf() 结果：有调用点时行尾追加〔调用点：…〕，没有调用点保持原样（不写「无」）
+ * @returns {string} 单行文本
+ * 注意：`arr.map(fmtMethod)` 会把下标当第二参传进来，非 Map 一律按无调用点处理。
+ */
+function fmtMethod(m, refs) {
   const start = Number(m.line) || 0;
   const end = Number(m.endLine) || start;
   let line = "";
@@ -1007,7 +1271,10 @@ function fmtMethod(m) {
   // 归纳可能不准，标成旁证
   const desc = m.desc ? " — 〔归纳·仅供参考〕" + m.desc : "";
   const title = m.title ? " — 〔源码注释〕" + m.title : desc || ' — 无注释，按需查看源码';
-  return "  - " + (m.name || "") + line + (m.rangeKind === 'estimated' ? '〔范围为规则估算〕' : '') + kv + title;
+  const call = refs && typeof refs.get === "function" ? (refs.get(String(m.name || "")) || "") : "";
+  // 只在真有调用点时追加，避免每行都挂「无调用点」噪声
+  const callText = call ? "〔调用点：" + call + "〕" : "";
+  return "  - " + (m.name || "") + line + (m.rangeKind === 'estimated' ? '〔范围为规则估算〕' : '') + kv + title + callText;
 }
 // 旧地图只有起始行时，现场补 endLine（读该文件估边界），不必等用户重绘
 // [铆钉优化] 按 mtime+size 缓存，避免每轮对话对同一批模块反复读全文。其他 AI 请勿去掉缓存
@@ -1167,6 +1434,8 @@ function moduleText(mapData, n, rev) {
   if (n.deps && n.deps.length) lines.push("  关联脚本：" + n.deps.slice(0, 12).join(", ") + (n.deps.length > 12 ? " …" : ""));
   const by = rev.get(n.id) || [];
   if (by.length) lines.push("  被依赖：" + by.slice(0, 12).join(", ") + (by.length > 12 ? " …" : ""));
+  // 调用点：只在返回文本里用，口径见 callRefsOf；不写进地图 JSON，也不改节点字段
+  const refs = callRefsOf(mapData && mapData.workspace, mapData, n, rev);
   const all = nodeMethods(n);
   const explained = all.filter((m) => m.desc || m.keyValues).length;
   const documented = all.filter((m) => m.comment).length;
@@ -1175,7 +1444,8 @@ function moduleText(mapData, n, rev) {
     appendChewedOnly(lines, n, all);
   } else if (all.length) {
     lines.push("  方法索引（" + all.length + "；用 map_lookup 的 module + symbol 读取条目完整源码）：");
-    for (const m of all) lines.push(fmtMethod(m));
+    if (refs.size) lines.push(CALL_REF_CAVEAT);
+    for (const m of all) lines.push(fmtMethod(m, refs));
   }
   return lines.join("\n");
 }
@@ -1290,6 +1560,8 @@ function mapFiles(workspace, extra) {
 }
 function mapTextForQuery(workspace, extra, mapData, query, opts) {
   opts = opts || {};
+  // 地图有截断时先备好说明文案，拼到回包 lines 的最前面（无截断/旧地图为空字符串）
+  const limitText = mapLimitText(mapData);
   const top = topMatches(workspace, extra, mapData, query, opts);
   if (top === null) return "查询为空";
   if (!top.length) return "项目地图未匹配到模块。部分模块可能尚未归纳，不能据此断言功能不存在；请用 search_text 搜索源码、注释或相关符号，再用 read_file 核实。";
@@ -1308,6 +1580,8 @@ function mapTextForQuery(workspace, extra, mapData, query, opts) {
     const tail = total > hit.length ? "\n  （共 " + total + " 个方法，传 module=\"" + n.path + "\" 查看全部）" : "";
     return head + "\n" + ms + tail;
   });
+  // 截断说明要出现在回包最前面：插到 lines 头部，不影响后面命中的原有顺序
+  if (limitText) lines.unshift(limitText);
   return "项目地图匹配到 " + top.total + " 个模块，这是标题索引，不是源码。先按方法名、源码注释筛选；用 map_lookup(module, symbol) 读取目标条目的完整区段。无法识别方法时可指定 module + startLine/endLine。注释可能过期，无注释不代表无关。这批对不上先换关键字或 search_text：\n\n" + lines.join("\n");
 }
 // 按模块路径精确/后缀匹配取单模块摘要
@@ -1338,18 +1612,21 @@ function loadMapCached(workspace) {
   mapCache.set(key, { mtime: st.mtimeMs, size: st.size, data });
   return data;
 }
-function appendModuleLines(lines, n, hit, rev) {
+function appendModuleLines(lines, n, hit, rev, mapData) {
+  // 调用点：本文件 + 直接 import 本文件的调用方，只拼进标题行文本，不改索引结构和打分
+  const refs = callRefsOf(mapData && mapData.workspace, mapData, n, rev);
   lines.push("`" + n.path + "`" + (n.desc ? " — 〔归纳·仅供参考〕" + n.desc : ""));
   const deps = (n.deps || []).slice(0, 8);
   if (deps.length) lines.push("  关联脚本：" + deps.join(", "));
-  const by = (rev.get(n.id) || []).slice(0, 6);
+  const by = (rev.get(n.id) || []).slice(0, CALL_REF_MAX_CALLERS);
   if (by.length) lines.push("  被依赖：" + by.join(", "));
   if (needsFullRead(n)) {
     appendChewedOnly(lines, n, hit);
   } else {
     const shown = hit.length ? hit : nodeMethods(n);
     lines.push("  方法索引（" + shown.length + "；按标题筛选后再读取详情）：");
-    for (const m of shown) lines.push(fmtMethod(m));
+    if (refs.size) lines.push(CALL_REF_CAVEAT);
+    for (const m of shown) lines.push(fmtMethod(m, refs));
   }
 }
 // [铆钉优化] 先 map_lookup，按起止行读段；归纳仅旁证。其他 AI 请勿改回整文件通读
@@ -1370,13 +1647,13 @@ function buildPromptBlock(workspace, query, extra) {
     if (!n || shown.has(n.id)) continue;
     const nAbs = n.abs || path.join(workspace, n.path || "");
     if (isForeignAiSkill(nAbs)) continue;
-    appendModuleLines(updatedLines, n, [], rev);
+    appendModuleLines(updatedLines, n, [], rev, mapData);
     shown.add(n.id);
   }
   const lines = [];
   for (const row of top) {
     if (shown.has(row.n.id)) continue;
-    appendModuleLines(lines, row.n, row.hit, rev);
+    appendModuleLines(lines, row.n, row.hit, rev, mapData);
   }
   const parts = [];
   if (updatedLines.length || touch.removed.length) {
@@ -2132,6 +2409,7 @@ function gotoDefinition(workspace, extra, symbol) {
 module.exports = {
   ensureIndex, kickIndex, abortIndex, deleteIndex, getStatus, onStatus, search, buildPromptBlock, getMap, mapFiles, upsertFile, removeFile, gotoDefinition,
   noteDiskChange, noteWatching,
+  mapLimitText,
   hashPath, fileKey, sameWorkspace, isIgnored, parseIgnoreLines, jsonPath, mdPath,
   getExcludes: loadExcludes, setExcludes: saveExcludes,
   getInclude: loadInclude, setInclude, summarizeIncludes, summarizeOne, sourceItem

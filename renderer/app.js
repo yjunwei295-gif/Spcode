@@ -1206,13 +1206,16 @@ function slimMessagesForSave(messages) {
 function persistTab(tab, force = false) {
   if ((!state.autoSave && !force) || !tab) return Promise.resolve();
   rememberComposer(tab);
-  if (!tab.messages?.length && !tab.composer) return Promise.resolve();
+  // 用户主动删空历史时也必须覆盖存档，避免重开会话后旧消息复活。
+  if (!tab.messages?.length && !tab.composer && !force) return Promise.resolve();
   return api.saveSession({
     id: tab.id,
     title: tab.title,
     workspace: tab.workspace || state.workspace,
     extraFolders: extraFoldersOf(tab),
     messages: slimMessagesForSave(tab.messages),
+    dialogRoundSeq: tab.dialogRoundSeq || 0,
+    contextRevision: tab.contextRevision || '',
     undone: tab.undone || [],
     context: tab.context || emptyContext(),
     workingMemory: tab.workingMemory || emptyWorkingMemory(),
@@ -1249,6 +1252,8 @@ function hydrateTab(data, fallbackWs) {
     id: data.id,
     title: data.title || t('unnamed'),
     messages: settleDeadTurns(data.messages),
+    dialogRoundSeq: data.dialogRoundSeq || 0,
+    contextRevision: data.contextRevision || '',
     workspace: data.workspace || fallbackWs || state.workspace,
     extraFolders: Array.isArray(data.extraFolders) ? [...data.extraFolders] : [],
     undone: data.undone || [],
@@ -1829,8 +1834,18 @@ function parseStartOptions(text) {
   return out;
 }
 
-// [铆钉优化] 大脑复述完方案等「开始」时给一个确定按钮，点了必定按「开始」开工，不再依赖关键词猜测；其他 AI 请勿删除或改成猜测式
-const START_ASK_RE = /确认无误后回复|回复[「"“]?开始|reply\s*["“]?start/i;
+/**
+ * 正文中的非空方案即可展示确认按钮，不要求模型再输出固定结尾。
+ * 忽略代码示例及行内提及；与后台一致，缺少结束标记时取到回复末尾。
+ */
+function hasPlanDraft(text) {
+  const src = String(text || '').replace(/```[\s\S]*?(?:```|$)/g, '');
+  const match = src.match(/^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*)?【方案】(?:\*\*)?([^\n]*(?:\n[\s\S]*)?)$/m);
+  if (!match) return false;
+  const body = match[1].split('【/方案】')[0].trim();
+  // 只有空标记、占位省略号或章节标签时，没有可供确认的方案。
+  return !!body.replace(/【[^】]*】|[\s#*_`.…-]/g, '');
+}
 
 // [铆钉优化] 复述里如果明说本轮没有要改的东西，就不该再给开工按钮，也不该让小窗亮「开始」
 // 判断方式：把各种「没有待改项」的显式中文字面量逐个 IndexOf，命中任一即算没有待改项
@@ -1853,8 +1868,41 @@ function textSaysNoPendingWork(text) {
   return false;
 }
 
-// 只重画某一条消息的开工按钮区（勾选切换后调用）：
+// 只重画某一条消息的按钮区（勾选切换后调用）：方案按钮段与开工选项段各自独立，一并重画：
 // 重画时勾选态从 m.startPicked 恢复，提交按钮的 disabled 与选项的 .on 态会一起刷新
+// 找最近一条「方案」助手消息下标：大脑常在【方案】段后面再补一句解释，
+// 若开工按钮只认最后一条消息，方案那条就点不到了，所以这里单独定位方案消息。
+// 从数组末尾往前扫，跳过非助手消息（含 tool-note 类提示）与没有【方案】段落的消息。
+// 未写入的方案消息优先；全都点过「写入方案」时退回最近一条已写入的方案消息，
+// 避免「写入方案」一点，方案导图和开工入口跟着整段消失、用户没有开工的办法。
+// 返回该消息下标；返回 -1 表示当前没有任何带方案的助手消息，调用方退回旧行为。
+function activePlanIdx(msgs) {
+  let writtenIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m) {
+      continue;
+    }
+    // 只认助手消息：用户消息、tool-note 之类提示一律跳过
+    if (m.role !== 'assistant') {
+      continue;
+    }
+    // 正文里没有【方案】段落的消息不是方案消息
+    if (!hasPlanDraft(m.text)) {
+      continue;
+    }
+    // 还有没写入的方案，就用最近这一条
+    if (!m.planWritten) {
+      return i;
+    }
+    // 已写入的方案先记下来当兜底，继续往前找有没有还没写入的
+    if (writtenIdx < 0) {
+      writtenIdx = i;
+    }
+  }
+  return writtenIdx;
+}
+
 function repaintStartGo(m, i, tab) {
   const box = $('messages') || document;
   const host = box.querySelector('.msg[data-msg-i="' + i + '"]');
@@ -1862,13 +1910,13 @@ function repaintStartGo(m, i, tab) {
   const msgs = tab?.messages || [];
   let lastIdx = msgs.length - 1;
   while (lastIdx >= 0 && msgs[lastIdx].role === 'tool-note') lastIdx--;
-  const html = renderStartGo(m, i, lastIdx, tab);
-  const old = host.querySelector('.start-go-row');
-  if (old) {
-    if (html) old.outerHTML = html;
-    else old.remove();
-    return;
-  }
+  // 当前方案下标（方案清单里的选中项）由 activePlanIdx 统一算出，交给模板决定方案段的勾选态
+  const planIdx = activePlanIdx(msgs);
+  const html = renderStartGo(m, i, lastIdx, planIdx, tab);
+  // 方案按钮和开工选项现在各自独立成一段 .start-go-row，重画时先全部摘掉再把新的一段段插回，
+  // 否则只替换第一段会留下过期的旧段（例如勾选切换后旧的开工选项或旧的方案按钮还挂着）
+  const olds = host.querySelectorAll('.start-go-row');
+  for (let k = 0; k < olds.length; k++) olds[k].remove();
   if (html) host.insertAdjacentHTML('beforeend', html);
 }
 
@@ -1886,44 +1934,72 @@ function reportStartReady(tab, canStart, options) {
   if (api.floatCanStart) api.floatCanStart(!!canStart, list);
 }
 
-function renderStartGo(m, i, lastIdx, tab) {
-  // 只取这一次正文，闸门和原来的 START_ASK_RE 判定共用同一个字符串，保证两边看的是同一份内容
+// 渲染某条消息的「写入方案 / 开工选项」按钮区，非候选消息直接返回空串。
+// 参数：m 消息对象；i 该消息在 messages 里的下标；lastIdx 最后一条非 tool-note 消息下标；
+//       planIdx 当前方案清单选中项下标（activePlanIdx，-1 表示没有可跟随的方案）；
+//       tab 该消息所属会话，用于判断是否正在生成/等待问答。
+// 返回：按钮区 HTML 片段，不能显示按钮时为空串。
+// 副作用：候选那一条会把「能否开工 + 开工方案清单」上报给小窗（经 reportStartReady 去重），
+//         并在有 api.reportError 时上报一次开工判定诊断。
+// 边界：本函数在整批渲染里逐条消息调用，只有候选那一条做判定和上报，避免一次重绘发上千次 IPC。
+function renderStartGo(m, i, lastIdx, planIdx, tab) {
+  // 方案按钮和开工按钮跟着最近一条仍未写入的【方案】消息走（planIdx）；
+  // 没有这样一条时才退回最后一条助手消息（lastIdx）。只有候选那一条决定主窗和小窗的开工状态，
+  // 历史消息不得清空当前状态。
+  const target = planIdx >= 0 ? planIdx : lastIdx;
+  if (i !== target || m.role !== 'assistant') return '';
   const text = String(m.text || '');
-  // [铆钉优化] 闸门：本轮明说没有待改项时，直接不渲染任何开工按钮（含那颗普通「开始」），
-  // 并沿本文件已有的上报路径把这条消息的 canStart 报成 false、方案为空，让小窗「开始」也保持不亮
-  if (textSaysNoPendingWork(text)) {
+  const hasPlan = hasPlanDraft(text);
+  // 明确列出的方案优先于正文中某个局部“无需改动”的描述。
+  if (!hasPlan && textSaysNoPendingWork(text)) {
     reportStartReady(tab, false, []);
     return '';
   }
-  // 有标记方案时走多选开工路径；没有标记方案时，仅保留原来的 START_ASK_RE 单按钮判定。
   const markerOptions = parseMarkerStartOptions(text);
-  // 停止或恢复会话后的完整方案仍可由用户明确确认开工；真正执行仍需点击按钮。
-  const eligible = i === lastIdx && (!m.stopped || START_ASK_RE.test(text) || markerOptions.length > 0) && !m.askPending && !isTabSending(tab);
-  const canStart = eligible && (markerOptions.length > 0 || START_ASK_RE.test(text));
-  // 认定能开工时再看这段复述里有没有可选方案，有就拆成多颗按钮，并把选项一并报给小窗
+  // 开工判定有两条来源：
+  //   1) [开工选项] 块：能拆出逐项按钮，勾选后一起开工；
+  //   2) 正文确实带【方案】正文：即使大脑没写 [开工选项] 块，也留一颗「开始」，
+  //      否则整条方案没有任何开工入口，用户只能靠手打口令，一打不通就彻底卡死。
+  // 仍刻意不认「正文里出现『点击开始』『/spcode-start』」这类自由文本，那种来源会让随口一提的对话也冒出按钮。
+  const hasStartOffer = markerOptions.length > 0;
+  // 生成中或等待问答时不展示；停止、重新打开会话后仍可确认已有方案/开工选项。
+  const eligible = !m.askPending && !isTabSending(tab);
+  const canStart = eligible && (hasStartOffer || hasPlan);
+  // 有 [开工选项] 块才拆多颗按钮并上报选项；只有方案正文时用下面的单颗「开始」按钮
   const options = canStart && markerOptions.length > 0 ? parseStartOptions(text) : [];
   // 诊断：开工按钮判定分解（只记录元数据，不含正文），用于定位按钮不出现的原因。
-  // 本函数是逐条消息调用的，只让候选那条（最后一条）上报一次：每条都上报的话，
-  // 上千条消息会在一次重绘里发出上千次 IPC，主进程是同步写日志，整个界面会被拖死
-  if (i === lastIdx && api.reportError) api.reportError('[开工按钮诊断]', {
-    msgIndex: i, lastIndex: lastIdx, stopped: !!m.stopped, askPending: !!m.askPending,
-    tabSending: isTabSending(tab), askMatched: START_ASK_RE.test(text),
-    markerOptionCount: markerOptions.length, canStart: !!canStart, optionCount: options.length
+  // 本函数是逐条消息调用的，只让候选那条（target，与上面的渲染判定同一口径）上报一次：
+  // 每条都上报的话，上千条消息会在一次重绘里发出上千次 IPC，主进程是同步写日志，整个界面会被拖死
+  if (i === target && api.reportError) api.reportError('[开工按钮诊断]', {
+    msgIndex: i, lastIndex: lastIdx, planIndex: planIdx, stopped: !!m.stopped, askPending: !!m.askPending,
+    tabSending: isTabSending(tab),
+    hasPlan, planWritten: !!m.planWritten, markerOptionCount: markerOptions.length, canStart: !!canStart, optionCount: options.length
   });
-  // 用户可点「写入方案」查看导图，也可在核对后直接回复「开始」；后台会锁定最新方案块。
-  // 没有【方案】段时后台把整条回复写进去。AGI 开着时后台不查方案，这里也不拦
-  const needPlan = canStart && !state.desktopAlive;
-  const planNeedsWrite = needPlan && !m.planWritten;
+  // 「写入方案」按钮独立成一段：只看正文有没有【方案】段，与开工判定（[开工选项] 块）彻底分开。
+  // 后台对没有【方案】段的回复直接拒写（state:'no-plan'，一个字节都不写），所以按钮只在这种情况下给：
+  // 正文确实带【方案】正文（hasPlan）或本条已写入过方案（m.planWritten）才显示，
+  // 避免像「核对后点开始」这类只有开工话术、没有方案正文的回复也冒出点了必失败的按钮。
+  // 生成中 / 等回答（eligible 为假）时不给，避免把半截正文写进方案文件。
+  // AGI 开着（desktopAlive）时后台不查方案，这里也不拦。
+  // 写方案只在非 AGI 下给（AGI 后台不锁方案文件）；已经写入过的方案在两种模式下都给导图入口，
+  // 否则 AGI 一开，「方案导图」也跟着消失，用户连方案都翻不到了
+  const showPlanWrite = eligible && ((!state.desktopAlive && hasPlan) || !!m.planWritten);
+  const planNeedsWrite = showPlanWrite && !m.planWritten && hasPlan;
   reportStartReady(tab, !!canStart, options);
-  if (!canStart) return '';
   const en = getLocale() === 'en';
-  let btns = '';
-  if (needPlan) {
+  let html = '';
+  // 第一段：方案写入 / 已写入后的方案导图，与下面第二段的开工选项互不影响
+  if (showPlanWrite) {
+    let planBtns = '';
     const planLabel = m.planWritten ? (en ? 'Plan written' : '已写入方案') : (en ? 'Write plan' : '写入方案');
-    btns += `<button type="button" class="start-go-submit" data-plan-write="1">${planLabel}</button>`;
-    if (m.planWritten && m.planItems) btns += `<button type="button" class="start-go-submit" data-plan-map="${i}">${en ? 'Plan map' : '方案导图'}</button>`;
-    if (m.planNote) btns += `<span class="start-go-hint">${escapeHtml(String(m.planNote))}</span>`;
+    planBtns += `<button type="button" class="start-go-submit" data-plan-write="1">${planLabel}</button>`;
+    if (m.planWritten) planBtns += `<button type="button" class="start-go-submit" data-plan-map="${i}">${en ? 'Plan map' : '方案导图'}</button>`;
+    if (m.planNote) planBtns += `<span class="start-go-hint">${escapeHtml(String(m.planNote))}</span>`;
+    html += `<div class="start-go-row plan-write-row">${planBtns}</div>`;
   }
+  // 第二段：开工选项；没有 [开工选项] 块就没有这一段，但上面那段方案按钮照样可能单独显示
+  if (!canStart) return html;
+  let btns = '';
   if (options.length >= 1) {
     // 有方案时改成多选：单击选项只切换勾选，勾选态存在当前消息对象的 m.startPicked（数组，存 value 字符串）上，
     // 流式刷新会重新调 renderStartGo，勾选态从这里恢复，不会丢；真正开工统一交给行尾那颗「一起开工」
@@ -1963,13 +2039,15 @@ function renderStartGo(m, i, lastIdx, tab) {
     row.appendChild(noteBox);
     btns += row.innerHTML;
   } else {
-    // 没有方案就完全保持原样：一颗按钮，空值代表旧行为
+    // 没有 [开工选项] 块时给一颗按钮：空值代表旧行为（发「开始」出门）；
+    // 有方案正文但大脑没写块的情况走的正是这里，保证方案总有开工入口
     btns += `<button type="button" class="start-go" data-start-go="">${en ? 'Start' : '开始'}</button>`;
   }
   const hint = planNeedsWrite
-    ? (en ? 'Review it, then click Write plan or reply Start' : '核对后点写入方案，或直接回复「开始」')
+    ? (en ? 'Review the plan, then click Start or send /spcode-start alone' : '核对方案后点击开始，或单独发送 /spcode-start')
     : (en ? 'Hand off to the code worker' : '确认方案，派给代码模块改');
-  return `<div class="start-go-row">${btns}<span class="start-go-hint">${hint}</span></div>`;
+  html += `<div class="start-go-row">${btns}<span class="start-go-hint">${hint}</span></div>`;
+  return html;
 }
 
 // 补充说明框的输入：实时把内容写回该条消息的 m.startDraft，
@@ -2388,6 +2466,8 @@ function ensureTypewriter() {
   state.typewriterRaf = requestAnimationFrame(tick);
 }
 
+// 首屏和流式重绘只处理最近一批消息，旧历史由用户按需展开。
+const MESSAGE_RENDER_BATCH = 60;
 function renderMessages(switching = false) {
   const box = $('messages');
   const keep = box.scrollTop;
@@ -2397,12 +2477,23 @@ function renderMessages(switching = false) {
   box.classList.toggle('empty-center', msgs.length === 0);
   if (!msgs.length) {
     box.innerHTML = '';
+    reportStartReady(tab, false, []);
     updateUndoRedo();
     return;
   }
   let lastIdx = msgs.length - 1;
   while (lastIdx >= 0 && msgs[lastIdx].role === 'tool-note') lastIdx--;
-  box.innerHTML = msgs.map((m, i) => {
+  // 当前方案下标（方案清单里的选中项）与上面 lastIdx 一样在整批渲染前算一次，
+  // 逐条传给 renderStartGo 决定方案段的勾选态，避免每条消息各算一遍
+  const planIdx = activePlanIdx(msgs);
+  if (msgs[lastIdx]?.role !== 'assistant') reportStartReady(tab, false, []);
+  const limit = Math.max(MESSAGE_RENDER_BATCH, tab._messageRenderLimit || 0);
+  let start = Math.max(0, msgs.length - limit);
+  // 不把首屏截在一轮回复中间；事件按钮仍使用消息的真实数组下标。
+  while (start > 0 && msgs[start].role !== 'user') start--;
+  const earlier = start ? `<div class="history-load"><button type="button" data-load-earlier>${escapeHtml(t('loadEarlierMessages', { n: start }))}</button></div>` : '';
+  box.innerHTML = earlier + msgs.slice(start).map((m, offset) => {
+    const i = start + offset;
     if (m.role === 'tool-note') return '';
     let extra = '';
     if (m.changes?.length) {
@@ -2470,11 +2561,11 @@ function renderMessages(switching = false) {
       <div class="role">${m.role === 'user' ? t('you') : t('assistantName')}${m.role === 'assistant' ? rosterHtml(m) : ''}
         <span>
           ${m.role === 'user' ? `<button class="msg-refill" data-refill="${i}" title="${t('refillTitle')}">${t('refill')}</button>` : ''}
-          ${m.role === 'assistant' && m.planMap ? planMapBtnHtml(i) : ''}
+          ${m.role === 'assistant' && (m.planMap || m.planWritten) ? planMapBtnHtml(i) : ''}
           <button class="msg-fork" data-fork="${i}" title="${t('forkTitle')}">${t('fork')}</button>
         </span>
       </div>
-      ${m.role === 'assistant' ? renderThink(m, i) : ''}${m.role === 'assistant' ? renderTodoCard(m) : ''}${bubble}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
+      ${m.role === 'assistant' ? renderThink(m, i) : ''}${m.role === 'assistant' ? renderTodoCard(m) : ''}${bubble}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, planIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
     </div>`;
   }).join('');
   // [铆钉优化] 进入/切换对话一律滚到最新；同一标签页重绘时原来贴底就继续贴底，否则保持原位。其他 AI 请勿改回恢复 scrollPos 旧位置
@@ -2534,17 +2625,67 @@ function planMapBtnHtml(i) {
   return `<button class="msg-fork" data-plan-map="${i}">${en ? 'Plan map' : '方案导图'}</button>`;
 }
 
-// 先向后台要最新的条目状态（落在方案文件夹里），拿不到再用这条消息上缓存的推送
+/**
+ * 打开方案导图：先向后台要最新的条目状态（落在方案文件夹里），拿不到再用这条消息上缓存的推送。
+ * 后台读不到条目时会带回 state（no-items=方案正文在但拆不出条目，no-file=还没写入方案），
+ * 这里按具体原因提示，别把「正文已保存、只是没解析出条目」说成方案已收尾或没写入。
+ *
+ * @param {object} tab 当前会话标签，提供 title / workspace / id
+ * @param {object} m 产生导图按钮的那条消息，m.planMap 是推送过的导图缓存
+ * 没有条目可用时不弹浏览器模态框，而是用空态导图弹层展示原因，避免打断式 alert。
+ * 副作用：打开或复用方案导图弹层（window.PlanMap.open 内部会先关闭旧弹层）。
+ */
 async function openPlanMap(tab, m) {
   if (!tab || !window.PlanMap) return;
   let map = null;
   try {
     if (api.planTree) map = await api.planTree({ workspace: tab.workspace || state.workspace, tabId: String(tab.id || '') });
   } catch (_) { map = null; }
+  // 后台明确说没条目：消息里缓存过导图就照旧用缓存展示，没有缓存则开空态弹层说明原因
+  if (map && map.state && map.state !== 'tree') {
+    const cached = m && m.planMap;
+    if (!(cached && Array.isArray(cached.nodes) && cached.nodes.length > 1)) {
+      // 空态仍走导图弹层（浏览器模态框会打断界面）：emptyText 说明原因，locked=false 因为没有可删条目
+      window.PlanMap.open({
+        title: tab.title || '',
+        emptyText: planMapEmptyText(map),
+        workspace: tab.workspace || state.workspace,
+        tabId: String(tab.id),
+        locked: false
+      });
+      return;
+    }
+    map = null;
+  }
   if (!map) map = m && m.planMap;
-  if (!map) { alert('没有方案条目：方案文件已收尾或还没写入方案'); return; }
-  // 传 workspace 与 tabId，删除条目时前端才有定位参数可用
-  window.PlanMap.open({ title: tab.title || '', map, workspace: tab.workspace || state.workspace, tabId: String(tab.id) });
+  if (!map) {
+    // 后台没回条目、消息里也没有缓存：同样用空态弹层说明，不弹模态框
+    window.PlanMap.open({
+      title: tab.title || '',
+      emptyText: '没有方案条目：方案文件已收尾或还没写入方案',
+      workspace: tab.workspace || state.workspace,
+      tabId: String(tab.id),
+      locked: false
+    });
+    return;
+  }
+  // 传 workspace 与 tabId，删除条目时前端才有定位参数可用；locked 决定导图里删除按钮是否可点
+  window.PlanMap.open({
+    title: tab.title || '',
+    map,
+    workspace: tab.workspace || state.workspace,
+    tabId: String(tab.id),
+    locked: !!(map && map.locked)
+  });
+}
+
+/** 方案导图为空时的提示：区分「方案文件还没写入」与「正文在但没解析出条目」 */
+function planMapEmptyText(map) {
+  const file = (map && map.file) || '';
+  if (map && map.state === 'no-items') {
+    return `方案文件已有正文，但没解析出条目：${file}\n每条写成「1. 文件路径：改动要求」或「1. 文件路径 → 方法：改动要求」，也认「一、文件路径」这种章节标题下面用「1. 方法（行号）：改动」逐条列；改完重新写入方案`;
+  }
+  return `还没写入方案：${file || '方案文件'} 不存在，请先点「写入方案」`;
 }
 
 function scheduleLivePaint() {
@@ -3560,8 +3701,8 @@ async function sendOne(tab, text, draft) {
   tab.messages.push({
     role: 'user',
     text: userText,
-    // 只回「开始」的一轮没有新信息（方案在方案文件里），默认不塞给 AI
-    ctxSkip: /^(开始|开始吧)[。.!！~～]*$/.test(userText.trim()),
+    // 仅跳过没有补充需求的专用开工操作，普通聊天里的“开始”保留为上下文。
+    ctxSkip: userText.trim() === '/spcode-start' || (draft.action === 'start-work' && userText.trim() === '开始'),
     images: imageAtts.map((a) => a.preview),
     _enterAnim: !prefersReducedMotion(),
     draft: {
@@ -3616,7 +3757,9 @@ async function sendOne(tab, text, draft) {
   tab.messages.push(assistant);
   const payload = {
     text,
+    action: draft.action === 'start-work' ? 'start-work' : undefined,
     history,
+    contextRevision: tab.contextRevision || '',
     skillId: skillIds[0] || null,
     skillIds,
     contextPaths: [...(draft.contextPaths || [])],
@@ -3751,11 +3894,15 @@ async function processQueue(tab) {
   }
 }
 
-async function send() {
+async function send(options = {}) {
   const tab = activeSession() || (newTab(), activeSession());
   if (!tab.workspace && state.workspace) tab.workspace = state.workspace;
   const input = $('input');
   const text = input.value.trim();
+  // 单独发送 /spcode-start 与点开工按钮等价：这里直接把意图记成 start-work，
+  // 后台按 action 判定开工，不靠聊天文本兜，避免口令被当成普通聊天发出去。
+  // 中文输入法会打出全角斜杠，先归一成半角再认口令。
+  if (text.replace(/／/g, '/') === '/spcode-start') options.action = 'start-work';
   if (!text && !state.attachments.length && !tabQueue(tab).length) return;
   if (!tab.workspace) {
     openModal(`<h3>${t('pickWorkspace')}</h3><p class="hint">${t('pickWorkspaceHint')}</p><div class="modal-actions"><button class="primary" id="m-ok">${t('ok')}</button></div>`);
@@ -3784,6 +3931,8 @@ async function send() {
     const ids = skillStack();
     return {
       text,
+      // 每条队列项独立保存按钮意图，不放进输入框或全局状态，避免下一条聊天继承。
+      action: options.action === 'start-work' ? 'start-work' : undefined,
       skillId: ids[0] || null,
       skillIds: ids,
       modelId: tab.modelId || state.currentModelId,
@@ -3794,7 +3943,7 @@ async function send() {
   // 运行中纯文本走插话，下一个 round 边界生效；带附件仍排队，避免丢图
   if (tab.sending || tab.draining) {
     // 这次没有任何附件，且输入框里有纯文本：直接插话给当前轮，不用等整轮跑完
-    if (text && !state.attachments.length) {
+    if (text && !state.attachments.length && options.action !== 'start-work' && text !== '/spcode-start') {
       // 用 async 包住，避免插话的 Promise 没人接
       (async () => {
         let res = null;
@@ -3910,18 +4059,24 @@ function usageLineText(u) {
   return bits.join(' · ');
 }
 
-/** 对话按轮分组：每轮 { n, user, asst }，user / asst 是消息对象；一轮只认用户消息后的第一条回复 */
+/** 按用户消息分整轮，保留稳定编号和全部回复/工具记录，供上下文筛选及整轮删除。 */
 function dialogRounds(tab) {
   const out = [];
   let cur = null;
+  let next = (tab?.messages || []).reduce((max, m) => Math.max(max, Number.isSafeInteger(m.dialogRound) ? m.dialogRound : 0), tab?.dialogRoundSeq || 0);
+  const used = new Set();
   for (const m of (tab?.messages || [])) {
     if (m.role === 'user') {
-      cur = { n: out.length + 1, user: m, asst: null };
+      // 删掉 R2 后，R3 仍是 R3，防止历史中的索引编号指向另一轮。
+      if (!Number.isSafeInteger(m.dialogRound) || m.dialogRound <= 0 || used.has(m.dialogRound)) m.dialogRound = ++next;
+      used.add(m.dialogRound);
+      cur = { n: m.dialogRound, user: m, asst: null, messages: [] };
       out.push(cur);
-    } else if (m.role === 'assistant' && cur && !cur.asst) {
-      cur.asst = m;
     }
+    if (cur) cur.messages.push(m);
+    if (m.role === 'assistant' && cur && !cur.asst) cur.asst = m;
   }
+  if (tab) tab.dialogRoundSeq = next;
   return out;
 }
 
@@ -3946,7 +4101,7 @@ function openDialogMap(turnId) {
   const latestAssistantTurn = [...(tab.messages || [])].reverse().find((m) => m.role === 'assistant' && m.turnId);
   const previewTurnId = turnId || latestAssistantTurn?.turnId || null;
   const one = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-  const editableRounds = dialogRounds(tab).filter((r) => !r.user.ctxRemoved);
+  const editableRounds = dialogRounds(tab);
   const rounds = editableRounds.map((r) => {
     const idx = r.asst && r.asst.dialogIndex;
     return {
@@ -3956,7 +4111,7 @@ function openDialogMap(turnId) {
       indexSummary: (idx && idx.summary) || '',
       userText: String(r.user.text || ''),
       asstText: String((r.asst && r.asst.text) || ''),
-      skip: !!r.user.ctxSkip
+      skip: !!(r.user.ctxSkip || r.user.ctxRemoved)
     };
   });
   window.DialogMap.open({
@@ -3965,28 +4120,60 @@ function openDialogMap(turnId) {
     onApply: async (payload) => {
       const skipSet = payload && payload.skipSet ? payload.skipSet : payload;
       const removeSet = (payload && payload.removeSet) || new Set();
+      if (removeSet.size && isTabSending(tab)) {
+        alert(t('historyDeleteWhileSending'));
+        return false;
+      }
+      const previousMessages = tab.messages;
+      const previousSummary = tab.contextSummary;
+      const previousUndone = tab.undone;
+      const previousRevision = tab.contextRevision;
+      const deleted = new Set();
       const previous = editableRounds.map(({ user }) => ({
         user, skip: user.ctxSkip, removed: user.ctxRemoved
       }));
       // 只修改打开导图时的轮次，避免把期间新增消息的筛选状态覆盖掉。
       for (const r of editableRounds) {
         if (removeSet.has(r.n)) {
-          r.user.ctxRemoved = true;
+          for (const m of r.messages) deleted.add(m);
           continue;
         }
-        if (r.user.ctxRemoved) continue;
+        delete r.user.ctxRemoved;
         r.user.ctxSkip = skipSet.has(r.n);
       }
+      if (deleted.size) {
+        tab.messages = tab.messages.filter((m) => !deleted.has(m));
+        // 压缩摘要可能含已删的原文；清掉后由剩余记录重新组织上下文。
+        tab.contextSummary = '';
+        tab.undone = [];
+      }
+      // 直通会话保存了模型自己的历史；改变筛选后下一轮必须重建，防止沿用已删内容。
+      tab.contextRevision = uid();
       try {
         await persistTab(tab, true);
       } catch (err) {
+        // 失败时恢复被删轮次，同时保留保存期间可能追加的新消息。
+        const old = new Set(previousMessages);
+        const appended = tab.messages.filter((m) => !old.has(m));
+        tab.messages = [...previousMessages, ...appended];
+        tab.contextSummary = previousSummary;
+        tab.undone = previousUndone;
+        tab.contextRevision = previousRevision;
         for (const { user, skip, removed } of previous) {
           if (skip === undefined) delete user.ctxSkip; else user.ctxSkip = skip;
           if (removed === undefined) delete user.ctxRemoved; else user.ctxRemoved = removed;
         }
         throw err;
       }
-      renderMessages();
+      if (deleted.size) {
+        if (deleted.has(tab.liveAssistant)) {
+          tab.liveAssistant = null;
+          tab.liveTurnId = null;
+        }
+        tab.refillFromIndex = null;
+        if (activeSession() === tab) state.refillFromIndex = null;
+      }
+      if (activeSession() === tab) renderMessages();
       return true;
     },
     onPreview: previewTurnId ? () => openContextPreview(previewTurnId) : null
@@ -4074,6 +4261,8 @@ async function persistMessages(tab) {
     workspace: tab.workspace || state.workspace,
     extraFolders: extraFoldersOf(tab),
     messages: slimMessagesForSave(tab.messages),
+    dialogRoundSeq: tab.dialogRoundSeq || 0,
+    contextRevision: tab.contextRevision || '',
     undone: tab.undone || [],
     context: tab.context || emptyContext(),
     workingMemory: tab.workingMemory || emptyWorkingMemory(),
@@ -6119,12 +6308,8 @@ function onDownloadProgress(p) {
   renderDownloadPanel(true);
 }
 
-// 主窗「开始」按钮的既有开工路径：原样搬进具名函数，小窗点「开始」时复用同一套，不另起发送逻辑
-// value 是单个 ASCII 字母（旧式 A/B）时正文保持原样写成「b 开始」；
-// value 是方案完整正文（编号式按钮带来的那套）时正文写成「就按「<正文>」这套来，开始」，正文原样嵌入不做替换；
-// value 为空就走原来的「开始」
-// value 是数组（主窗多选勾中后点「一起开工」、小窗回传多项）时，逐项编号拼成一条正文再走同一条开工流程
-// 多选的补充说明来自开工选项下面的输入框，note 为空时输出与原来一致
+// 主窗、小窗和多选开工共用此入口；显示正文保留选项及补充，授权独立放在 action 字段。
+// 复制或重新编辑这些正文再普通发送，不会继承按钮的开工授权。
 async function startGoTurn(value, note) {
   const input = $('input');
   const draft = input.value;
@@ -6139,7 +6324,7 @@ async function startGoTurn(value, note) {
       if (extra) lines.push('补充：' + extra);
       lines.push('开始');
       input.value = lines.join('\n');
-      const sending = send();
+      const sending = send({ action: 'start-work' });
       if (draft && !input.value) input.value = draft;
       await sending;
       return;
@@ -6147,7 +6332,7 @@ async function startGoTurn(value, note) {
     // 空数组没有可做的项：有补充说明就直接发补充说明，没有才退回下面「没带值」的老文案
     if (extra) {
       input.value = '补充：' + extra + '\n开始';
-      const sending = send();
+      const sending = send({ action: 'start-work' });
       if (draft && !input.value) input.value = draft;
       await sending;
       return;
@@ -6158,7 +6343,7 @@ async function startGoTurn(value, note) {
   // 没带值时若补了说明，就只按补充说明开工；v 有值时两种文案完全保持原样，不追加补充行
   if (!v && extra) input.value = '补充：' + extra + '\n开始';
   else input.value = !v ? '开始' : (/^[a-zA-Z]$/.test(v) ? v + ' 开始' : '就按「' + v + '」这套来，开始');
-  const sending = send();
+  const sending = send({ action: 'start-work' });
   if (draft && !input.value) input.value = draft;
   await sending;
 }
@@ -6702,6 +6887,20 @@ function bind() {
     openDialogMap(mapBtn.getAttribute('data-dialog-map'));
   });
   $('messages').onclick = async (e) => {
+    if (e.target.closest('[data-load-earlier]')) {
+      const tab = activeSession();
+      if (!tab) return;
+      const box = $('messages');
+      const anchor = box.querySelector('.msg[data-msg-i]');
+      const index = anchor?.dataset.msgI;
+      const top = anchor?.getBoundingClientRect().top;
+      cancelStickBottom();
+      tab._messageRenderLimit = Math.max(MESSAGE_RENDER_BATCH, tab._messageRenderLimit || 0) + MESSAGE_RENDER_BATCH;
+      renderMessages();
+      const next = index == null ? null : box.querySelector(`.msg[data-msg-i="${index}"]`);
+      if (next && top != null) box.scrollTop += next.getBoundingClientRect().top - top;
+      return;
+    }
     const ctxBtn = e.target.closest('[data-ctx-turn]');
     if (ctxBtn) {
       e.stopPropagation();
@@ -6821,13 +7020,26 @@ function bind() {
       } catch (err) {
         r = { ok: false, message: err.message || String(err) };
       }
-      m.planWritten = !!(r && r.ok);
+      // 后台按 state 讲清结果：tree=已写入并解析出条目，no-items=正文已保存但没解析出条目，
+      // no-plan=这条回复里没有【方案】段、一个字节都没写，write-failed=正文没写进去
+      // 变量名不用 state，避免和模块级 state（当前工作区等）撞名
+      const rState = String((r && r.state) || (r && (r.written || r.ok) ? 'tree' : 'write-failed'));
+      // 只有真写进方案文件（并解析出条目或至少留下正文）才算已写入，no-plan 与 write-failed 都算没写入
+      m.planWritten = rState === 'tree' || rState === 'no-items';
       m.planItems = (r && r.items) || 0;
       const bad = (r && r.mismatch) || [];
-      m.planNote = r && r.ok
-        ? [`方案文件：${r.file}`, m.planItems ? `共 ${m.planItems} 条` : '', r.merged ? `合并进 ${r.merged} 条新条目` : '', bad.length ? `有 ${bad.length} 条现状原文对不上代码（${bad.map((b) => `第 ${b.no} 条`).join('、')}），开始时不会放行` : ''].filter(Boolean).join(' · ')
-        : String((r && r.message) || '写入方案失败');
-      if (!m.planWritten) alert(`写入方案失败：${m.planNote}`);
+      const note = [`方案文件：${(r && r.file) || '（未知）'}`];
+      if (rState === 'no-plan') note.push(String((r && r.message) || '这条回复里没有【方案】段，没有写入'));
+      else if (rState === 'write-failed') note.push(String((r && r.message) || '正文没写进方案文件'));
+      else if (!m.planItems) note.push(String((r && r.message) || '正文已保存，但没解析出条目'));
+      else note.push(`共 ${m.planItems} 条`);
+      if (r && r.merged) note.push(`合并进 ${r.merged} 条新条目`);
+      if (bad.length) note.push(`有 ${bad.length} 条现状原文对不上代码（${bad.map((b) => `第 ${b.no} 条`).join('、')}），开始时不会放行`);
+      m.planNote = note.filter(Boolean).join(' · ');
+      // no-plan 和 write-failed 都是方案文件里什么都没落下，统一按写入失败提示，别告诉用户已保存
+      if (rState === 'no-plan' || rState === 'write-failed') alert(`写入方案失败：${m.planNote}`);
+      // 正文已写进文件但没解析出条目（no-items）不算写入失败：这里不再弹模态框打断用户，
+      // 只靠上面生成的 m.planNote 在消息按钮区渲染成灰字说明（渲染处自行读取 planNote）。
       await persistSession();
       repaintStartGo(m, idx, tab);
       return;

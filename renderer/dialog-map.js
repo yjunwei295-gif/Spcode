@@ -51,7 +51,7 @@
     const rounds = (opts.rounds || []).map((r) => Object.assign({}, r));
     // 暂存的勾选：改动先只影响图，点「应用」才写回
     const on = new Set(rounds.filter((r) => !r.skip).map((r) => r.n));
-    // 本趟点过删除、等「应用」才写入 ctxRemoved 的轮次
+    // 本趟点过删除、等「应用」才同时删除聊天记录的轮次
     const pendingRemove = new Set();
 
     const modal = el('div', { id: 'dialog-map-modal', className: 'map-modal' });
@@ -141,7 +141,7 @@
         hidePopover();
         refreshAll();
       };
-      const del = el('button', { textContent: text('从上下文删除', 'Remove from context') });
+      const del = el('button', { textContent: text('删除本轮对话', 'Delete this round') });
       del.style.cssText = btnCss;
       del.onclick = () => { hidePopover(); removeRounds([r.n]); };
       btns.appendChild(t);
@@ -158,7 +158,7 @@
     function removeRounds(ns) {
       const list = [...new Set(ns)].filter((n) => rounds.some((r) => r.n === n));
       if (!list.length) return;
-      if (!confirm(text(`将从上下文去掉 ${list.length} 轮，聊天记录保留。确定？`, `Remove ${list.length} round(s) from context? Chat history will be kept.`))) return;
+      if (!confirm(text(`将删除 ${list.length} 轮的用户消息、AI 回复及对应上下文，点「应用」后保存。项目文件不会回滚。确定？`, `Delete ${list.length} round(s), including user messages, AI replies and context, when you click Apply? Project files will not be reverted.`))) return;
       for (const n of list) {
         pendingRemove.add(n);
         on.delete(n);
@@ -189,7 +189,7 @@
     const node = el('div', { className: 'dialog-map-filter' });
     node.style.cssText = 'position:absolute;top:0;right:0;width:300px;height:100%;background:var(--panel-solid);border-left:1px solid var(--border);'
       + 'display:flex;flex-direction:column;z-index:3;box-shadow:var(--shadow);';
-    const hint = el('div', { textContent: text('勾选的轮次塞给 AI，没勾的不发。按住左键拖过列表可连续勾选/取消。可多选后点「删除所选」从上下文去掉（聊天保留）。点「应用」才保存；不点应用直接关掉就不改。', 'Checked rounds are sent to AI; unchecked rounds are omitted. Hold the left mouse button and drag across the list to check or uncheck multiple rounds. Select multiple rounds and choose “Delete selected” to remove them from context (chat history is kept). Changes are saved only when you click “Apply”; closing without applying discards them.') });
+    const hint = el('div', { textContent: text('勾选的轮次塞给 AI，没勾的不发。按住左键拖过列表可连续勾选/取消。可多选后点「删除所选」同时删除对应聊天记录和上下文。取消勾选仅不发给 AI，聊天仍保留。点「应用」才保存；不点应用直接关掉就不改。', 'Checked rounds are sent to AI; unchecked rounds are omitted. Hold the left mouse button and drag across the list to check or uncheck multiple rounds. Choose “Delete selected” to delete the matching chat history and context. Unchecking only excludes a round from AI context and keeps the chat. Changes are saved only when you click “Apply”; closing without applying discards them.') });
     hint.style.cssText = 'padding:8px 10px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);line-height:1.5;';
     node.appendChild(hint);
 
@@ -219,7 +219,7 @@
     const clearAll = el('button', { textContent: text('清空', 'Clear') });
     clearAll.style.cssText = btnCss;
     const delSel = el('button', { textContent: text('删除所选', 'Delete selected') });
-    delSel.title = text('把当前勾上的轮次从上下文去掉，聊天记录保留', 'Remove the checked rounds from context while keeping chat history');
+    delSel.title = text('同时删除当前勾选轮次的聊天记录和上下文', 'Delete checked rounds from both chat history and context');
     delSel.style.cssText = btnCss;
     const apply = el('button', { textContent: text('应用', 'Apply') });
     apply.style.cssText = 'margin-left:auto;border:1px solid var(--border);background:var(--primary-bg);color:var(--primary-fg);border-radius:var(--sub-r);padding:3px 10px;cursor:pointer;font-size:12px;';

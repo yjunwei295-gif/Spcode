@@ -1,6 +1,8 @@
 let locale = 'zh';
 
 const zh = {
+  loadEarlierMessages: '加载更早的消息（还有 {n} 条）',
+  historyDeleteWhileSending: '请先停止当前回复，再删除对话记录。筛选勾选仍可正常调整。',
   file: '文件', newWindow: '新窗口', openProject: '打开项目', recents: '最近打开',
   autoSave: '自动保存', settings: '设置', modelCombo: '模型组合', manageSkills: '管理技能',
   editPersona: '编辑人设', manageRules: '管理规则', exit: '退出', view: '查看',
@@ -277,6 +279,8 @@ const zh = {
 };
 
 const en = {
+  loadEarlierMessages: 'Load earlier messages ({n} remaining)',
+  historyDeleteWhileSending: 'Stop the current reply before deleting chat history. You can still change context selections.',
   file: 'File', newWindow: 'New window', openProject: 'Open project', recents: 'Recent',
   autoSave: 'Auto save', settings: 'Settings', modelCombo: 'Model combo', manageSkills: 'Skills',
   editPersona: 'Persona', manageRules: 'Rules', exit: 'Exit', view: 'View',

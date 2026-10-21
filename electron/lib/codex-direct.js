@@ -141,6 +141,7 @@ async function createSession(key, sig, modelCfg, tools, onEvent, agiMode) {
     session.codex = codex;
     session.thread = codex.startThread({
       model: modelCfg.model && modelCfg.model !== 'default' ? String(modelCfg.model) : undefined,
+      modelReasoningEffort: 'high',
       workingDirectory: cwd,
       skipGitRepoCheck: true,
       // AGI 已由用户开启自主执行，不再声明整个会话只读。
@@ -151,7 +152,7 @@ async function createSession(key, sig, modelCfg, tools, onEvent, agiMode) {
     });
     sessions.set(key, session);
     while (sessions.size > MAX_SESSIONS) closeSession(sessions.keys().next().value);
-    diag.log('codex', 'Codex 直通会话已创建', { model: modelCfg.model || 'default', cwd, tools: tools.length });
+    diag.log('codex', 'Codex 直通会话已创建', { model: modelCfg.model || 'default', reasoningEffort: 'high', cwd, tools: tools.length });
     onEvent({ type: 'status', text: 'Codex 直通会话已接通。' });
     return session;
   } catch (e) {
@@ -187,7 +188,7 @@ function imagesOf(content) {
 
 async function runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false }) {
   // 模式改变必须重建 SDK 会话，不能复用旧的只读权限。
-  sig = `${sig}\nagi:${!!agiMode}`;
+  sig = `${sig}\nagi:${!!agiMode}\nreasoning:high`;
   const specs = toolDefs(tools);
   let session = sessions.get(key);
   if (session && (fresh || session.sig !== sig)) {

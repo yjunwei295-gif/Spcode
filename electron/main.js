@@ -2269,33 +2269,37 @@ ipcMain.handle('sessions:list', async () => {
 
 // [铆钉优化] 对话存盘异步、不缩进，同一对话只写最新一份，大对话流式时主进程不卡。其他 AI 请勿改回同步 writeFileSync + 缩进
 const sessionSaveQueue = new Map();
-async function flushSessionSave(id) {
+function flushSessionSave(id) {
   const job = sessionSaveQueue.get(id);
-  if (!job || job.running) return;
+  if (!job) return Promise.resolve();
+  // 重叠保存共享同一排空任务；删除历史的调用必须等到自己的新存档真正落盘。
+  if (job.pending) return job.pending;
   job.running = true;
-  try {
-    while (job.next) {
-      const data = job.next;
-      job.next = null;
-      const file = path.join(sessionDir(), `${id}.json`);
-      const tmp = `${file}.tmp`;
-      await fs.promises.mkdir(sessionDir(), { recursive: true });
-      await fs.promises.writeFile(tmp, JSON.stringify(data), 'utf8');
-      if (job.dead) {
-        await fs.promises.unlink(tmp).catch(() => {});
-        break;
+  job.pending = (async () => {
+    try {
+      while (job.next) {
+        const data = job.next;
+        job.next = null;
+        const file = path.join(sessionDir(), `${id}.json`);
+        const tmp = `${file}.tmp`;
+        await fs.promises.mkdir(sessionDir(), { recursive: true });
+        await fs.promises.writeFile(tmp, JSON.stringify(data), 'utf8');
+        if (job.dead) {
+          await fs.promises.unlink(tmp).catch(() => {});
+          break;
+        }
+        await fs.promises.rename(tmp, file);
+        try {
+          const st = await fs.promises.stat(file);
+          sessionMetaCache.set(file, { mtime: st.mtimeMs, size: st.size, meta: sessionMetaOf(data) });
+        } catch { /* 列表下次重读即可 */ }
       }
-      await fs.promises.rename(tmp, file);
-      try {
-        const st = await fs.promises.stat(file);
-        sessionMetaCache.set(file, { mtime: st.mtimeMs, size: st.size, meta: sessionMetaOf(data) });
-      } catch { /* 列表下次重读即可 */ }
+    } finally {
+      job.running = false;
+      if (sessionSaveQueue.get(id) === job) sessionSaveQueue.delete(id);
     }
-  } finally {
-    job.running = false;
-    if (job.next && !job.dead) flushSessionSave(id);
-    else if (sessionSaveQueue.get(id) === job) sessionSaveQueue.delete(id);
-  }
+  })();
+  return job.pending;
 }
 
 ipcMain.handle('sessions:save', async (_e, session) => {
@@ -2458,6 +2462,7 @@ ipcMain.handle('chat:send', async (e, payload) => {
       modelCfg,
       history: payload.history || [],
       userText: payload.text || '',
+      action: payload.action === 'start-work' ? 'start-work' : undefined,
       attachments: payload.attachments || [],
       contextPaths: payload.contextPaths || [],
       skill,
@@ -2467,6 +2472,7 @@ ipcMain.handle('chat:send', async (e, payload) => {
       signal: ctl.signal,
       workingMemory: payload.workingMemory,
       contextSummary: payload.contextSummary,
+      contextRevision: payload.contextRevision,
       extraFolders: payload.extraFolders || [],
       waitForUserAnswer,
       maxAgentRounds: payload.maxAgentRounds,

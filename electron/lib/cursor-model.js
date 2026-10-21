@@ -8,6 +8,10 @@ const path = require('path');
 const CURSOR_PROTOCOL = 'cursor';
 const CURSOR_BASE_URL = 'cursor://sdk';
 const MAX_IMAGES = 8;
+// 缓存参数目录，避免每次规划/总结都重新请求；按登录凭据隔离。
+const modelParameterCache = new Map();
+const modelParameterPending = new Map();
+const MODEL_PARAMETER_CACHE_MS = 5 * 60 * 1000;
 
 let sdkMod = null;
 function sdk() {
@@ -91,6 +95,7 @@ async function ensureLogin(modelCfg) {
 async function listModels(modelCfg) {
   await ensureLogin(modelCfg);
   const rows = await sdk().Cursor.models.list({ apiKey: apiKeyOf(modelCfg) });
+  modelParameterCache.set(apiKeyOf(modelCfg) || '', { at: Date.now(), rows: rows || [] });
   const models = [];
   const catalog = Object.create(null);
   for (const m of rows || []) {
@@ -99,6 +104,44 @@ async function listModels(modelCfg) {
     catalog[m.id] = { id: m.id, name: m.displayName || m.id, priceText: m.displayName || '', input: null, output: null };
   }
   return { ok: true, protocol: CURSOR_PROTOCOL, models, catalog, balance: { available: false } };
+}
+
+/** 只使用厂商目录声明的高档推理参数；不猜测参数名，也不更换用户所选模型。 */
+async function highModelSelection(modelCfg) {
+  const key = apiKeyOf(modelCfg) || '';
+  let cached = modelParameterCache.get(key);
+  if (!cached || Date.now() - cached.at > MODEL_PARAMETER_CACHE_MS) {
+    if (!modelParameterPending.has(key)) {
+      const pending = listModels(modelCfg).finally(() => modelParameterPending.delete(key));
+      modelParameterPending.set(key, pending);
+    }
+    await modelParameterPending.get(key);
+    cached = modelParameterCache.get(key);
+  }
+  const id = String(modelCfg?.model || 'default');
+  const row = cached.rows.find((m) => m.id === id || m.aliases?.includes(id));
+  const params = [];
+  for (const param of row?.parameters || []) {
+    if (!/reason|think|effort|推理|思考/i.test(`${param.id} ${param.displayName || ''}`)) continue;
+    const high = param.values?.find((v) => /^(high|高|高档|高强度)$/i.test(String(v.value)))
+      || param.values?.find((v) => /^(high|高|高档|高强度)$/i.test(String(v.displayName || '')));
+    // 仅有思考开关的模型，使用厂商声明的开启值。
+    const enabled = !high && /think|思考/i.test(`${param.id} ${param.displayName || ''}`)
+      ? param.values?.find((v) => /^(enabled|on|true)$/i.test(String(v.value))) : null;
+    const choice = high || enabled;
+    if (choice) params.push({ id: param.id, value: choice.value });
+  }
+  // 有的模型只在 variants 中声明参数，仍按目录的原始 id/value 发送。
+  for (const variant of row?.variants || []) {
+    for (const param of variant.params || []) {
+      if (/reason|think|effort|推理|思考/i.test(param.id)
+        && String(param.value).toLowerCase() === 'high'
+        && !params.some((chosen) => chosen.id === param.id)) {
+        params.push({ id: param.id, value: param.value });
+      }
+    }
+  }
+  return { id, ...(params.length ? { params } : {}) };
 }
 
 function partsText(content) {
@@ -202,7 +245,7 @@ async function complete({ modelCfg, messages, tools, onDelta, onReason, signal }
   const { Agent } = sdk();
   const agent = await Agent.create({
     apiKey: apiKeyOf(modelCfg),
-    model: { id: String(modelCfg.model) },
+    model: await highModelSelection(modelCfg),
     tools: [],
     name: 'SpCode',
     local: localOptions(sandboxDir())
@@ -300,7 +343,7 @@ function warmUp(modelCfg) {
     }
     const agent = await sdk().Agent.create({
       apiKey: apiKeyOf(modelCfg),
-      model: { id: String(modelCfg?.model || 'default') },
+      model: await highModelSelection(modelCfg),
       tools: [],
       name: 'SpCode',
       local: localOptions(sandboxDir())
@@ -318,5 +361,5 @@ function warmUp(modelCfg) {
 
 module.exports = {
   CURSOR_PROTOCOL, CURSOR_BASE_URL, complete, listModels, ensureLogin, flatten, warmUp,
-  sdk, apiKeyOf, localOptions, sandboxDir, releaseAgent
+  sdk, apiKeyOf, localOptions, sandboxDir, releaseAgent, highModelSelection
 };
