@@ -60,7 +60,7 @@ function promptBlock(workspace) {
   const { pressure, violations } = read(workspace);
   if (pressure <= 0) return '';
   if (pressure >= MAX) {
-    return `\n你已被列为重点监管（偏离方案违规 ${violations} 次）。任何方案外改动都会被立即撤回并继续加罚。只做方案写明的每一步，一步都不多做，方案没点名的文件和方法一律不碰。`;
+    return `\n你已被列为重点监管（偏离方案违规 ${violations} 次）。任何方案外改动都会继续加罚并报告给用户，程序不会撤回、也不会替你还原：回滚和撤回只有用户自己能在界面上操作。只做方案写明的每一步，一步都不多做，方案没点名的文件和方法一律不碰。`;
   }
   if (pressure >= 50) {
     return `\n你已多次偏离方案（违规 ${violations} 次），处于严管期。每次 edit_file / write_file 前先核对目标文件和方法都在【已确认方案】里；不在就停手回报大脑，禁止自作主张。`;
