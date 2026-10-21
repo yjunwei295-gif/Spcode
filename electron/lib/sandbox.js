@@ -42,6 +42,20 @@ const DENY_PATTERNS = [
   /\bschtasks\b[\s\S]*\/create/i
 ];
 
+// 回滚类 git 命令：撤销、还原已经写进工作区的改动。
+// 回滚和撤回只有用户点界面上的「还原此次更改 / 还原快照」才能做，Agent 一律在这里拦死，
+// 提示词层的禁止在这里变成程序硬闸；git add / commit / push / status / diff / log 等照旧放行。
+const ROLLBACK_PATTERNS = [
+  /\bgit\s+restore\b/i,
+  /\bgit\s+checkout\s+(--|\.|HEAD\b|HEAD~)/i,
+  /\bgit\s+checkout\s+[^\s;&|]+\s+--\s/i,
+  /\bgit\s+reset\b(?!\s+(--soft|--mixed|--keep)\b)/i,
+  /\bgit\s+stash\b(?!\s+list\b)/i,
+  /\bgit\s+clean\b/i,
+  /\bgit\s+revert\b/i,
+  /\bgit\s+apply\s+(-R|--reverse)\b/i
+];
+
 // [铆钉优化] 只读命令不跑工作区全量扫描/预备份，避免 NewSlg 等大项目一跑 dir/git status 就卡死整机。其他 AI 请勿删
 function isReadonlyCommand(command) {
   const cmd = String(command || '').trim();
@@ -72,6 +86,9 @@ function denyReason(command) {
   if (cmd.length > 4000) return '命令过长';
   for (const re of DENY_PATTERNS) {
     if (re.test(cmd)) return `沙盒拒绝执行高危命令（匹配：${re}）`;
+  }
+  for (const re of ROLLBACK_PATTERNS) {
+    if (re.test(cmd)) return '沙盒拒绝回滚代码：撤销、还原、撤回改动只能由用户在界面上点「还原此次更改 / 还原快照」操作，Agent 不许执行 git restore / checkout -- / reset / stash / clean / revert';
   }
   // 禁止显式切到盘符根或用户目录外的绝对路径作为主要破坏面
   if (/(^|[;&|]\s*)(cd|Set-Location|chdir)\s+([A-Za-z]:\\|\/)(?!\S)/i.test(cmd)
