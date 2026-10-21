@@ -29,7 +29,27 @@ function countOf(hay, needle) {
 }
 
 // 字段后面紧跟的代码块；没有代码块就取到下一个字段前的文字
-const FIELD_RE = /^\s*(?:[-*]\s*)?(文件|方法|需求|现状原文|改成|验证)\s*[:：]\s*(.*)$/;
+// 字段名允许外面包粗体/斜体标记：真实回复常写成「**文件**：`a/b.cs`」，少了这一段就整份方案都认不出条目
+const FIELD_RE = /^\s*(?:[-*]\s*)?[*_]{0,2}\s*(文件|方法|需求|现状原文|改成|验证)\s*[*_]{0,2}\s*[:：]\s*(.*)$/;
+
+/**
+ * 从「文件：」字段值里取出纯路径。
+ * 真实方案常写成「**文件**：`Script/x/Foo.cs`（只改这一个文件）」，括号里的补充说明不是路径的一部分；
+ * 原样拿去拼绝对路径会带上说明文字，永远找不到文件，导图条目也就全对不上出处。
+ * @param {string} value 字段原文（可能多行，只用第一行）
+ * @returns {string} 去掉反引号、粗体标记和括号说明后的路径；认不出路径时返回清理后的原文
+ */
+function pickFileValue(value) {
+  const raw = String(value || '');
+  // 反引号包起来的路径最可靠，优先取第一段反引号内容
+  const tick = raw.match(/`([^`\n]+)`/);
+  if (tick) return tick[1].trim();
+  const first = raw.split('\n')[0].replace(/[`*]/g, '').trim();
+  // 没有反引号就取第一个带后缀的路径串，避免把「（只改这一个文件）」这类说明吃进路径
+  const hit = first.match(new RegExp('[^\\s`*（(，,；;：:]+?\\.(?:' + BULLET_EXT_RE + ')', 'i'));
+  if (hit) return hit[0];
+  return first;
+}
 function readField(lines, i) {
   const first = lines[i].match(FIELD_RE)[2].trim();
   // 值是代码块：同一行就是 ```，或者下面跳过空行后是 ```
@@ -73,7 +93,7 @@ function parseItems(text) {
     }
     const head = line.match(ITEM_HEAD_RE);
     // 编号行后面几行内有「文件：」才算条目头，防止把字段里的编号列表当成新条目
-    if (head && !inKeep && lines.slice(i + 1, i + 8).some((l) => /^\s*(?:[-*]\s*)?文件\s*[:：]/.test(l))) {
+    if (head && !inKeep && lines.slice(i + 1, i + 8).some((l) => { const f = l.match(FIELD_RE); return !!(f && f[1] === '文件'); })) {
       cur = { no: Number(head[1]), title: head[2].replace(/[*#]/g, '').trim(), file: '', method: '', requirement: '', before: '', beforeIsCode: false, after: '', afterIsCode: false, verify: '' };
       items.push(cur);
       i++;
@@ -85,9 +105,8 @@ function parseItems(text) {
       const f = readField(lines, i);
       if (name === '文件') {
         // 「a/b.cs（新建）」这类括号说明不是路径的一部分，去掉后记成新建文件
-        let file = f.value.split('\n')[0].replace(/[`*]/g, '').trim();
-        const note = file.match(NEW_NOTE_RE);
-        if (note) { file = file.slice(0, note.index).trim(); cur.newFile = true; }
+        const file = pickFileValue(f.value);
+        if (NEW_NOTE_RE.test(f.value.split('\n')[0].replace(/[`*]/g, '').trim())) cur.newFile = true;
         cur.file = file;
       }
       else if (name === '方法') cur.method = f.value.split('\n')[0].replace(/[`*]/g, '').trim();
@@ -101,13 +120,18 @@ function parseItems(text) {
     i++;
   }
   const good = items.filter((it) => it.file);
-  // 只兜底无编号头、只在标准格式零命中时触发：字段块 → 列表格式 → 章节标题式，逐级尝试
+  // 只兜底无编号头、只在标准格式零命中时触发：单文件分条 → 字段块 → 列表格式 → 章节标题式 → 整份兜底，逐级尝试。
+  // 最后一级保证「方案文件里有正文」就一定出得了导图：宁可整份当一条，也不给用户弹「没解析出条目」。
   if (!good.length) {
+    const single = parseSingleFileItems(text, keep.join('\n'));
+    if (single.ok) return single;
     const loose = parseLooseItems(text, keep.join('\n'));
     if (loose.ok) return loose;
     const bullets = parseFileBullets(text);
     if (bullets.ok) return bullets;
-    return parseFileSections(text);
+    const sections = parseFileSections(text);
+    if (sections.ok) return sections;
+    return parseWholePlan(text);
   }
   return { items: good, keep: keep.join('\n'), ok: good.length > 0 };
 }
@@ -153,9 +177,8 @@ function parseLooseItems(text, keepText) {
       // 「文件：」既是字段也是条目起点，编号按已拆出的条数往后排
       cur = { no: items.length + 1, title: '', file: '', method: '', requirement: '', before: '', beforeIsCode: false, after: '', afterIsCode: false, verify: '' };
       // 「a/b.cs（新建）」这类括号说明不是路径的一部分，去掉后记成新建文件
-      let file = f.value.split('\n')[0].replace(/[`*]/g, '').trim();
-      const note = file.match(NEW_NOTE_RE);
-      if (note) { file = file.slice(0, note.index).trim(); cur.newFile = true; }
+      const file = pickFileValue(f.value);
+      if (NEW_NOTE_RE.test(f.value.split('\n')[0].replace(/[`*]/g, '').trim())) cur.newFile = true;
       cur.file = file;
       // 导图条目文件夹名不能为空，标题取文件路径最后一段
       const segs = file.split(/[\\/]/);
@@ -330,6 +353,120 @@ function parseFileSections(text) {
     if (items[i].file) good.push(items[i]);
   }
   return { items: good, keep: keep.join('\n').trim(), ok: good.length > 0 };
+}
+
+/**
+ * 单文件多条目式方案：整份方案只改一个文件，正文先写一行「文件：」点名它，
+ * 再用「1. 方法 xxx（行号），说明」这类编号小标题把各处改动分条列出。
+ * 这是真实回复里最常见的写法之一（一个文件、多处改），而前几路解析器都要求每条自己带「文件：」，
+ * 认不出共享文件就整份方案报「没解析出条目」、方案导图打不开。这一级把顶上的文件分给每个编号小标题。
+ * @param {string} text 整段方案正文
+ * @param {string} keepText parseItems 已经收到的「不动范围」原文；没收到时传空串
+ * @returns {{items: Array, keep: string, ok: boolean}} ok 要求有共享文件且至少切出一个编号小标题
+ * 副作用：无。``` 围起来的代码块里不判标题，免得把示例正文当成条目。
+ * 只由 parseItems 在标准格式零命中时调用；遇到第二个「文件：」说明是多文件方案，直接交回上一级。
+ */
+function parseSingleFileItems(text, keepText) {
+  const lines = lf(text).split('\n');
+  const items = [];
+  const keep = [];
+  const base = String(keepText || '').trim();
+  if (base) keep.push(base);
+  let sharedFile = '';   // 顶上的「文件：」点到的路径，后面每个编号小标题共用
+  let cur = null;        // 当前条目
+  let stop = false;      // 已进入「不动范围」
+  let fenced = false;    // 是否处在 ``` 代码块里
+  let verify = '';       // 整份方案的验收说明，落到每条条目上
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const isFence = /^\s*```/.test(line);
+    if (isFence) fenced = !fenced;
+    // 见到「不动范围」就封口：后面的内容只当原文保留，不再开新条目
+    if (!isFence && !fenced && KEEP_HEAD_RE.test(line)) {
+      stop = true;
+      cur = null;
+      const rest = line.replace(KEEP_HEAD_RE, '').replace(/^[\s*:：]+/, '').trim();
+      if (rest) keep.push(rest);
+      continue;
+    }
+    if (stop) {
+      if (line.trim()) keep.push(line.trim());
+      continue;
+    }
+    // 代码块里的行不判标题，内容仍属于当前条目
+    if (isFence || fenced) {
+      if (cur) cur.requirement += '\n' + line;
+      continue;
+    }
+    const field = line.match(FIELD_RE);
+    if (field && field[1] === '文件') {
+      if (!items.length && !cur) {
+        // 还没开条目时看到的「文件：」说的是「整份方案只改这一个文件」
+        sharedFile = pickFileValue(field[2].trim());
+        continue;
+      }
+      // 已经有了条目又冒出「文件：」，这是多文件方案，不归这一级管，交回上一级
+      return { items: [], keep: '', ok: false };
+    }
+    // 「验收 / 验证 / 结果区分」是整份方案的收尾说明，不属于某一条改动
+    if (/^(?:\*\*)?(?:验证|验收|结果区分)\s*[:：]/.test(line.trim())) {
+      verify = line.trim().replace(/^(?:\*\*)?(?:验证|验收|结果区分)\s*[:：]\s*/, '').trim();
+      cur = null;
+      continue;
+    }
+    const head = sharedFile ? line.match(SECTION_HEAD_RE) : null;
+    if (head) {
+      const rest = String(head[1] || '');
+      // 标题里点到的方法名作定位提示：优先反引号里的，其次「方法 xxx」后面的第一段
+      let method = '';
+      const tick = rest.match(/`([^`\n]+)`/);
+      if (tick) method = tick[1].trim();
+      if (!method) {
+        const word = rest.match(/方法\s*[:：]?\s*([\w.]+)/);
+        if (word) method = word[1];
+      }
+      // 标题正文去掉粗体、反引号和序号残留；太长就截断，导图节点和条目文件夹名都要看得清
+      const flat = rest.replace(/[*#`]/g, '').replace(/\s+/g, ' ').trim();
+      const title = (flat.length > 36 ? flat.slice(0, 36) + '…' : flat) || '改动';
+      cur = { no: items.length + 1, title, file: sharedFile, method, requirement: '', before: '', beforeIsCode: false, after: '', afterIsCode: false, verify: '' };
+      items.push(cur);
+      continue;
+    }
+    // 普通行：条目开着就并进需求（保留原换行与缩进），否则留给原文
+    if (cur) {
+      cur.requirement += '\n' + line;
+      continue;
+    }
+    if (line.trim()) keep.push(line.trim());
+  }
+  const good = [];
+  for (let i = 0; i < items.length; i++) {
+    items[i].requirement = String(items[i].requirement || '').trim();
+    items[i].verify = verify;
+    good.push(items[i]);
+  }
+  return { items: good, keep: keep.join('\n').trim(), ok: good.length > 0 && !!sharedFile };
+}
+
+/**
+ * 最后一级兜底：正文有内容、但前几路都拆不出条目时，把整份正文当成一条「整份方案」条目。
+ * 用户点「方案导图」必须能看到方案内容，不能只弹一句「没解析出条目」：这条的文件取正文里
+ * 第一个带后缀的路径（正文确实没写路径就留空，导图仍能显示整份正文与提示）。
+ * @param {string} text 整段方案正文
+ * @returns {{items: Array, keep: string, ok: boolean}} 正文为空时 ok=false，其余情况给一条条目
+ */
+function parseWholePlan(text) {
+  const body = lf(text).trim();
+  if (!body) return { items: [], keep: '', ok: false };
+  const hit = body.match(new RegExp('[^\\s`*（(，,；;：:]+?\\.(?:' + BULLET_EXT_RE + ')', 'i'));
+  const file = hit ? hit[0] : '';
+  const segs = file.split(/[\\/]/);
+  const title = file ? String(segs[segs.length - 1] || file).trim().slice(0, 40) : '整份方案';
+  return {
+    items: [{ no: 1, title, file, method: '', requirement: body, before: '', beforeIsCode: false, after: '', afterIsCode: false, verify: '' }],
+    keep: '',
+    ok: true
+  };
 }
 
 const NEW_NOTE_RE = /\s*[(（【\[][^()（）【】\[\]]*(?:新建|新增|新文件)[^()（）【】\[\]]*[)）】\]]\s*$/;
