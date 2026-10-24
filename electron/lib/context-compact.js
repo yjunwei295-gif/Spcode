@@ -194,6 +194,33 @@ function indexTextOf(older) {
   return out.join('\n');
 }
 
+/**
+ * 把历史拆成「最近一轮」和「更早的所有消息」两段。
+ * 用途：需要保留最新一轮原文、只把更早轮次交给索引或 dialog_lookup 时使用。
+ * @param {Array} history 消息列表；每条可带 round 轮次编号，没带则按用户消息出现次数兜底（与 roundsOf 一致）
+ * @returns {{latest: Array, older: Array}} latest 为轮次编号等于最大轮次的消息（保持原顺序），older 为其余消息；
+ *   history 为空时返回两个空数组。
+ * 边界：标了 skip/removed 的轮次由调用方先过滤，本函数不做过滤。
+ */
+function splitLatestRound(history) {
+  const list = Array.isArray(history) ? history : [];
+  const rounds = roundsOf(list);
+  if (!rounds.length) return { latest: [], older: [] };
+  // 轮次编号按消息顺序递增生成，列表最后一项就是最新的轮次
+  const lastRound = rounds[rounds.length - 1].round;
+  const latest = [];
+  const older = [];
+  let n = 0;
+  for (const m of list) {
+    if (m && m.role === 'user') n += 1;
+    // 与 roundsOf 的兜底规则保持一致，否则没带 round 的消息会被全部判成「更早」
+    const round = Number(m && m.round) || n || 1;
+    if (round === lastRound) latest.push(m);
+    else older.push(m);
+  }
+  return { latest, older };
+}
+
 // 本地裁历史：只留最近几轮全文，更早的轮次换成对话索引。不调模型，避免再等一轮。
 function trimHistoryLocal(history, contextSummary) {
   const { older, keep } = splitHistory(history);
@@ -236,9 +263,10 @@ function titleIndexOf(history) {
 function formatIndexForPrompt(indexText, { english = false } = {}) {
   const s = String(indexText || '').trim();
   if (!s) return '';
+  // 提示词只让模型去查「不在手里的更早轮次」，避免它重复查已经带全文的最近一轮
   return english
-    ? `## Conversation index\nPrevious rounds are NOT included in the messages; only their titles are listed here, one per line: #id title. When you need what was said in a round (including the latest one), call dialog_lookup with the id first; never guess from the title. Rounds the user marked as not applicable are removed; do not bring them up.\n${s}`
-    : `## 对话索引\n之前的对话不在消息里，这里只列每轮标题，每行一轮：#编号 标题。需要某一轮说了什么（包括最近一轮）就先用 dialog_lookup 传编号查原文，禁止凭标题猜。用户标了不适用的轮次已经去掉，不要提起。\n${s}`;
+    ? `## Conversation index\nLatest round is already included in full; only titles of earlier rounds are listed here, one per line: #id title. For anything said in an earlier round, call dialog_lookup with the id first; never guess from the title. Rounds the user marked as not applicable are removed; do not bring them up.\n${s}`
+    : `## 对话索引\n最新一轮已带全文；这里只列更早轮次的标题，每行一轮：#编号 标题。更早的轮次要原文就先用 dialog_lookup 传编号查，禁止凭标题猜。用户标了不适用的轮次已经去掉，不要提起。\n${s}`;
 }
 
 function replaceFullBlock(text, filePath) {
@@ -655,6 +683,7 @@ module.exports = {
   formatIndexForPrompt,
   titleIndexOf,
   roundsOf,
+  splitLatestRound,
   isContextOverflowError,
   pickSummaryCfg
 };

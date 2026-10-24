@@ -12,6 +12,13 @@ using System.Runtime.InteropServices;
 public class DeskHand {
   [StructLayout(LayoutKind.Sequential)]
   public struct POINT { public int X; public int Y; }
+  // 前台窗口物理坐标，供后台请求检测只裁剪当前窗口。
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+  // 所属显示器的物理边界，与客户区使用同一 Win32 坐标系，供截图按实际尺寸缩放。
+  [StructLayout(LayoutKind.Sequential)]
+  public struct MONITORINFO { public uint cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags; }
+  public const uint MONITOR_DEFAULTTONULL = 0;
   [StructLayout(LayoutKind.Sequential)]
   public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
   [StructLayout(LayoutKind.Sequential)]
@@ -28,6 +35,10 @@ public class DeskHand {
   [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern short VkKeyScanW(char ch);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT rect);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT point);
+  [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
@@ -372,7 +383,28 @@ while ($true) {
       $h = [DeskHand]::GetForegroundWindow()
       $procId = [uint32]0
       [DeskHand]::GetWindowThreadProcessId($h, [ref]$procId) | Out-Null
-      Send-Obj @{ ok = $true; hwnd = [string]$h.ToInt64(); pid = [int]$procId }
+      # 前台窗口信息只用于本地屏幕接单裁剪，不向聊天模型发送窗口截图。
+      $rect = New-Object DeskHand+RECT
+      # 客户区不含透明阴影与标题栏，后方动画不会导致请求 OCR 缓存失效。
+      if (-not [DeskHand]::GetClientRect($h, [ref]$rect)) { throw "Cannot read foreground client bounds" }
+      # 在已启用的逐屏 DPI 感知上下文中转换两个角，不能把客户区宽高直接加到屏幕坐标上。
+      $origin = New-Object DeskHand+POINT
+      $origin.X = $rect.Left
+      $origin.Y = $rect.Top
+      $extent = New-Object DeskHand+POINT
+      $extent.X = $rect.Right
+      $extent.Y = $rect.Bottom
+      if (-not [DeskHand]::ClientToScreen($h, [ref]$origin)) { throw "Cannot locate foreground client origin" }
+      if (-not [DeskHand]::ClientToScreen($h, [ref]$extent)) { throw "Cannot locate foreground client extent" }
+      # 显示器边界与客户区来自同一物理坐标系；裁剪不依赖 Electron 的 DIP 尺寸或缩放档位。
+      $monitorHandle = [DeskHand]::MonitorFromWindow($h, [DeskHand]::MONITOR_DEFAULTTONULL)
+      $monitorInfo = New-Object DeskHand+MONITORINFO
+      $monitorInfo.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($monitorInfo)
+      if (-not [DeskHand]::GetMonitorInfo($monitorHandle, [ref]$monitorInfo)) { throw "Cannot read foreground monitor bounds" }
+      $caption = New-Object System.Text.StringBuilder 1024
+      [DeskHand]::GetWindowText($h, $caption, $caption.Capacity) | Out-Null
+      $foregroundProc = Get-Process -Id $procId -ErrorAction Stop
+      Send-Obj @{ ok = $true; hwnd = [string]$h.ToInt64(); pid = [int]$procId; title = $caption.ToString(); proc = $foregroundProc.ProcessName; left = $origin.X; top = $origin.Y; right = $extent.X; bottom = $extent.Y; monitor = @{ left = $monitorInfo.rcMonitor.Left; top = $monitorInfo.rcMonitor.Top; right = $monitorInfo.rcMonitor.Right; bottom = $monitorInfo.rcMonitor.Bottom } }
       continue
     }
     if ($op -eq "focus") {

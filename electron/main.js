@@ -6,6 +6,9 @@ const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
 const store = require('./lib/store');
+const { mergeCatalogEdits } = require('./lib/model-catalog');
+// 每个渲染窗口保留它最后收到的目录快照，用来区分用户编辑和过期的本地副本。
+const modelCatalogBySender = new WeakMap();
 const snapshot = require('./lib/snapshot');
 const agent = require('./lib/agent');
 const skillsLib = require('./lib/skills');
@@ -28,6 +31,8 @@ const codeIndex = require('./lib/code-index');
 const codeEmbed = require('./lib/code-embed');
 const desktopHand = require('./lib/desktop-hand');
 const contextPreview = require('./lib/context-preview');
+// 发送前预览：只读拼一遍本轮 system 文本给预览面板，模块内不发模型请求、不写盘
+const promptPreview = require('./lib/prompt-preview');
 const { createFloatBar } = require('./lib/float-bar');
 const { parseAttachment, isDocumentExt } = require('./lib/media');
 // 文件树、@ 搜索、预览都走这里。漏导入时列目录会抛错，侧栏被收成空目录
@@ -80,6 +85,65 @@ const abortByWin = new WeakMap();
 /** win -> Map(turnId, { resolve, reject, ask }) */
 const pendingAskByWin = new WeakMap();
 const watchByWin = new WeakMap();
+
+/** AGI 后台接单只属于开启它的窗口和会话；回执防止无效会话吞掉请求。 */
+let screenWatchOwner = null;
+let screenWatchDelivery = null;
+let screenRequestSeq = 0;
+const screenWatcher = require('./lib/agi-screen-watch').createScreenWatcher({
+  observe: observeScreenRequest,
+  ready: screenRequestReady,
+  deliver: deliverScreenRequest,
+  interval: screenRequestInterval,
+  onError: screenRequestError
+});
+
+/** 沿用桌面资源档位间隔，空闲等待不产生任何模型请求。 */
+function screenRequestInterval() { return require('./lib/agi-throttle').profile().minGapMs; }
+/** 调用独立的前台裁剪 OCR，不刷新工具操作中的坐标帧。 */
+function observeScreenRequest() { return require('./lib/screen-text-map').observeForegroundRequest(); }
+/** 有轮次运行、会话切换或窗口失效时暂停，避免抢正在执行的任务。 */
+function screenRequestReady() {
+  const owner = screenWatchOwner;
+  if (!owner || owner.win.isDestroyed() || !desktopHand.isAlive() || desktopHand.isBusy()) return false;
+  if (lastTabIdByWin.get(owner.win) !== owner.tabId || !workspaceByWin.get(owner.win)) return false;
+  for (const turns of runningByWin.values()) if (turns.size) return false;
+  return true;
+}
+/** 识别错误在界面和诊断日志中明确展示；不把错误当作需求提交给模型。 */
+function screenRequestError(error) {
+  diag.log('desktop', 'AGI 后台接单已停止', { message: error.message });
+  if (screenWatchOwner && !screenWatchOwner.win.isDestroyed()) {
+    sendTo(screenWatchOwner.win, 'desktop:screen-status', '后台接单已停止：' + error.message);
+  }
+}
+/** 投递一条屏幕需求；等待渲染层入队确认，不触碰输入框里的草稿。 */
+function deliverScreenRequest(request) {
+  const owner = screenWatchOwner;
+  if (!screenRequestReady()) return Promise.resolve(false);
+  function accepted(resolve) {
+    const id = ++screenRequestSeq;
+    screenWatchDelivery = { id, win: owner.win, resolve };
+    sendTo(owner.win, 'chat:screen-request', { id, tabId: owner.tabId,
+      text: request.text, source: request.source });
+  }
+  return new Promise(accepted);
+}
+/** 停止后台观察并结束尚未交付的回执等待；在途 OCR 不再触发任务。 */
+function stopScreenRequests() {
+  screenWatcher.stop();
+  if (screenWatchDelivery) {
+    screenWatchDelivery.resolve(false);
+    screenWatchDelivery = null;
+  }
+  screenWatchOwner = null;
+}
+/** 绑定开启 AGI 的确切会话，不猜测其它窗口或其它项目。 */
+function startScreenRequests(win, tabId) {
+  stopScreenRequests();
+  screenWatchOwner = { win, tabId };
+  screenWatcher.start(makeSessionKey(win, tabId));
+}
 
 function abortMap(win) {
   let m = abortByWin.get(win);
@@ -344,12 +408,13 @@ function handleFloatBarSend(payload) {
       diag.log('floatbar', '插话失败', { message: e && e.message });
     }
     if (pushed) {
-      broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '已插话，下一轮就能读到' });
+      // 已投递的插话也交给绑定会话记入历史；只登记，不经过 send 再次投递或覆盖当前草稿。
+      sendTo(target, 'chat:float-user-message', { tabId: key.slice(key.indexOf(':') + 1), text: msg, interjection: true });
+      broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '插话已接收，将在当前工具或模型请求结束后优先处理' });
       return;
     }
-    // AGI 没开：插话不成立，这条改成排队——本轮跑完再发。
-    // 只提示一句，然后借主窗现有的 send() 走它自己的排队流程，不另起队列
-    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: 'AGI 没开，这条先排队，这一轮跑完就发' });
+    // AGI 关闭或大脑已进入收尾时，交给主窗队列，不能报告为已插话后丢掉。
+    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '当前无法插话，这条已交给主窗排队' });
     sendTo(target, 'chat:float-user-message', { text: msg, attachments: attList });
     return;
   }
@@ -408,6 +473,7 @@ function createWindow() {
   workspaceByWin.set(win, '');
   win.on('closed', () => {
     diag.log('window', '窗口已关闭');
+    if (screenWatchOwner && screenWatchOwner.win === win) stopScreenRequests();
     stopWorkspaceWatch(win);
     windows.delete(win);
     // 这个窗口的身份和会话一起撤掉，免得小窗还挂着一个已经没了的会话
@@ -733,6 +799,8 @@ function registerFloatBarIpc() {
     const wid = winIdByWin.get(win);
     const title = String((payload && payload.title) || '').trim();
     lastTabIdByWin.set(win, tabId);
+    // 持久化的 AGI 开关开启时，等真实会话恢复完成再绑定后台接单。
+    if (!screenWatchOwner && store.load().desktopAlive) startScreenRequests(win, tabId);
     lastActiveKey = key;
     sessionsByKey.set(key, `窗口${wid} · ${title || '对话'}`);
     // 只有主窗真的开工（active=true）才把绑定切过来；单纯切标签只更新会话清单，不抢绑定
@@ -1128,6 +1196,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   diag.log('app', '所有窗口已关闭');
+  stopScreenRequests();
   desktopHand.setAlive(false);
   if (process.platform !== 'darwin') app.quit();
 });
@@ -1147,6 +1216,7 @@ function modelsDirOf(s) {
 ipcMain.handle('app:state', async (e) => {
   const win = getWin(e);
   const s = settingsWithTheme();
+  modelCatalogBySender.set(e.sender, structuredClone({ models: s.models, providers: s.providers }));
   const modelsDir = modelsDirOf(s);
   return {
     ...s,
@@ -1240,10 +1310,21 @@ ipcMain.handle('chain:tree', (e, payload) => {
   return agent.readChainMap({ workspace: ws, tabId: String(payload?.tabId || ''), turnId: String(payload?.turnId || '') });
 });
 
-// 删除方案条目：仅未锁定条目可删除（锁定语义由 agent.removePlanItem 内部判断），删除后返回 {ok, locked/notFound/map}
+// 删除方案条目：删除是用户自己的操作，方案锁不拦用户，删除后返回 {ok, notFound/map}
 ipcMain.handle('plan:remove', (e, payload) => {
   const ws = String(payload?.workspace || workspaceByWin.get(getWin(e)) || '');
   return agent.removePlanItem({ workspace: ws, tabId: String(payload?.tabId || ''), no: payload?.no });
+});
+
+/**
+ * 清空整个方案导图：把 plan-tree.js 的方案文件整体清掉（走 agent.clearPlanMap）。
+ * 参数 payload：{ workspace?, tabId }；workspace 缺省时用当前窗口绑定的工作目录。
+ * 返回 agent.clearPlanMap 的结果，前端据此判断是否需要重绘空导图。
+ * 这里只做转发，不做兜底：清空失败/解析异常照常抛给前端，避免假装已清空。
+ */
+ipcMain.handle('plan:clear', (e, payload) => {
+  const ws = String(payload?.workspace || workspaceByWin.get(getWin(e)) || '');
+  return agent.clearPlanMap({ workspace: ws, tabId: String(payload?.tabId || '') });
 });
 
 ipcMain.handle('app:cursorDirect', (_e, on) => {
@@ -1253,12 +1334,22 @@ ipcMain.handle('app:cursorDirect', (_e, on) => {
   return s.cursorDirect;
 });
 
-ipcMain.handle('desktop:setAlive', (_e, on) => {
+/** AGI 开启后监听当前会话的屏幕需求，不再需要额外的“开始”操作。 */
+ipcMain.handle('desktop:setAlive', function setDesktopAlive(e, on, tabId) {
   const s = store.load();
   s.desktopAlive = !!on;
   store.save(s);
   desktopHand.setAlive(s.desktopAlive);
+  if (s.desktopAlive && tabId) startScreenRequests(getWin(e), String(tabId));
+  else stopScreenRequests();
   return s.desktopAlive;
+});
+/** 只接受接单目标窗口的回执，防止其它窗口误认领请求。 */
+ipcMain.on('desktop:screen-result', function screenRequestResult(e, id, accepted) {
+  const delivery = screenWatchDelivery;
+  if (!delivery || delivery.id !== id || delivery.win !== getWin(e)) return;
+  screenWatchDelivery = null;
+  delivery.resolve(accepted === true);
 });
 
 ipcMain.handle('window:new', () => {
@@ -1514,18 +1605,23 @@ ipcMain.handle('ssh:connect', async (e, profile) => {
   return { ok: false, message: result.err || 'SSH 连接失败。第一版请先同步到本地再打开。' };
 });
 
-ipcMain.handle('models:save', (_e, payload) => {
+ipcMain.handle('models:save', (e, payload) => {
   const s = store.load();
   const models = payload?.models;
   const providers = payload?.providers;
   const currentModelId = payload?.currentModelId;
+  const baseline = modelCatalogBySender.get(e.sender);
+  // 窗口通过 app:state 取得目录后才能编辑；缺少快照时拒绝整表覆盖，避免误删其他窗口的模型。
+  if (!baseline) throw new Error('模型目录尚未加载，请重新打开窗口后再保存。');
   if (Array.isArray(providers)) {
-    s.providers = providers.map(store.normalizeProvider).filter(Boolean);
+    const editedProviders = mergeCatalogEdits(s.providers, baseline.providers, providers);
+    s.providers = editedProviders.map(store.normalizeProvider).filter(Boolean);
   }
   if (Array.isArray(models)) {
+    const editedModels = mergeCatalogEdits(s.models, baseline.models, models);
     const migrated = store.migrateProvidersAndModels({
       providers: s.providers,
-      models
+      models: editedModels
     });
     s.providers = migrated.providers;
     s.models = migrated.models;
@@ -1535,6 +1631,7 @@ ipcMain.handle('models:save', (_e, payload) => {
     s.currentModelId = s.models[0]?.id || 'local-gguf';
   }
   store.save(s);
+  modelCatalogBySender.set(e.sender, structuredClone({ models: s.models, providers: s.providers }));
   syncCursorDirect();
   return { models: s.models, providers: s.providers, currentModelId: s.currentModelId };
 });
@@ -2236,6 +2333,8 @@ ipcMain.handle('paste:save', (_e, { name, mime, base64 }) => {
 
 // [铆钉优化] 对话列表按文件修改时间缓存摘要，文件没变就不再整份读、整份解析几十 MB 的对话。其他 AI 请勿去掉缓存
 const sessionMetaCache = new Map();
+// 草稿走独立小文件，打字不再经 IPC 复制和重存整份历史。
+const sessionComposers = require('./lib/session-composer').createComposerStore(sessionDir);
 function sessionMetaOf(data) {
   return {
     id: data.id,
@@ -2260,19 +2359,31 @@ ipcMain.handle('sessions:list', async () => {
       const st = await fs.promises.stat(file);
       const hit = sessionMetaCache.get(file);
       if (hit && hit.mtime === st.mtimeMs && hit.size === st.size) {
-        items.push(hit.meta);
+        items.push({ ...hit.meta });
         continue;
       }
       const data = JSON.parse(await fs.promises.readFile(file, 'utf8'));
       const meta = sessionMetaOf(data);
       sessionMetaCache.set(file, { mtime: st.mtimeMs, size: st.size, meta });
-      items.push(meta);
+      items.push({ ...meta });
     } catch {
       /* 忽略损坏会话 */
     }
   }
   for (const key of [...sessionMetaCache.keys()]) {
     if (!alive.has(key)) sessionMetaCache.delete(key);
+  }
+  // 草稿覆盖保存的输入状态；只有草稿的新对话也须在重开项目时恢复。
+  const drafts = await sessionComposers.list();
+  for (const draft of drafts) {
+    const item = items.find(function sameSession(meta) { return meta.id === draft.id; });
+    const hasComposer = sessionMetaOf(draft).hasComposer;
+    if (item) {
+      item.hasComposer = hasComposer;
+      if (draft.updatedAt > item.updatedAt) item.updatedAt = draft.updatedAt;
+    } else if (hasComposer) {
+      items.push(sessionMetaOf(draft));
+    }
   }
   items.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
   return items;
@@ -2323,11 +2434,19 @@ ipcMain.handle('sessions:save', async (_e, session) => {
     sessionSaveQueue.set(id, job);
   }
   job.next = data;
-  await flushSessionSave(id);
+  // 在完整保存入口立即登记草稿顺序，较晚到达的输入保存不得被旧正文覆盖。
+  await Promise.all([flushSessionSave(id), sessionComposers.save(data)]);
   return true;
 });
 
-ipcMain.handle('sessions:delete', (_e, id) => {
+/** 高频输入仅保存草稿；会话正文仍由原有完整保存和流式保存负责。 */
+ipcMain.handle('sessions:saveComposer', async function saveComposer(_e, draft) {
+  if (!draft || !draft.id) throw new Error('会话无效');
+  await sessionComposers.save({ ...draft, updatedAt: new Date().toISOString() });
+  return true;
+});
+
+ipcMain.handle('sessions:delete', async (_e, id) => {
   const pending = sessionSaveQueue.get(String(id));
   if (pending) {
     pending.dead = true;
@@ -2335,6 +2454,7 @@ ipcMain.handle('sessions:delete', (_e, id) => {
   }
   const p = path.join(sessionDir(), `${id}.json`);
   if (fs.existsSync(p)) fs.unlinkSync(p);
+  await sessionComposers.remove(id);
   return true;
 });
 
@@ -2342,8 +2462,14 @@ ipcMain.handle('sessions:delete', (_e, id) => {
 ipcMain.handle('sessions:load', async (_e, id) => {
   if (!id) throw new Error('会话无效');
   const p = path.join(sessionDir(), `${id}.json`);
-  if (!fs.existsSync(p)) throw new Error('会话不存在');
-  return JSON.parse(await fs.promises.readFile(p, 'utf8'));
+  const draft = await sessionComposers.load(id);
+  if (!fs.existsSync(p)) {
+    if (draft) return { ...draft, messages: [] };
+    throw new Error('会话不存在');
+  }
+  const data = JSON.parse(await fs.promises.readFile(p, 'utf8'));
+  if (draft) data.composer = draft.composer;
+  return data;
 });
 
 ipcMain.handle('sessions:rename', (_e, { id, title }) => {
@@ -2410,6 +2536,49 @@ ipcMain.handle('chat:answer', (e, payload) => handleChatAnswer(getWin(e), payloa
 
 ipcMain.handle('chat:contextPreview', (_e, turnId) => contextPreview.get(turnId));
 
+// 发送前预览：按 chat:send 同一批来源，在本地只读地把本轮要发给模型的 system 文本拼一遍。
+// 只读文件，不落盘、不发模型请求；预览面板里的改动只用于展示，不写回磁盘，也不改变真正发送的内容。
+ipcMain.handle('chat:promptPreview', (e, payload) => {
+  const win = getWin(e);
+  // 工作区与模型取值和 chat:send 完全同一口径：渲染层没上报工作区时用该窗口上次上报的
+  const ws = String(payload?.workspace || workspaceByWin.get(win) || '');
+  const s = store.load();
+  const modelCfg = store.resolveModelCfg(payload.modelId || s.currentModelId, s);
+  const order = s.skillOrder || [];
+  const skills = agent.listSkills(APP_ROOT, ws, order);
+  const allSkills = skillsLib.listDetailed(path.join(APP_ROOT, 'skills'), ws, order);
+  const rules = agent.listRules(APP_ROOT, ws);
+  // 勾中的技能按点选顺序合成一份，和 chat:send 同一算法；没上报勾选时默认 zabingsk
+  const source = Array.isArray(payload.skillIds)
+    ? payload.skillIds
+    : (payload.skillId ? [payload.skillId] : ['zabingsk']);
+  const payloadIds = [];
+  for (const id of source) {
+    const sid = String(id || '').trim();
+    if (sid && !payloadIds.includes(sid)) payloadIds.push(sid);
+  }
+  const chosen = payloadIds.map((id) => skills.find((x) => x.id === id)).filter(Boolean);
+  const skill = chosen.length
+    ? {
+      id: chosen.map((x) => x.id).join('+'),
+      name: chosen.map((x) => x.name).join(' + '),
+      body: chosen.map((x) => x.body).join('\n\n---\n\n')
+    }
+    : null;
+  // build 原样返回：system 给面板展示，editable 给面板先改，notes 标出哪些内容要到发送时才现场生成。
+  // skills / skill / rules / allSkills 一并透传，面板要按这些渲染勾选项；build 内部仍按 skillIds 自己重算同一份，结果一致。
+  return promptPreview.build({
+    ...payload,
+    appRoot: APP_ROOT,
+    workspace: ws,
+    modelCfg,
+    skills,
+    skill,
+    rules,
+    allSkills
+  });
+});
+
 ipcMain.handle('chat:send', async (e, payload) => {
   const win = getWin(e);
   const ws = String(payload?.workspace || workspaceByWin.get(win) || '');
@@ -2453,6 +2622,27 @@ ipcMain.handle('chat:send', async (e, payload) => {
     }
     : null;
   const rules = agent.listRules(APP_ROOT, ws);
+  // 预览面板里这一轮改过的内容，只作用于本次发送：用户可能在「上下文」预览里改了规则、技能和人设。
+  // 三项各自「有值才顶替」——缺失或为 null 时仍用上面从磁盘读到的原值，保证不带 sysOverrides 的常规发送完全不变；
+  // 这里只改本轮内存里的取值，不写回磁盘，下一轮仍从文件重新读取。
+  const overrides = (payload && payload.sysOverrides && typeof payload.sysOverrides === 'object') ? payload.sysOverrides : {};
+  const rulesForTurn = Array.isArray(overrides.rules) ? overrides.rules : rules;
+  // 预览面板里改过的技能正文是纯字符串（渲染层只传正文），这里补回 id 与 name，拼成 runTurn 需要的 { id, name, body }；
+  // 传对象时按原样采用；没有覆盖值（undefined / null / 空串）时沿用上面从磁盘读到的技能
+  let skillForTurn = skill;
+  if (overrides.skill && typeof overrides.skill === 'object') {
+    skillForTurn = overrides.skill;
+  } else if (typeof overrides.skill === 'string' && overrides.skill) {
+    skillForTurn = {
+      id: skill ? skill.id : '',
+      name: skill ? skill.name : '',
+      body: overrides.skill
+    };
+  }
+  // 较早摘要可以改成空串（表示本轮不带摘要），所以判 null 和 undefined，不用真假值判断
+  const summaryForTurn = overrides.summary != null ? overrides.summary : payload.contextSummary;
+  // 人设不在这里拼进提示词，交给 runTurn 的 personaOverride，那边只在非空字符串时才顶替磁盘人设
+  const personaOverride = typeof overrides.persona === 'string' ? overrides.persona : undefined;
   const waitForUserAnswer = (ask, signal) => new Promise((resolve, reject) => {
     const onAbort = () => {
       pendingAskMap(win).delete(turnId);
@@ -2476,13 +2666,17 @@ ipcMain.handle('chat:send', async (e, payload) => {
       action: payload.action === 'start-work' ? 'start-work' : undefined,
       attachments: payload.attachments || [],
       contextPaths: payload.contextPaths || [],
-      skill,
-      rules,
+      // 规则、技能用本轮取值（预览里改过时是改后的，没改过就是磁盘读到的原值）
+      skill: skillForTurn,
+      rules: rulesForTurn,
+      // 预览面板里改过的人设：runTurn 只在非空字符串时顶替磁盘人设，未改时传 undefined 走原流程
+      personaOverride,
       allSkills,
       onEvent,
       signal: ctl.signal,
       workingMemory: payload.workingMemory,
-      contextSummary: payload.contextSummary,
+      // 较早摘要同样允许预览面板改过，未改时仍是渲染层传上来的会话摘要
+      contextSummary: summaryForTurn,
       contextRevision: payload.contextRevision,
       extraFolders: payload.extraFolders || [],
       waitForUserAnswer,
@@ -2510,7 +2704,7 @@ ipcMain.handle('chat:send', async (e, payload) => {
   }
 });
 
-// 主窗运行中把这条消息插话给当前轮，下一个 round 边界生效
+// 主窗运行中接收本会话插话，由 Agent 在工具或模型请求边界优先交给 AI。
 ipcMain.handle('chat:interject', async (e, payload) => {
   const win = getWin(e);
   const text = payload && typeof payload.text === 'string' ? payload.text.trim() : '';
@@ -2519,12 +2713,11 @@ ipcMain.handle('chat:interject', async (e, payload) => {
   // 会话键算法与 chat:send 完全一致，保证主窗插话和小窗插话落进同一个桶
   const key = makeSessionKey(win, resolveTurnTabId(win, payload));
   try {
-    // AGI 关着时 pushInterjection 返回非 true：不广播「已插话」，
-    // 告诉渲染层没插上，渲染层本来就有「ok !== true → 退回排队」的分支
+    // AGI 关闭或大脑不再消费消息时明确拒收，由渲染层保留正文并排队发送。
     if (agent.pushInterjection(key, text) !== true) {
-      return { ok: false, reason: 'no-agi' };
+      return { ok: false, reason: 'not-accepting' };
     }
-    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '已插话，下一轮就能读到' });
+    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '插话已接收，将在当前工具或模型请求结束后优先处理' });
   } catch (err) {
     diag.log('floatbar', '插话失败', { message: err && err.message });
     return { ok: false, reason: 'error' };

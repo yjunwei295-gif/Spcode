@@ -9,15 +9,36 @@ const api = {
   saveProxy: (proxy) => ipcRenderer.invoke('app:proxy', proxy),
   saveCommandSandbox: (cfg) => ipcRenderer.invoke('app:commandSandbox', cfg),
   saveMaxAgentRounds: (n) => ipcRenderer.invoke('app:maxAgentRounds', n),
-  setDesktopAlive: (on) => ipcRenderer.invoke('desktop:setAlive', !!on),
+  // 开启 AGI 时同时传入用户当前选中的会话，后台接单不猜目标。
+  setDesktopAlive: function setDesktopAlive(on, tabId) { return ipcRenderer.invoke('desktop:setAlive', !!on, tabId); },
+  /** 屏幕请求只交给既有会话队列，不通过输入框模拟发送。 */
+  onScreenRequest: function onScreenRequest(cb) {
+    function receive(_event, payload) { cb(payload); }
+    ipcRenderer.on('chat:screen-request', receive);
+    return function unsubscribe() { ipcRenderer.removeListener('chat:screen-request', receive); };
+  },
+  /** 目标窗口确认是否已经入队，主进程据此登记请求去重。 */
+  screenRequestResult: function screenRequestResult(id, accepted) { ipcRenderer.send('desktop:screen-result', id, accepted); },
+  /** 后台识别失败明确反馈到 AGI 控件提示，不触发聊天模型。 */
+  onScreenRequestStatus: function onScreenRequestStatus(cb) {
+    function receive(_event, text) { cb(text); }
+    ipcRenderer.on('desktop:screen-status', receive);
+    return function unsubscribe() { ipcRenderer.removeListener('desktop:screen-status', receive); };
+  },
   setCursorDirect: (on) => ipcRenderer.invoke('app:cursorDirect', !!on),
   planWrite: (payload) => ipcRenderer.invoke('plan:write', payload),
   planTree: (payload) => ipcRenderer.invoke('plan:tree', payload),
   // 链路导图：把 { tabId, turnId } 之类参数原样转给主进程 chain:tree，
   // 由主进程解析本轮回答里的【链路】段并回传节点/边；preload 只做透传，不做任何解析或兜底
   chainTree: (p) => ipcRenderer.invoke('chain:tree', p),
+  // 提示词预览：把参数 p 原样转给主进程 chat:promptPreview，由主进程拼装并回传预览内容；
+  // preload 只做透传，不解析、不兜底（联网检索/看图/工具返回等要到真正发送时才现场生成）
+  promptPreview: (p) => ipcRenderer.invoke('chat:promptPreview', p),
   // 删除方案条目：转发到主进程 plan:remove
   planRemoveItem: (payload) => ipcRenderer.invoke('plan:remove', payload),
+  // 清空方案条目：把 payload 原样转给主进程 plan:clear，由主进程负责改写方案文件；
+  // preload 只做透传，不解析、不兜底
+  planClear: (payload) => ipcRenderer.invoke('plan:clear', payload),
   dialogIndex: (payload) => ipcRenderer.invoke('dialog:index', payload),
   newWindow: () => ipcRenderer.invoke('window:new'),
   focusWindow: () => ipcRenderer.invoke('window:focus'),
@@ -94,6 +115,8 @@ const api = {
   loadSessions: () => ipcRenderer.invoke('sessions:list'),
   loadSession: (id) => ipcRenderer.invoke('sessions:load', id),
   saveSession: (session) => ipcRenderer.invoke('sessions:save', session),
+  // 输入草稿只传少量状态，避免携带整份聊天历史。
+  saveComposer: function saveComposer(draft) { return ipcRenderer.invoke('sessions:saveComposer', draft); },
   renameSession: (id, title) => ipcRenderer.invoke('sessions:rename', { id, title }),
   deleteSession: (id) => ipcRenderer.invoke('sessions:delete', id),
 

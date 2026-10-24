@@ -266,7 +266,8 @@ function mergeRow(pieces) {
 }
 
 // 行级文字 + 中心点坐标（图内坐标，单位与屏幕 DIP 一致）
-function normalizeLines(pieces, scaleX, scaleY) {
+/** 标准读屏按指定长度整理行文字；后台接单传 Infinity 保留完整需求，禁止截半句执行。 */
+function normalizeLines(pieces, scaleX, scaleY, maxLineChars = 160) {
   const clean = [];
   for (const p of pieces || []) {
     const text = String(p.text || '').replace(/\s+/g, ' ').trim();
@@ -279,7 +280,7 @@ function normalizeLines(pieces, scaleX, scaleY) {
     clean.push({ ...p, text });
   }
   const lines = mergeRow(clean).map((p) => ({
-    text: p.text.slice(0, 160),
+    text: p.text.slice(0, maxLineChars),
     x: Math.round(((p.x0 + p.x1) / 2) * scaleX),
     y: Math.round(((p.y0 + p.y1) / 2) * scaleY),
     w: Math.max(1, Math.round((p.x1 - p.x0) * scaleX)),
@@ -430,6 +431,58 @@ function observe(opts = {}) {
   return observing;
 }
 
+/** 后台接单缓存独立于操作帧，绝不刷新正在执行桌面动作的坐标锁。 */
+let requestScreen = null;
+
+/**
+ * 只识别真实前台其它软件的可见区域，返回本地文本供“请帮我”检测。
+ * 以客户区和所属屏幕的物理边界换算实际截图像素，DIP 仅用于返回文本行的位置。
+ * 前台属于 SpCode 或任务正在运行时不截图；图像未变化时复用本地 OCR，
+ * 窗口切换期间的结果作废，整份截图和文字不主动发送聊天模型。
+ */
+async function observeForegroundRequest() {
+  const desktopHand = require('./desktop-hand');
+  const target = await desktopHand.foregroundWindow();
+  const selfProc = path.basename(process.execPath, '.exe').toLowerCase();
+  if (target.pid === process.pid || target.proc.toLowerCase() === selfProc || desktopHand.isBusy()) return null;
+  const { screen } = require('electron');
+  // Electron 的 nativeOrigin 与 Win32 均为物理屏幕坐标；不以 DIP 矩形猜测所属显示器。
+  const monitor = target.monitor;
+  const display = screen.getAllDisplays().find(function matchesPhysicalOrigin(item) {
+    return item.nativeOrigin.x === monitor.left && item.nativeOrigin.y === monitor.top;
+  });
+  await require('./agi-throttle').beforeObserve();
+  if (!desktopHand.isAlive() || desktopHand.isBusy()) return null;
+  const shot = await captureDisplay(display);
+  // 截图完成即登记观察时间，缓存复用、裁剪无效或切窗作废也遵守下一次观察间隔。
+  require('./agi-throttle').markObserved();
+  // 物理屏幕坐标直接映射到实际缩略图像素，兼容高 DPI、缩小截图与负坐标副屏。
+  const sx = shot.width / (monitor.right - monitor.left);
+  const sy = shot.height / (monitor.bottom - monitor.top);
+  const x = Math.max(0, Math.round((target.left - monitor.left) * sx));
+  const y = Math.max(0, Math.round((target.top - monitor.top) * sy));
+  const right = Math.min(shot.width, Math.round((target.right - monitor.left) * sx));
+  const bottom = Math.min(shot.height, Math.round((target.bottom - monitor.top) * sy));
+  if (right <= x || bottom <= y) return null;
+  const image = shot.image.crop({ x, y, width: right - x, height: bottom - y });
+  // 精确比较裁剪图像，细小的需求文字变化也必须重新识别。
+  const hash = require('crypto').createHash('sha256').update(image.toBitmap()).digest('hex');
+  const key = target.hwnd + ':' + target.pid + ':' + hash;
+  let lines;
+  if (requestScreen && requestScreen.key === key) {
+    lines = requestScreen.lines;
+  } else {
+    // 前台局部用一个 OCR worker 识别完整行，避免小窗口跨切片误拼，也减少后台占用。
+    const pieces = await recognize(image, 1);
+    // 文本行的位置仍用裁剪区域内的 DIP 表示，沿用后台文本结构，不作为桌面操作坐标。
+    lines = normalizeLines(pieces, shot.dipWidth / shot.width, shot.dipHeight / shot.height, Infinity);
+  }
+  const after = await desktopHand.foregroundWindow();
+  if (!desktopHand.isAlive() || desktopHand.isBusy() || after.hwnd !== target.hwnd) return null;
+  requestScreen = { key, lines };
+  return { lines, source: { title: target.title, proc: target.proc, hwnd: target.hwnd } };
+}
+
 function lastFrame() {
   return last;
 }
@@ -545,6 +598,7 @@ function applyToMessages(messages, block) {
 }
 
 function reset() {
+  requestScreen = null;
   last = null;
   observing = null;
   stopOcr();
@@ -553,5 +607,5 @@ function reset() {
 
 module.exports = {
   localTessdataPath, pickDisplay, captureDisplay, normalizeLines, observe, lastFrame, formatBlock,
-  diffFrames, currentBlock, applyToMessages, stripFromMessages, reset, stopOcr
+  diffFrames, currentBlock, applyToMessages, stripFromMessages, reset, stopOcr, observeForegroundRequest
 };

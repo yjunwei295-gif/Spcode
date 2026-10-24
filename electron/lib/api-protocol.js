@@ -115,9 +115,14 @@ function attachQuota(out, used, total) {
   return out;
 }
 
+/** 解析厂商余额响应；Kimi 使用包含代金券的 available_balance，保留零余额和欠费值。 */
 function parseBalancePayload(data) {
   if (!data || typeof data !== 'object') return null;
   const d = (data.data && typeof data.data === 'object') ? data.data : data;
+  if (d.available_balance != null && Number.isFinite(Number(d.available_balance))) {
+    const remaining = Number(d.available_balance);
+    return { available: true, text: `¥${remaining}`, remaining, currency: 'CNY' };
+  }
   const infos = data.balance_infos || d.balance_infos;
   if (Array.isArray(infos) && infos[0] && infos[0].total_balance != null) {
     const c = String(infos[0].currency || 'CNY').toUpperCase();
@@ -185,9 +190,13 @@ function quotaPairScore(p) {
   return 0;
 }
 
+/** 按已配置的厂商地址构造余额接口；Kimi 只访问其官方 users/me/balance 路径。 */
 function balanceCandidateUrls(baseUrl) {
   const origin = originOf(baseUrl);
   const root = openaiRoot(baseUrl);
+  if (/^https?:\/\/api\.moonshot\.(cn|ai)$/i.test(origin)) {
+    return [`${origin}/v1/users/me/balance`];
+  }
   const urls = [
     `${origin}/user/balance`,
     `${root}/user/info`,
@@ -675,28 +684,55 @@ function emitSseLine(s, event, onEvent) {
   return event;
 }
 
+/**
+ * 读取 SSE 响应并逐条交给 onEvent，signal 表示本次请求的停止或超时状态。
+ * 本方法独占取得的 reader，并在正常结束或解析回调失败时取消剩余数据、释放锁。
+ * 获取 reader 前遇到锁定只上报可重试错误，不操作其他持有者的 reader。
+ */
 async function readSseStream(res, { onEvent, signal, onFirst, onChunk }) {
-  const reader = res.body.getReader();
+  // 不接管其他持有者已经锁定的响应体。
+  if (!res.body) {
+    throw Object.assign(new Error('响应没有 body'), { code: 'stream_error', retryable: true });
+  }
+  if (res.body.locked) {
+    throw Object.assign(new Error('响应流已被锁定'), { code: 'stream_locked', retryable: true });
+  }
+  // 获取 reader：把原生 "ReadableStream is locked" 转换为可重试的业务错误
+  let reader;
+  try {
+    reader = res.body.getReader();
+  } catch (err) {
+    if (/ReadableStream is locked|stream is locked/i.test(String(err && err.message))) {
+      throw Object.assign(new Error('响应流已被锁定'), { code: 'stream_locked', retryable: true });
+    }
+    throw err;
+  }
   const decoder = new TextDecoder('utf-8');
   let buf = '';
-  while (true) {
-    if (signal?.aborted) throw Object.assign(new Error('已停止'), { name: 'AbortError' });
-    const { done, value } = await reader.read();
-    if (done) {
-      buf += decoder.decode();
-      if (buf.trim()) {
-        let event = '';
-        for (const line of buf.split('\n')) event = emitSseLine(line, event, onEvent);
+  try {
+    while (true) {
+      if (signal?.aborted) throw Object.assign(new Error('已停止'), { name: 'AbortError' });
+      const { done, value } = await reader.read();
+      if (done) {
+        buf += decoder.decode();
+        if (buf.trim()) {
+          let event = '';
+          for (const line of buf.split('\n')) event = emitSseLine(line, event, onEvent);
+        }
+        break;
       }
-      break;
+      onFirst?.();
+      onChunk?.();
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+      let event = '';
+      for (const line of lines) event = emitSseLine(line, event, onEvent);
     }
-    onFirst?.();
-    onChunk?.();
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() || '';
-    let event = '';
-    for (const line of lines) event = emitSseLine(line, event, onEvent);
+  } finally {
+    // 只清理本方法取得的 reader；清理失败不能覆盖原本的读取或回调异常。
+    try { await reader.cancel(); } catch { /* 忽略取消失败 */ }
+    try { reader.releaseLock(); } catch { /* 忽略释放失败 */ }
   }
 }
 
@@ -771,7 +807,7 @@ async function completeOpenAI({ modelCfg, messages, stream, tools, toolChoice, o
   const acc = { content: '', reason: '', toolCalls: [] };
   let gotFirst = false;
   await readSseStream(res, {
-    signal,
+    signal: ctl.signal,
     onFirst: () => { gotFirst = true; },
     onChunk: () => {},
     onEvent: (json) => consumeOpenAIChunk(json, acc, onDelta, onReason)
@@ -813,7 +849,7 @@ async function completeAnthropic({ modelCfg, messages, stream, tools, onDelta, o
   }
   const acc = { content: '', reason: '', toolCalls: [], _toolIndex: {} };
   await readSseStream(res, {
-    signal,
+    signal: ctl.signal,
     onEvent: (json, event) => {
       const type = json.type || event;
       const usage = wallet.parseTokenUsage(json);
@@ -889,7 +925,7 @@ async function completeGemini({ modelCfg, messages, stream, tools, onDelta, onRe
   }
   const acc = { content: '', reason: '', toolCalls: [] };
   await readSseStream(res, {
-    signal,
+    signal: ctl.signal,
     onEvent: (json) => {
       const usage = wallet.parseTokenUsage(json);
       if (usage) acc.usage = usage;

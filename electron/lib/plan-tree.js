@@ -46,7 +46,7 @@ function pickFileValue(value) {
   if (tick) return tick[1].trim();
   const first = raw.split('\n')[0].replace(/[`*]/g, '').trim();
   // 没有反引号就取第一个带后缀的路径串，避免把「（只改这一个文件）」这类说明吃进路径
-  const hit = first.match(new RegExp('[^\\s`*（(，,；;：:]+?\\.(?:' + BULLET_EXT_RE + ')', 'i'));
+  const hit = first.match(new RegExp('[^\\s`*（(，,；;：:]+?\\.(?:' + BULLET_EXT_RE + ')(?![A-Za-z0-9])', 'i'));
   if (hit) return hit[0];
   return first;
 }
@@ -203,7 +203,11 @@ function parseLooseItems(text, keepText) {
   return { items: good, keep: keep.join('\n'), ok: good.length > 0 };
 }
 
-// 列表条目认得的文件后缀；与实际方案里会点名的源码/资源类型保持一致
+// 列表条目认得的文件后缀；与实际方案里会点名的源码/资源类型保持一致。
+// 这份列表里短后缀排在长后缀前面（h 在 html 前、cs 在 css 前、js 在 json 前），而下面各处都用惰性 +?
+// 去取最短的路径串，只写 \.(?:后缀) 会把 renderer/index.html 截成 renderer/index.h、styles.css 截成 styles.cs。
+// 所以各使用处在后缀分组之后追加断言 (?![A-Za-z0-9])：扩展名后面不许紧跟字母或数字，才能认全
+// index.html、styles.css、a.json；后缀顺序本身保持不动，避免影响其它解析分支的既有行为。
 const BULLET_EXT_RE = 'cs|js|mjs|cjs|ts|tsx|jsx|vue|py|lua|java|kt|go|rs|c|cc|cpp|h|hpp|swift|json|ya?ml|xml|md|txt|css|scss|html|shader|hlsl|compute|uss|uxml|prefab|unity|asset|ps1|bat|sh';
 /**
  * 列表条目头：列表符号/序号 + 文件路径 + 分隔冒号 + 改动要求。
@@ -214,7 +218,7 @@ const BULLET_EXT_RE = 'cs|js|mjs|cjs|ts|tsx|jsx|vue|py|lua|java|kt|go|rs|c|cc|cp
 const BULLET_HEAD_RE = new RegExp(
   '^\\s*(?:[-*+]|\\d+[.、)）])\\s+' +                 // 列表符号，或「1.」「2、」这类序号
   '[`*]{0,4}' +                                       // 路径前面的反引号/粗体标记
-  '([^`\\n*]+?\\.(?:' + BULLET_EXT_RE + '))' +        // 路径本体：不含反引号和星号，免得把标记吃进路径
+  '([^`\\n*]+?\\.(?:' + BULLET_EXT_RE + ')(?![A-Za-z0-9]))' +        // 路径本体：不含反引号和星号，免得把标记吃进路径；后缀后不许紧跟字母数字，免得 a.html 被截成 a.h
   '[`*]{0,4}' +                                       // 路径后面的反引号/粗体标记
   '(?:\\s*(?:→|->)\\s*([^\\n:：]{0,120}?))?' +        // 可选：箭头右边点到的方法或范围
   '\\s*[:：]\\s*\\*{0,2}\\s*(.*)$',                    // 分隔冒号，冒号后是改动要求
@@ -275,7 +279,7 @@ const SECTION_HEAD_RE = new RegExp(
   '(.+?)\\s*$'                                                              // 标题正文
 );
 // 标题正文里第一个带后缀的路径；后缀直接沿用 BULLET_EXT_RE，保证章节标题与列表两种写法认得同一批文件类型
-const SECTION_PATH_RE = new RegExp('([^\\s`*:：，,]+?\\.(?:' + BULLET_EXT_RE + '))', 'i');
+const SECTION_PATH_RE = new RegExp('([^\\s`*:：，,]+?\\.(?:' + BULLET_EXT_RE + ')(?![A-Za-z0-9]))', 'i');
 
 /**
  * 章节标题式方案的第四级兜底：标题里点名文件，标题下面的行整段记成该条需求。
@@ -458,7 +462,7 @@ function parseSingleFileItems(text, keepText) {
 function parseWholePlan(text) {
   const body = lf(text).trim();
   if (!body) return { items: [], keep: '', ok: false };
-  const hit = body.match(new RegExp('[^\\s`*（(，,；;：:]+?\\.(?:' + BULLET_EXT_RE + ')', 'i'));
+  const hit = body.match(new RegExp('[^\\s`*（(，,；;：:]+?\\.(?:' + BULLET_EXT_RE + ')(?![A-Za-z0-9])', 'i'));
   const file = hit ? hit[0] : '';
   const segs = file.split(/[\\/]/);
   const title = file ? String(segs[segs.length - 1] || file).trim().slice(0, 40) : '整份方案';
@@ -677,6 +681,7 @@ function renumber(items) {
 
 /**
  * 有未完成旧条目时：新方案追加进去（同文件+同现状原文则更新改成/验证），已通过的保留。
+ * 同编号且同标题的旧条目即使文件路径被改过也会认回，跟着新方案更新文件路径。
  * 没有未完成旧条目时整份重建。返回的 tree.serialized 是应写入方案文件的全文。
  */
 function merge(oldTree, planText, requirement, resolve) {
@@ -693,12 +698,25 @@ function merge(oldTree, planText, requirement, resolve) {
   const done = (oldTree.items || []).filter((it) => DONE_STATUS.has(it.status)).map((it) => ({ ...it }));
   const live = pending.map((it) => ({ ...it }));
   const byKey = new Map(live.map((it) => [itemKey(it), it]));
+  // 同一条目后来改了文件路径时，itemKey（文件+现状原文+需求）会变，按 key 认不回旧条目；
+  // 再按「同编号+同标题」认一次，才能用新方案里的路径覆盖旧路径，而不是把它当成新条目追加
+  const byNo = new Map(live.map((it) => [Number(it.no) || 0, it]));
   let maxNo = Math.max(0, ...oldTree.items.map((it) => Number(it.no) || 0));
   let added = 0;
   let updated = 0;
   for (const neu of parsed.items) {
-    const hit = byKey.get(itemKey(neu));
+    let hit = byKey.get(itemKey(neu));
+    if (!hit) {
+      const sameNo = byNo.get(Number(neu.no) || 0);
+      if (sameNo && squash(sameNo.title) === squash(neu.title)) {
+        hit = sameNo;
+      }
+    }
     if (hit) {
+      // 新方案写了路径就用新路径覆盖旧路径；没写才保留旧值
+      if (neu.file) {
+        hit.file = neu.file;
+      }
       hit.after = neu.after;
       hit.afterIsCode = neu.afterIsCode;
       hit.verify = neu.verify || hit.verify;
@@ -707,12 +725,15 @@ function merge(oldTree, planText, requirement, resolve) {
       if (neu.before) { hit.before = neu.before; hit.beforeIsCode = neu.beforeIsCode; }
       hit.requirement = neu.requirement || hit.requirement;
       hit.newFile = !!neu.newFile || hit.newFile;
+      byKey.set(itemKey(hit), hit);
+      byNo.set(Number(hit.no) || 0, hit);
       updated += 1;
     } else {
       maxNo += 1;
       const copy = Object.assign({}, neu, { no: maxNo });
       live.push(copy);
       byKey.set(itemKey(copy), copy);
+      byNo.set(Number(copy.no) || 0, copy);
       added += 1;
     }
   }

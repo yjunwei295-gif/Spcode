@@ -1,4 +1,7 @@
-window.__APP_BUILD = 'v20260922d'; // 渲染层构建标记：用于诊断页面加载的是否为当前磁盘代码
+// 渲染层构建标记：用于诊断页面加载的是否为当前磁盘代码。
+// 每次改动渲染层资源（app.js / styles.css / index.html）都要 bump 这个值，
+// 否则旧页面缓存会继续跑磁盘上已经不存在的样式，排查“改了没生效”时会误判。
+window.__APP_BUILD = 'v20261024b';
 import { t, setLocale, applyDom, getLocale, isNewChatTitle } from './i18n.js';
 import { renderMarkdown } from './markdown.js';
 
@@ -133,8 +136,9 @@ function applyTheme(resolved) {
   $('status-theme').textContent = t(resolved === 'dark' ? 'themeDark' : 'themeLight');
 }
 
+/** 返回当前明确选中的模型；失效 ID 不冒充列表第一项，确保顶栏与发送目标一致。 */
 function currentModel() {
-  return state.models.find((m) => m.id === state.currentModelId) || state.models[0];
+  return state.models.find((m) => m.id === state.currentModelId);
 }
 
 function providerById(id) {
@@ -857,7 +861,12 @@ async function openProject(dir) {
   const ws = dir ? await api.setWorkspace(dir) : await api.openProject();
   if (!ws) return;
   setWorkspace(ws);
-  await refreshMeta();
+  // 同时观察两个异步任务的错误；聊天恢复不再等待侧栏资料加载完成。
+  await Promise.all([refreshMeta(), showProjectSession(ws)]);
+}
+
+/** 恢复目标项目的对话再显示输入框，避免加载过程覆盖用户新草稿。 */
+async function showProjectSession(ws) {
   const existing = state.tabs.find((t) => sameWorkspace(t.workspace, ws));
   if (existing) {
     state.activeTab = existing.id;
@@ -875,26 +884,52 @@ async function openProject(dir) {
   syncSendBtn();
 }
 
+/** 加载项目侧栏资料；独立查询并行执行，文件树使用恢复后的当前标签。 */
 async function refreshMeta() {
-  state.skills = await api.listSkills();
-  state.rules = await api.listRules();
-  state.snapshots = await api.listSnapshots();
-  try {
-    state.milestones = state.workspace ? (await api.listMilestones()) : [];
-  } catch {
-    state.milestones = [];
-  }
-  try {
-    state.globalMemory = await api.getGlobalMemory();
-  } catch {
-    state.globalMemory = null;
-  }
-  try {
-    state.snapshotMax = await api.getSnapshotMax();
-  } catch { /* 未开项目时用默认 */ }
+  const [skills, rules, snapshots, milestones, globalMemory, snapshotMax] = await Promise.all([
+    api.listSkills(),
+    api.listRules(),
+    api.listSnapshots(),
+    loadMilestones(),
+    loadGlobalMemory(),
+    loadSnapshotMax()
+  ]);
+  state.skills = skills;
+  state.rules = rules;
+  state.snapshots = snapshots;
+  state.milestones = milestones;
+  state.globalMemory = globalMemory;
+  if (snapshotMax != null) state.snapshotMax = snapshotMax;
   renderSidebar();
   await loadFileTree();
   syncAgentBtn();
+}
+
+/** 读取项目里程碑；沿用未开项目或读取失败时的现有空列表行为。 */
+async function loadMilestones() {
+  try {
+    return state.workspace ? await api.listMilestones() : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 读取全局记忆；保留原有读取失败时不显示记忆的行为。 */
+async function loadGlobalMemory() {
+  try {
+    return await api.getGlobalMemory();
+  } catch {
+    return null;
+  }
+}
+
+/** 读取快照上限；未开项目时保持内存里的现有值。 */
+async function loadSnapshotMax() {
+  try {
+    return await api.getSnapshotMax();
+  } catch {
+    return state.snapshotMax;
+  }
 }
 
 function activeSession() {
@@ -1140,20 +1175,120 @@ function collectComposer() {
   };
 }
 
+/**
+ * 取得本会话按提交顺序保存的正文列表；旧存档首次使用时从用户消息、插话及待发队列建立列表。
+ * 只读取用户输入，不包含助手回复或附件名称；同一句多次提交仍保留多条记录。
+ * @param {object} tab 会话或已加载的会话存档。
+ * @returns {string[]} 会话自己的历史列表；首次迁移会写入该会话对象。
+ */
+function submittedTextHistory(tab) {
+  if (Array.isArray(tab.submittedTextHistory)) return tab.submittedTextHistory;
+  const history = [];
+  const interjectionPrefix = '你（插话·已提交）：';
+  for (const message of tab.messages || []) {
+    let text = '';
+    if (message.role === 'user') {
+      text = typeof message.draft?.text === 'string' ? message.draft.text : message.text;
+    } else if (message.role === 'system' && message.text?.startsWith(interjectionPrefix)) {
+      text = message.text.slice(interjectionPrefix.length);
+    }
+    if (text && text.trim()) history.push(text);
+  }
+  for (const item of tab.queue || []) {
+    const text = typeof item === 'string' ? item : item.text;
+    if (text && text.trim()) history.push(text);
+  }
+  tab.submittedTextHistory = history;
+  return history;
+}
+
+/** 记录通过发送检查的原始正文并结束历史浏览；排队与插话在异步投递前调用，附件提交不新增记录。 */
+function recordSubmittedText(tab, text) {
+  if (text.trim()) submittedTextHistory(tab).push(text);
+  tab.composerHistoryIndex = null;
+  tab.composerHistoryText = null;
+}
+
+/**
+ * 将悬浮栏已经投递成功的插话记入绑定会话，保存正文历史并重绘该会话。
+ * 不触碰输入区，也不再次发送；用户切换标签后仍按载荷中的 tabId 登记。
+ */
+function receiveFloatInterjection(payload) {
+  let tab = null;
+  for (const candidate of state.tabs) {
+    if (candidate.id === payload.tabId) { tab = candidate; break; }
+  }
+  if (!tab) return;
+  recordSubmittedText(tab, payload.text);
+  tab.messages.push({ role: 'system', text: `你（插话·已提交）：${payload.text}` });
+  persistTab(tab);
+  if (isActiveTab(tab)) {
+    renderMessages();
+    scrollMessagesToBottom();
+  }
+}
+
+/**
+ * 从空输入框开始，用上键向旧记录、下键向新记录连续浏览当前会话的发送历史。
+ * 召回后仍可继续翻页；编辑了召回正文就退出浏览，保留多行光标、输入法和菜单的原生行为。
+ * @param {KeyboardEvent} event 输入框键盘事件；组合键不参与历史切换。
+ * @returns {boolean} 是否消费该按键；只恢复正文并保存草稿，不发送或恢复旧附件。
+ */
+function recallSubmittedText(event) {
+  if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return false;
+  if (event.isComposing || event.keyCode === 229) return false;
+  if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return false;
+  if (!$('slash-menu').classList.contains('hidden') || !$('at-menu').classList.contains('hidden')) return false;
+  const tab = activeSession();
+  if (!tab) return false;
+  const input = $('input');
+  if (tab.composerHistoryIndex != null && input.value !== tab.composerHistoryText) {
+    tab.composerHistoryIndex = null;
+    tab.composerHistoryText = null;
+  }
+  if (tab.composerHistoryIndex == null && (input.value !== '' || event.key === 'ArrowDown')) return false;
+  const history = submittedTextHistory(tab);
+  if (!history.length) return false;
+  const current = tab.composerHistoryIndex == null ? history.length : tab.composerHistoryIndex;
+  const next = event.key === 'ArrowUp' ? Math.max(0, current - 1) : Math.min(history.length, current + 1);
+  const text = next === history.length ? '' : history[next];
+  event.preventDefault();
+  tab.composerHistoryIndex = next === history.length ? null : next;
+  tab.composerHistoryText = text;
+  input.value = text;
+  input.setSelectionRange(text.length, text.length);
+  // 历史正文里的 / 或 @ 不是新输入，不弹出菜单，以免截断后续上下键浏览。
+  rememberComposer(tab);
+  scheduleComposerSave();
+  return true;
+}
+
 // 判断草稿是否非空（决定是否落盘）
 function hasComposerContent(c) {
   return !!(c && (c.text || (c.attachments && c.attachments.length)));
 }
 
-// 输入/附件/编辑变化时防抖保存草稿（300ms）
+// 输入/附件/编辑变化时防抖保存草稿（300ms），不遍历或传输聊天历史。
 let composerTimer = null;
 function scheduleComposerSave() {
   if (composerTimer) clearTimeout(composerTimer);
-  composerTimer = setTimeout(() => {
-    composerTimer = null;
-    const tab = activeSession();
-    if (tab) persistTab(tab);
-  }, 300);
+  composerTimer = setTimeout(saveComposerDraft, 300);
+}
+
+/** 保存当前标签的输入状态；遵守自动保存开关，空草稿也写入以清除旧内容。 */
+function saveComposerDraft() {
+  composerTimer = null;
+  const tab = activeSession();
+  if (!tab || !state.autoSave) return;
+  rememberComposer(tab);
+  // 全新空对话仍沿用完整保存，载荷很小且需保留模型、附加目录等会话设置。
+  if (!tab.messages?.length) return persistTab(tab);
+  return api.saveComposer({
+    id: tab.id,
+    title: tab.title,
+    workspace: tab.workspace || state.workspace,
+    composer: tab.composer
+  });
 }
 
 // 当前输入框只属于正在看的这个对话。发出去或删空后必须立刻改内存，
@@ -1206,14 +1341,15 @@ function slimMessagesForSave(messages) {
 function persistTab(tab, force = false) {
   if ((!state.autoSave && !force) || !tab) return Promise.resolve();
   rememberComposer(tab);
-  // 用户主动删空历史时也必须覆盖存档，避免重开会话后旧消息复活。
-  if (!tab.messages?.length && !tab.composer && !force) return Promise.resolve();
+  // 发送历史包含尚未开始的排队和插话；即使还没有消息，也须保存已经提交的正文。
+  if (!tab.messages?.length && !tab.composer && !submittedTextHistory(tab).length && !force) return Promise.resolve();
   return api.saveSession({
     id: tab.id,
     title: tab.title,
     workspace: tab.workspace || state.workspace,
     extraFolders: extraFoldersOf(tab),
     messages: slimMessagesForSave(tab.messages),
+    submittedTextHistory: submittedTextHistory(tab),
     dialogRoundSeq: tab.dialogRoundSeq || 0,
     contextRevision: tab.contextRevision || '',
     undone: tab.undone || [],
@@ -1252,6 +1388,10 @@ function hydrateTab(data, fallbackWs) {
     id: data.id,
     title: data.title || t('unnamed'),
     messages: settleDeadTurns(data.messages),
+    submittedTextHistory: [...submittedTextHistory(data)],
+    // 浏览位置只属于当前界面，不持久化；重开后从最近提交的记录开始。
+    composerHistoryIndex: null,
+    composerHistoryText: null,
     dialogRoundSeq: data.dialogRoundSeq || 0,
     contextRevision: data.contextRevision || '',
     workspace: data.workspace || fallbackWs || state.workspace,
@@ -2377,17 +2517,21 @@ function cancelReveal(msg) {
   msg._revealTimeout = null;
 }
 
+/**
+ * 把消息当前的已显示长度画进气泡，供打字机逐帧调用。
+ * 高频路径：每帧可能执行一次，内部只做 DOM 写入与必要的贴底滚动，不做日志/诊断上报。
+ * @param {object} msg 消息对象，使用 text、revealLen 字段。
+ * @param {boolean} done true 表示流式结束，改用 Markdown 渲染整段文本；false 时按 revealLen 截断为纯文本。
+ * @returns {boolean} 找到并绘制了对应气泡返回 true；消息不在当前会话或气泡节点缺失返回 false（调用方据此走兜底补满）。
+ * 副作用：切换 bubble 的 typewriter/md 类名、写 textContent 或 innerHTML、在贴底时调整消息区滚动位置。
+ */
 function paintRevealBubble(msg, done) {
   const tab = activeSession();
   const idx = tab ? tab.messages.indexOf(msg) : -1;
   if (idx < 0) return false;
+  // 说明：这里处于打字机的高频绘制路径（每帧都会调用），不做逐帧日志/诊断上报，
+  // 否则日志文件每秒会被刷几十行并拖高 CPU；确需排查时请只在回合起止处记录一次。
   const el = document.querySelector(`.msg.assistant[data-msg-i="${idx}"] .bubble`);
-  logSummaryTrace('打字机刷新总结文本', tab, msg, {
-    msgIndex: idx,
-    renderTargetFound: !!el,
-    renderingMode: done ? 'markdown-final' : 'typewriter',
-    renderedLength: done ? String(msg.text || '').length : String(msg.text || '').slice(0, msg.revealLen || 0).length
-  });
   if (!el) return false;
   const box = $('messages');
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 96;
@@ -2402,18 +2546,6 @@ function paintRevealBubble(msg, done) {
     el.textContent = (msg.text || '').slice(0, msg.revealLen || 0);
   }
   if (nearBottom) box.scrollTop = box.scrollHeight;
-  // 诊断：气泡实际写进 DOM 的文本长度与滚动位置，判断“已渲染但看不见”（只记元数据）
-  if (api.reportError) {
-    const elRect = el.getBoundingClientRect();
-    const boxRect = box.getBoundingClientRect();
-    api.reportError('[总结气泡诊断]', {
-      msgIndex: idx, done: !!done, textLength: String(msg.text || '').length,
-      revealLen: Number(msg.revealLen || 0), domTextLength: String(el.textContent || '').length,
-      nearBottom: nearBottom, scrollTop: Math.round(box.scrollTop),
-      scrollHeight: box.scrollHeight, clientHeight: box.clientHeight,
-      visibleInViewport: elRect.top < boxRect.bottom && elRect.bottom > boxRect.top
-    });
-  }
   return true;
 }
 
@@ -2488,6 +2620,7 @@ function revealRest(msg) {
   msg._revealRaf = requestAnimationFrame(step);
 }
 
+/** 推进当前回复的文字显示；追上已收到正文后停止帧循环，新片段到达时再启动。 */
 function ensureTypewriter() {
   const tab = activeSession();
   const last = tab?.liveAssistant;
@@ -2497,7 +2630,7 @@ function ensureTypewriter() {
     return;
   }
   if (state.typewriterRaf) return;
-  const tick = () => {
+  function tick() {
     const cur = activeSession()?.liveAssistant;
     if (!cur || cur.typewriterDone || revealingMsgs.has(cur)) {
       state.typewriterRaf = null;
@@ -2508,14 +2641,15 @@ function ensureTypewriter() {
     const behind = fullLen - revealed;
     if (behind > 0) {
       cur.revealLen = Math.min(fullLen, revealed + typeStep(behind));
-      paintLiveAssistant();
+      // 每帧只写气泡，思考区、模型栏与用量由低频事件刷新。
+      if (!paintRevealBubble(cur, false)) paintLiveAssistant();
     }
-    if ((cur.revealLen || 0) < fullLen || (isTabSending(activeSession()) && cur === activeSession()?.liveAssistant && !cur.typewriterDone)) {
+    if ((cur.revealLen || 0) < fullLen) {
       state.typewriterRaf = requestAnimationFrame(tick);
     } else {
       state.typewriterRaf = null;
     }
-  };
+  }
   state.typewriterRaf = requestAnimationFrame(tick);
 }
 
@@ -2714,13 +2848,12 @@ async function openPlanMap(tab, m) {
   if (map && map.state && map.state !== 'tree') {
     const cached = m && m.planMap;
     if (!(cached && Array.isArray(cached.nodes) && cached.nodes.length > 1)) {
-      // 空态仍走导图弹层（浏览器模态框会打断界面）：emptyText 说明原因，locked=false 因为没有可删条目
+      // 空态仍走导图弹层（浏览器模态框会打断界面）：emptyText 说明原因，没有条目就没有可删的东西
       window.PlanMap.open({
         title: tab.title || '',
         emptyText: planMapEmptyText(map),
         workspace: tab.workspace || state.workspace,
-        tabId: String(tab.id),
-        locked: false
+        tabId: String(tab.id)
       });
       return;
     }
@@ -2733,18 +2866,26 @@ async function openPlanMap(tab, m) {
       title: tab.title || '',
       emptyText: '没有方案条目：方案文件已收尾或还没写入方案',
       workspace: tab.workspace || state.workspace,
-      tabId: String(tab.id),
-      locked: false
+      tabId: String(tab.id)
     });
     return;
   }
-  // 传 workspace 与 tabId，删除条目时前端才有定位参数可用；locked 决定导图里删除按钮是否可点
+  // 「清理导图」成功后把本标签页【所有】消息上的导图缓存置空并落盘：
+  // 否则旧消息再点「方案导图」还会用 m.planMap 把已删掉的图重画出来；置空后只会进 no-file 空态。
+  const onCleared = () => {
+    for (const msg of tab.messages || []) {
+      if (msg && msg.planMap) msg.planMap = null;
+    }
+    // 落盘失败不影响界面已经清空的内存缓存，这里只吞掉异常，避免未处理的 Promise 报错
+    persistTab(tab).catch(() => {});
+  };
+  // 传 workspace 与 tabId，删除条目时前端才有定位参数可用；onCleared 只在弹层真正清空成功并关闭后回调
   window.PlanMap.open({
     title: tab.title || '',
     map,
     workspace: tab.workspace || state.workspace,
     tabId: String(tab.id),
-    locked: !!(map && map.locked)
+    onCleared
   });
 }
 
@@ -2883,12 +3024,7 @@ function paintLiveAssistant() {
   if (last.text) {
     let bubble = el.querySelector('.bubble');
     const typing = isAssistantTyping(last);
-    logSummaryTrace('实时渲染总结文本', tab, last, {
-      msgIndex: tab.messages.indexOf(last),
-      renderTargetFound: !!bubble,
-      renderingMode: typing ? 'typewriter' : 'markdown',
-      renderedLength: typing ? String(last.text || '').slice(0, last.revealLen || 0).length : String(last.text || '').length
-    });
+    // 绘制路径不发诊断 IPC；接收片段和回合完成处已记录链路信息。
     if (!bubble) {
       bubble = document.createElement('div');
       bubble.className = 'bubble';
@@ -3193,9 +3329,9 @@ async function selectLocalGguf(name) {
   }
   const _t = activeSession(); if (_t) _t.modelId = local.id;
   state.currentModelId = local.id;
-  await api.saveModels(state.models, local.id, state.providers);
+  // 与 API 模型共用保存入口，接回其他窗口新增的目录，保持下次编辑使用的快照一致。
+  await persistModels(local.id);
   renderModelMenu();
-  refreshQuotaBar();
 }
 
 function roleLabel(roleId) {
@@ -3795,6 +3931,11 @@ function restoreStoppedDraft(tab, assistant) {
   }
 }
 
+/**
+ * 发送指定会话队列中的一条任务并维护回复状态。
+ * draft 是入队时的独立载荷；屏幕任务只消费自身内容，保留手动草稿与附件，停止时也不覆盖输入框。
+ * 返回是否中止当前队列，发送、快照和验收沿用现有 chatSend 链路。
+ */
 async function sendOne(tab, text, draft) {
   if (!tab) return true;
   tab.undone = [];
@@ -3867,6 +4008,10 @@ async function sendOne(tab, text, draft) {
     _enterAnim: !prefersReducedMotion()
   };
   tab.messages.push(assistant);
+  // 预览面板里改过人设 / 规则正文 / 技能正文时，把覆盖值带上这一轮请求；
+  // 没改过就是 null，payload 里连字段都不出现，行为与原来完全一致
+  // 后台屏幕任务不消费用户为未发送消息准备的提示词覆盖。
+  const sysOverrides = draft.source === 'screen' ? null : (state.promptOverrides || null);
   const payload = {
     text,
     action: draft.action === 'start-work' ? 'start-work' : undefined,
@@ -3884,18 +4029,25 @@ async function sendOne(tab, text, draft) {
     turnId,
     maxAgentRounds: roundsOf(tab),
     unlimitedRounds: !!tab.unlimitedRounds,
+    // 预览面板的覆盖值：有改动才带上这个字段，没有就整条字段不出现（不做默认值兜底）
+    ...(sysOverrides ? { sysOverrides } : {}),
     // 上报当前标签 id，主进程用它拼会话键，小窗按会话键精确匹配事件；缺失会导致小窗收不到事件
     tabId: String(tab.id || '')
   };
-  tab.context = {
-    skillId: skillIds[0] || null,
-    skillIds,
-    contextPaths: [...(draft.contextPaths || [])],
-    attachments: []
-  };
+  // 自动接单和手动输入拥有不同的载荷；后台任务不得清空尚未提交的附件与引用。
+  if (draft.source !== 'screen') {
+    tab.context = {
+      skillId: skillIds[0] || null,
+      skillIds,
+      contextPaths: [...(draft.contextPaths || [])],
+      attachments: []
+    };
+  }
   if (isActiveTab(tab)) {
-    state.contextPaths = [];
-    state.attachments = [];
+    if (draft.source !== 'screen') {
+      state.contextPaths = [];
+      state.attachments = [];
+    }
     renderChips();
     renderTabs();
     renderMessages();
@@ -3913,14 +4065,17 @@ async function sendOne(tab, text, draft) {
   if (api.floatBind) api.floatBind(String(tab.id || ''), String(tab.title || ''), true);
   let aborted = false;
   try {
-    const result = await api.chatSend(payload);
+    // 请求发出后立刻清空：预览面板的覆盖值只影响这一轮，下一轮仍按磁盘上的规则、人设、技能拼
+    const sending = api.chatSend(payload);
+    if (draft.source !== 'screen') state.promptOverrides = null;
+    const result = await sending;
     if (isStopError(null, tab)) {
       if (isActiveTab(tab)) {
         flushLivePaint();
         stopTypewriter();
       }
       finalizeStoppedTurn(assistant);
-      restoreStoppedDraft(tab, assistant);
+      if (draft.source !== 'screen') restoreStoppedDraft(tab, assistant);
       aborted = true;
     } else {
       logSummaryTrace('收到总结最终结果', tab, assistant, { finalTextLength: String(result.text || '').length });
@@ -3945,7 +4100,7 @@ async function sendOne(tab, text, draft) {
         stopTypewriter();
       }
       finalizeStoppedTurn(assistant);
-      restoreStoppedDraft(tab, assistant);
+      if (draft.source !== 'screen') restoreStoppedDraft(tab, assistant);
       aborted = true;
     } else {
       markTurnFailed(assistant, e);
@@ -4006,11 +4161,41 @@ async function processQueue(tab) {
   }
 }
 
+/**
+ * 将本地识别出的屏幕请求交给开启 AGI 的会话。
+ * 使用独立队列项，不覆盖草稿、附件、引用或历史编辑状态；没有额外的开始口令。
+ * 入队后立即回执，既有 processQueue/sendOne 负责模型调用、停止、快照和验收。
+ */
+async function receiveScreenRequest(payload) {
+  const tab = state.tabs.find(function matches(item) { return item.id === payload.tabId; });
+  if (!tab || !isActiveTab(tab) || !tab.workspace || !currentModel() || tab.refillFromIndex != null) {
+    api.screenRequestResult(payload.id, false);
+    return;
+  }
+  const text = '【AGI 屏幕请求】\n来源：' + payload.source.title + '（' + payload.source.proc + '）\n' + payload.text;
+  const ids = normalizeSkillIds({ skillIds: tab.pickedSkillIds });
+  tabQueue(tab).push({
+    text, source: 'screen', modelId: tab.modelId || state.currentModelId,
+    skillId: ids[0] || null, skillIds: ids, contextPaths: [], attachments: []
+  });
+  api.screenRequestResult(payload.id, true);
+  renderQueue();
+  await processQueue(tab);
+}
+
+/** 显示后台监听的实际状态，不把本地观察通知追加为模型消息。 */
+function showScreenRequestStatus(text) {
+  const button = $('btn-alive');
+  if (button) button.title = text;
+}
+
+/** 提交当前输入；通过发送前置检查后即追加原始正文历史，供上下键浏览，排队和插话无需等待模型启动。 */
 async function send(options = {}) {
   const tab = activeSession() || (newTab(), activeSession());
   if (!tab.workspace && state.workspace) tab.workspace = state.workspace;
   const input = $('input');
-  const text = input.value.trim();
+  const submittedText = input.value;
+  const text = submittedText.trim();
   // 单独发送 /spcode-start 与点开工按钮等价：这里直接把意图记成 start-work，
   // 后台按 action 判定开工，不靠聊天文本兜，避免口令被当成普通聊天发出去。
   // 中文输入法会打出全角斜杠，先归一成半角再认口令。
@@ -4038,6 +4223,8 @@ async function send(options = {}) {
       state.refillRevertFiles = choice === 'revert';
     }
   }
+  // 在任何异步插话或队列处理之前追加原始正文；同一句重复提交也分别记录。
+  recordSubmittedText(tab, submittedText);
   // 每条消息入队时各自拍快照（文本/技能/引用/附件），队列里互不继承上一轮的内容
   const snapItem = () => {
     const ids = skillStack();
@@ -4052,49 +4239,40 @@ async function send(options = {}) {
       attachments: state.attachments.map((a) => ({ ...a }))
     };
   };
-  // 运行中纯文本走插话，下一个 round 边界生效；带附件仍排队，避免丢图
+  // 运行中纯文本走插话，在工具或模型请求边界优先处理；带附件保持排队。
   if (tab.sending || tab.draining) {
     // 这次没有任何附件，且输入框里有纯文本：直接插话给当前轮，不用等整轮跑完
     if (text && !state.attachments.length && options.action !== 'start-work' && text !== '/spcode-start') {
-      // 用 async 包住，避免插话的 Promise 没人接
-      (async () => {
-        let res = null;
-        try {
-          res = await api.chatInterject({ tabId: tab.id, text });
-        } catch {
-          res = null;
+      // 提交时固定本条载荷并消费输入框；等待回执期间的新草稿不能被异步清空或混进队列。
+      const item = snapItem();
+      input.value = '';
+      clearComposer(tab);
+      scheduleComposerSave();
+      state.contextPaths = [];
+      renderChips();
+      // 回执可能延迟，先持久化提交列表和已消费的草稿，重开也能召回本条插话。
+      persistTab(tab);
+      let res = null;
+      try {
+        res = await api.chatInterject({ tabId: tab.id, text });
+      } catch {
+        res = null;
+      }
+      if (res && res.ok === true) {
+        // 插话保存在消息模型中，实时重绘、切换标签或重开会话时仍可查看原文。
+        tab.messages.push({ role: 'system', text: `你（插话·已提交）：${text}` });
+        persistTab(tab);
+        if (isActiveTab(tab)) {
+          renderMessages();
+          scrollMessagesToBottom();
         }
-        if (res && res.ok === true) {
-          input.value = '';
-          clearComposer(tab);
-          scheduleComposerSave();
-          // 消息流里插一条系统提示样式的灰色小气泡，沿用已有的 msg/bubble 类；
-          // 内容用 textContent 赋值，不走 innerHTML，防注入
-          const box = $('messages');
-          if (box) {
-            const note = document.createElement('div');
-            note.className = 'msg system';
-            const bubble = document.createElement('div');
-            bubble.className = 'bubble';
-            bubble.textContent = `你（插话·下一轮读到）：${text}`;
-            note.appendChild(bubble);
-            box.appendChild(note);
-            box.scrollTop = box.scrollHeight;
-          }
-          return;
-        }
-        // 插话没成功（res 不存在或 ok !== true）：退回原来的排队逻辑，界面不做任何改动
-        if (text || state.attachments.length) {
-          tabQueue(tab).push(snapItem());
-          input.value = '';
-          clearComposer(tab);
-          scheduleComposerSave();
-          state.attachments = [];
-          state.contextPaths = [];
-          renderChips();
-        }
-        renderQueue();
-      })();
+        return;
+      }
+      // AGI 关闭或投递失败时，排队的仍是本条提交快照，保留用户随后输入的内容。
+      tabQueue(tab).push(item);
+      if (isActiveTab(tab)) renderQueue();
+      // 回执到达时原任务可能已经结束，空闲队列必须当场启动。
+      if (!tab.sending && !tab.draining) await processQueue(tab);
       return;
     }
     // 带附件（或只有附件）仍旧排队，附件快照/缩略图/清空行为都不变
@@ -4107,6 +4285,7 @@ async function send(options = {}) {
       state.attachments = [];
       state.contextPaths = [];
       renderChips();
+      persistTab(tab);
     }
     renderQueue();
     return;
@@ -4120,6 +4299,7 @@ async function send(options = {}) {
     state.attachments = [];
     state.contextPaths = [];
     renderChips();
+    persistTab(tab);
   }
   renderQueue();
   await processQueue(tab);
@@ -4307,6 +4487,21 @@ function renderUsageLine(m) {
   return `<div class="msg-usage">${html}</div>`;
 }
 
+// 从上下文预览的 system 文本里去掉「更早对话摘要」段，避免摘要重复占用预览空间
+function stripContextSummary(text) {
+  if (typeof text !== 'string') return text;
+  const markers = ['## 更早对话摘要', '## Earlier conversation summary'];
+  for (const marker of markers) {
+    const idx = text.indexOf(marker);
+    if (idx === -1) continue;
+    const tail = text.slice(idx + marker.length);
+    const nextHeading = tail.search(/\n## /);
+    if (nextHeading === -1) return text.slice(0, idx).trimEnd();
+    return (text.slice(0, idx) + tail.slice(nextHeading)).trimStart();
+  }
+  return text;
+}
+
 async function openContextPreview(turnId) {
   let data = null;
   try { data = await api.contextPreview(turnId); } catch { data = null; }
@@ -4317,9 +4512,10 @@ async function openContextPreview(turnId) {
   }
   const items = data.messages.map((m, i) => {
     const who = m.name ? `${m.role} · ${m.name}` : m.role;
+    const displayText = m.role === 'system' ? stripContextSummary(m.text) : m.text;
     return `<details class="ctx-item"${i === data.messages.length - 1 ? ' open' : ''}>
-      <summary><span class="ctx-role">${escapeHtml(who)}</span><span class="ctx-size">${t('ctxChars', { n: m.text.length })}</span></summary>
-      <pre class="ctx-text">${escapeHtml(m.text)}</pre>
+      <summary><span class="ctx-role">${escapeHtml(who)}</span><span class="ctx-size">${t('ctxChars', { n: displayText.length })}</span></summary>
+      <pre class="ctx-text">${escapeHtml(displayText)}</pre>
     </details>`;
   }).join('');
   openModal(`<div class="modal-card-inner">
@@ -4330,6 +4526,113 @@ async function openContextPreview(turnId) {
   </div>`);
   $('modal-card').classList.add('wide');
   $('m-ok').onclick = () => { $('modal-card').classList.remove('wide'); closeModal(); };
+}
+
+/**
+ * 打开「发给 AI 的内容」预览面板。
+ * 参数全部取输入区与会话当前状态：输入框文本、当前技能栈、上下文引用、附件、当前模型、
+ * 本会话的工作记忆与较早摘要、轮数开关；交给主进程 chat:promptPreview，用与真正发送同一套逻辑
+ * 拼出这一轮会发出去的 system 文本。
+ * 面板里人设、每条规则正文、技能正文可以改，改动只收进 state.promptOverrides，
+ * 不写回磁盘、不改规则/技能/人设的加载来源；完整 system 原文与 notes 是只读段，
+ * notes 标出联网检索、看图识别、工具返回、方案文件正文这些要到发送时才现场生成。
+ */
+async function openPromptPreview() {
+  const tab = activeSession();
+  if (!tab) return;
+  const text = $('input').value.trim();
+  const skillIds = skillStack();
+  // 历史用于回复语言等当前会话判断，不在 system 中生成对话索引。
+  const history = [];
+  for (let i = 0; i < tab.messages.length; i++) {
+    const m = tab.messages[i];
+    if (m.role !== 'user' && m.role !== 'assistant') continue;
+    history.push({
+      role: m.role,
+      content: m.text || '',
+      skip: !!m.ctxSkip,
+      removed: !!m.ctxRemoved,
+      index: m.dialogIndex || undefined
+    });
+  }
+  const data = await api.promptPreview({
+    workspace: tab.workspace || state.workspace,
+    modelId: tab.modelId || state.currentModelId,
+    userText: text,
+    action: null,
+    skillId: skillIds[0] || null,
+    skillIds,
+    contextPaths: [...state.contextPaths],
+    attachments: state.attachments.map((a) => ({ ...a })),
+    history,
+    contextSummary: tab.contextSummary || '',
+    extraFolders: extraFoldersOf(tab)
+  });
+  const editable = data.editable || {};
+  // 规则按「规则名 + 正文」两栏列出，正文可改，规则名不参与编辑
+  const ruleRows = [];
+  for (let i = 0; i < (editable.rules || []).length; i++) {
+    const r = editable.rules[i];
+    ruleRows.push(`<div class="pp-edit-row">
+      <span class="pp-label">${escapeHtml(r.name || '')}</span>
+      <textarea class="pp-textarea" id="ov-rule-${i}">${escapeHtml(r.body || '')}</textarea>
+    </div>`);
+  }
+  // 技能正文按勾选顺序合成的一份；没勾技能时这一段不出现
+  const skillBox = editable.skill
+    ? `<textarea class="pp-textarea" id="ov-skill">${escapeHtml(editable.skill.body || '')}</textarea>`
+    : '';
+  const noteItems = [];
+  for (let i = 0; i < (data.notes || []).length; i++) {
+    noteItems.push(`<li>${escapeHtml(data.notes[i])}</li>`);
+  }
+  // 内部模块单独展示共用基础提示词，避免把大脑预览误认成所有模块的请求。
+  const moduleRows = [];
+  for (const [role, label] of [['code', '实现模块'], ['summary', '总结模块'], ['planning', '规划模块']]) {
+    if (!data.modules || !data.modules[role]) continue;
+    moduleRows.push(`<details class="pp-readonly"><summary>${label} · 基础提示词</summary><pre class="ctx-text">${escapeHtml(data.modules[role])}</pre></details>`);
+  }
+  openModal(`<div class="modal-card-inner">
+    <h3>${t('promptPreviewTitle')}</h3>
+    <p class="hint">${t('promptPreviewReadonly')}</p>
+    <div class="pp-wrap">
+      <label class="pp-label">${t('promptPreviewPersona')}（仅大脑）</label>
+      <textarea class="pp-textarea" id="ov-persona">${escapeHtml(editable.persona || '')}</textarea>
+      <label class="pp-label">${t('promptPreviewRules')}</label>
+      ${ruleRows.join('')}
+      <label class="pp-label">${t('promptPreviewSkills')}</label>
+      ${skillBox}
+      <details class="pp-readonly">
+        <summary>${t('promptPreviewTitle')} · 大脑</summary>
+        <pre class="ctx-text">${escapeHtml(data.system || '')}</pre>
+      </details>
+      ${moduleRows.join('')}
+      <details class="pp-readonly">
+        <summary>${t('promptPreviewLiveHint')}</summary>
+        <ul>${noteItems.join('')}</ul>
+      </details>
+    </div>
+    <div class="modal-actions">
+      <button class="primary" id="m-preview-send">${t('promptPreviewSend')}</button>
+      <button id="m-preview-close">${t('promptPreviewClose')}</button>
+    </div>
+  </div>`);
+  $('modal-card').classList.add('wide');
+  // 按修改发送：把可编辑区的值收成 overrides 交给发送流程；面板里的改动只留在内存，不写回磁盘
+  $('m-preview-send').onclick = () => {
+    const rules = [];
+    for (let i = 0; i < (editable.rules || []).length; i++) {
+      rules.push({ name: editable.rules[i].name, body: $(`ov-rule-${i}`).value });
+    }
+    state.promptOverrides = {
+      persona: $('ov-persona').value,
+      rules,
+      skill: editable.skill ? $('ov-skill').value : ''
+    };
+    closeModal();
+    send();
+  };
+  $('m-preview-close').onclick = () => closeModal();
 }
 
 function patchLiveUsage(tab, msg) {
@@ -4373,6 +4676,7 @@ async function persistMessages(tab) {
     workspace: tab.workspace || state.workspace,
     extraFolders: extraFoldersOf(tab),
     messages: slimMessagesForSave(tab.messages),
+    submittedTextHistory: submittedTextHistory(tab),
     dialogRoundSeq: tab.dialogRoundSeq || 0,
     contextRevision: tab.contextRevision || '',
     undone: tab.undone || [],
@@ -4446,7 +4750,10 @@ function onChatEvent(ev) {
     last.status = t('generating');
     last.text += ev.text;
     scheduleStreamSave(tab);
-    if (touchUi) ensureTypewriter();
+    if (touchUi) {
+      scheduleLivePaint();
+      ensureTypewriter();
+    }
   } else if (ev.type === 'status') {
     last.thinkingOpen = true;
     last.status = ev.text;
@@ -6643,6 +6950,8 @@ function bind() {
     promptRename(id, tab?.title || '');
   };
 
+  // 「发给 AI 的内容」按钮：打开预览面板，只读拼一遍本轮要发出去的 system 文本
+  $('btn-prompt-preview').onclick = () => openPromptPreview();
   $('btn-attach').onclick = async () => {
     await addAttachments(await api.pickFiles());
   };
@@ -6820,7 +7129,8 @@ function bind() {
   $('btn-alive')?.addEventListener('click', async () => {
     const next = !state.desktopAlive;
     try {
-      state.desktopAlive = await api.setDesktopAlive(next);
+      state.desktopAlive = await api.setDesktopAlive(next, activeSession()?.id);
+      showScreenRequestStatus(state.desktopAlive ? 'AGI 待命：前台显示“请帮我……”即可自动接单；空闲观察不消耗聊天 token' : 'AGI 已关闭');
     } catch {
       state.desktopAlive = false;
     }
@@ -7398,6 +7708,7 @@ function bind() {
   $('input').addEventListener('input', onInput);
   $('input').addEventListener('input', scheduleComposerSave);
   $('input').addEventListener('keydown', (e) => {
+    if (recallSubmittedText(e)) return;
     if (e.key === 'Escape') {
       if (state.refillFromIndex != null) {
         const et = activeSession();
@@ -7546,10 +7857,17 @@ function bind() {
 }
 
 api.onChatEvent(onChatEvent);
+// 后台接单使用独立入口；主窗草稿和悬浮栏手动发送保持各自现有流程。
+if (api.onScreenRequest) api.onScreenRequest(receiveScreenRequest);
+if (api.onScreenRequestStatus) api.onScreenRequestStatus(showScreenRequestStatus);
 // 悬浮栏里发的提示（主窗空闲时）落到这里：填进输入区后复用现有 send() 流程，不另起一套发送逻辑
 if (api.onFloatUserMessage) {
   // 小窗可能是纯文本，也可能是 { text, attachments } 对象（带图发送），两种形态都认
   api.onFloatUserMessage((payload) => {
+    if (payload && payload.interjection === true) {
+      receiveFloatInterjection(payload);
+      return;
+    }
     const box = $('input');
     if (!box) return;
     let text = '';
@@ -7665,21 +7983,15 @@ api.onIndexProgress(paintIndexCard);
   setWorkspace(s.workspace);
   renderRecents();
   renderModelMenu();
-  state.skills = await api.listSkills();
-  state.persona = (await api.loadPersona()) || '';
-  try {
-    state.globalMemory = await api.getGlobalMemory();
-  } catch {
-    state.globalMemory = null;
-  }
+  // 启动所需的独立资料并行读取，沿用全局记忆原有的失败处理。
+  const [initialSkills, persona, globalMemory] = await Promise.all([
+    api.listSkills(), api.loadPersona(), loadGlobalMemory()
+  ]);
+  state.skills = initialSkills;
+  state.persona = persona || '';
+  state.globalMemory = globalMemory;
   if (s.workspace && localStorage.getItem('spcode.onboarding.completed') === 'true') {
-    await refreshMeta();
-    await restoreLastSession(s.workspace);
-    showChat();
-    renderTabs();
-    renderMessages(true);
-    renderQueue();
-    syncSendBtn();
+    await Promise.all([refreshMeta(), showProjectSession(s.workspace)]);
     // 启动时就已经落在一个标签上，这里也上报一次，小窗一打开就能看到当前标签
     if (api.floatBind) api.floatBind(String(state.activeTab || ''), String(activeSession()?.title || ''));
     syncAgentBtn();

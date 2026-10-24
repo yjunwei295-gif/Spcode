@@ -1,7 +1,7 @@
 {
   "name": "simplecode",
   "productName": "SimpleCode",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "桌面 AI 编程助手",
   "main": "electron/main.js",
   "author": "SimpleCode",

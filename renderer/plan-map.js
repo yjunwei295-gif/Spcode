@@ -35,16 +35,18 @@
    *   title: 头部标题（显示为「方案导图 · title」）,
    *   map: { nodes:[{ id, desc, status, file, reason }], edges },
    *   emptyText?: 非空时进入「只显示说明」的空态：不建 canvas / 图例 / 侧栏，body 只放一段居中说明,
-   *   workspace, tabId, locked
+   *   workspace, tabId,
+   *   onCleared?: 「清理导图」成功后的回调（弹窗已关闭时调用），由调用方刷新入口或清掉当前导图状态
    * }
    * 空态与正常模式共用同一个弹窗、标题、× 关闭、点遮罩关闭和 Esc 关闭，只有内容区不同。
+   * 删除按钮不受方案锁定影响：锁只约束 AI，用户随时能删条目。
+   * 「清理导图」是整页清空（方案正文、方案锁、导图数据含链路图），必须二次确认；空态不创建该按钮。
    * 副作用：关掉上一个实例、往 document.body 挂一个 #plan-map-modal，并注册 keydown 监听（dispose 时移除）。
    */
   function open(opts) {
     close();
     const workspace = opts.workspace;
     const tabId = opts.tabId;
-    const locked = !!opts.locked;
     // 空态文案先归一成字符串；为空即走原来的绘制流程，保证不传时行为完全不变
     const emptyText = opts.emptyText ? String(opts.emptyText) : '';
     const modal = el('div', { id: 'plan-map-modal', className: 'map-modal' });
@@ -62,6 +64,11 @@
     head.appendChild(title);
     // 空态没有节点，图例没有可解释的状态分布，整块不创建；正常模式仍按 STATUS_COLOR 渲染图例
     if (!emptyText) {
+      // 「清理导图」夹在标题和图例之间：属危险操作，点击后由 clearAll 二次确认，样式复用 btnCss
+      const clearBtn = el('button', { textContent: '清理导图', title: '清空本标签页的方案正文、方案锁与导图数据' });
+      clearBtn.style.cssText = btnCss;
+      clearBtn.onclick = clearAll;
+      head.appendChild(clearBtn);
       const legend = el('div');
       legend.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;font-size:11px;color:var(--muted);margin-left:auto;';
       for (const [name, color] of Object.entries(STATUS_COLOR)) {
@@ -155,11 +162,29 @@
         .then((res) => {
           if (!res) return;
           if (res.notFound) { alert('未找到该方案，可能已被删除'); return; }
-          // 后端把删除拦在锁定时，明确告诉用户原因，不要静默无反应
-          if (res.locked) { alert('方案已锁定，不能删除'); return; }
           if (res.map) update(res.map);
         })
         .catch(() => { alert('删除失败，请稍后重试'); });
+    }
+    /**
+     * 清空本标签页的全部方案数据（方案正文、方案锁、导图数据含链路图），删除后无法恢复。
+     * 先 confirm 二次确认；主进程接口缺失时只提示、不发请求。
+     * 成功后关闭弹层并回调 opts.onCleared()，调用方据此刷新入口状态；失败保留弹层以便重试。
+     * 与单条 × 删除一样不受方案锁限制，锁只约束 AI。
+     */
+    function clearAll() {
+      if (!confirm('确认清理方案导图？会删除本标签页的方案正文、方案锁和导图数据（含链路图），删除后无法恢复。')) return;
+      const api = window.simple || window.sinpo;
+      if (!api || typeof api.planClear !== 'function') {
+        alert('当前环境不支持清理操作');
+        return;
+      }
+      Promise.resolve(api.planClear({ workspace, tabId }))
+        .then(() => {
+          close();
+          if (typeof opts.onCleared === 'function') opts.onCleared();
+        })
+        .catch(() => { alert('清理失败，请稍后重试'); });
     }
     function renderSide(map) {
       side.innerHTML = '';
@@ -176,19 +201,11 @@
         top.style.cssText = 'display:flex;align-items:center;gap:6px;';
         const t = el('div', { textContent: n.title ? `${n.no}. ${clip(n.title, 64)}` : n.id, title: n.title || n.id });
         t.style.cssText = 'font-weight:600;flex:1;min-width:0;';
-        // 每条右侧放删除按钮：方案锁定时置灰不可点，未锁定才允许删除
-        const del = el('button', { textContent: '×', title: locked ? '方案已锁定，不能删除' : '删除该条方案' });
+        // 每条右侧放删除按钮：方案锁只约束 AI 不改方案，用户随时可以删掉自己方案里的条目，按钮始终可点
+        const del = el('button', { textContent: '×', title: '删除该条方案' });
         del.style.cssText = 'border:1px solid var(--border);background:transparent;border-radius:var(--sub-r);width:20px;height:20px;'
           + 'line-height:1;font-size:14px;cursor:pointer;color:var(--muted);flex:none;padding:0;';
-        if (locked) {
-          // 锁定后不允许删条目：按钮不可用、光标变禁止、整体变淡
-          del.disabled = true;
-          del.style.cursor = 'not-allowed';
-          del.style.opacity = '0.4';
-          del.onclick = (e) => { e.stopPropagation(); };
-        } else {
-          del.onclick = (e) => { e.stopPropagation(); removeItem(n); };
-        }
+        del.onclick = (e) => { e.stopPropagation(); removeItem(n); };
         top.appendChild(t);
         top.appendChild(del);
         const s = el('div', { textContent: `${n.status || ''}${n.reason ? ' · ' + n.reason : ''}` });

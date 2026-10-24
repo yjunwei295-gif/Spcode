@@ -196,6 +196,18 @@ async function listWindows() {
     .map((w) => ({ hwnd: String(w.hwnd), title: String(w.title), proc: String(w.proc || ''), pid: Number(w.pid), fg: !!w.fg, min: !!w.min }));
 }
 
+/**
+ * 读取真正前台窗口的身份、客户区和所属显示器的物理屏幕边界。
+ * 客户区与 monitor 均保留 Win32 坐标，不做 DIP 转换；裁剪端通过显示器原点定位截图，
+ * 再按物理屏幕尺寸与实际缩略图尺寸换算像素，避免混用不同 DPI 屏幕的逻辑坐标；查询失败直接抛出。
+ */
+async function foregroundWindow() {
+  const result = await winInput({ op: 'foreground' });
+  if (!result.ok) throw new Error(result.message);
+  return { hwnd: result.hwnd, pid: result.pid, title: result.title, proc: result.proc,
+    left: result.left, top: result.top, right: result.right, bottom: result.bottom, monitor: result.monitor };
+}
+
 function toDip(x, y) {
   try { return screen.screenToDipPoint({ x, y }); }
   catch { return { x, y }; }
@@ -627,7 +639,7 @@ function importClipboardImage() {
 }
 
 module.exports = {
-  isAlive, isBusy, setAlive, hold, release, noteLook, currentFrame, listWindows, scanControls,
+  isAlive, isBusy, setAlive, hold, release, noteLook, currentFrame, listWindows, scanControls, foregroundWindow,
   assessRisk, allowRiskyThisTurn, controlLabel, TYPE_ZH,
   clickAt, dragStroke, scrollAt, typeText, tapKeys, windowList, windowFocus, uiAct,
   captureScreen, importClipboardImage, nameSightFile

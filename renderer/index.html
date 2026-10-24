@@ -182,12 +182,24 @@
               <div class="queue hidden" id="queue"></div>
               <textarea id="input" rows="3" data-i18n-placeholder="inputPlaceholder" placeholder="规划、构建，输入 / 使用技能，输入 @ 引用上下文..."></textarea>
               <div class="composer-bar">
-                <div class="select-wrap model-roster-wrap">
-                  <button class="pill ghost" id="btn-model"><span data-i18n="model">模型</span></button>
-                  <div class="menu-drop up" id="model-menu"></div>
-                </div>
-                <button type="button" class="pill ghost" id="btn-context-map" style="display: inline-flex" aria-label="上下文">上下文</button>
                 <div class="left">
+                  <!-- 三排制左组：模型胶囊（.select-wrap.model-roster-wrap）仍在 DOM 首位，靠 CSS 让它独占第 1 排；
+                       第 2 排是本组内的 8 颗按钮，顺序不变：上下文 → 发给 AI 的内容 → ∞ Agent → 轮数 → 全解放 → AGI →
+                       AI 直通 → 小窗。使用手册、本地部署指南已回到 .right 排头，这里不再挂这两颗。
+                       这些入口全部放在 .left 内部，才会真正同处左组并跟随左组一起换行；
+                       .composer-bar 直属层因此只剩 .left / .right 两个子项，不再直接挂按钮（否则右侧组会贴到左组最后一行）。
+                       注意：下方按钮的 id、class、type、data-act、data-i18n、aria 与原来一字不差，app.js 与 i18n 的取值不依赖层级。 -->
+                  <!-- 模型胶囊：点击展开 #model-menu 选择模型组合；下拉浮层由 .select-wrap 相对定位，随按钮一起移动不影响展开行为。 -->
+                  <div class="select-wrap model-roster-wrap">
+                    <button class="pill ghost" id="btn-model"><span data-i18n="model">模型</span></button>
+                    <div class="menu-drop up" id="model-menu"></div>
+                  </div>
+                  <!-- 上下文：打开「上下文 / 塞给 AI 的上下文」导图面板，内容来自现有导图数据，不在这里拼装。 -->
+                  <button type="button" class="pill ghost" id="btn-context-map" style="display: inline-flex" aria-label="上下文">上下文</button>
+                  <!-- 发给 AI 的内容：打开预览面板，展示本轮实际发给 AI 的完整内容。
+                       title 提示联网检索、看图识别、工具返回、方案文件正文等要到发送时才现场生成，面板内只做标注；
+                       样式类与同排按钮一致；面板内编辑只进 state.promptOverrides，不写回磁盘。 -->
+                  <button type="button" class="pill ghost" id="btn-prompt-preview" title="本轮实际发给 AI 的完整内容（联网检索、看图识别、工具返回等要到发送时才生成）">发给 AI 的内容</button>
                   <div class="select-wrap">
                     <button class="pill" id="btn-agent">∞ Agent</button>
                   </div>
@@ -199,8 +211,15 @@
                   <button type="button" class="pill ghost" id="btn-alive" data-i18n="desktopAlive" data-i18n-title="desktopAliveTitle" title="AGI（测试版）：下命令后自动查看屏幕，使用系统鼠标点击、拖动并输入文字" aria-pressed="false">AGI</button>
                   <button type="button" class="pill ghost" id="btn-cursor-direct" data-i18n="cursorDirect" data-i18n-title="cursorDirectTitle" title="大脑、总结、代码、规划有一个用 Cursor 或 Codex 模型时自动打开，都不用时关闭，不能手动切换" aria-pressed="false" disabled>AI 直通</button>
                   <button id="btn-floatbar" class="pill ghost" data-i18n="floatBarToggle" data-i18n-title="floatBarToggleTitle" aria-pressed="true">小窗</button>
+                  <!-- 左组到「小窗」为止：使用手册 / 本地部署指南已搬回 .right 排头（第 3 排），
+                       这里不再追加按钮，保证左组只排第 2 排。 -->
                 </div>
                 <div class="right">
+                  <!-- 第 3 排右组，顺序：使用手册 → 本地部署指南 → 🖇 → 排队 → 发送；
+                       使用手册 / 本地部署指南放在本组排头（从 .left 末尾搬回），id、class、type、data-act、data-i18n 一字不动。
+                       .composer-bar .right 的 margin-left 已为 0，组内 #btn-attach 的 margin-left: auto
+                       把 🖇 / 排队 / 发送推到排尾；
+                       模型胶囊由 CSS 独占第 1 排、8 颗工具按钮占满第 2 排，右组自然落到第 3 排，不会与左组抢行。 -->
                   <button type="button" class="pill ghost" id="btn-guide" data-act="guide">使用手册</button>
                   <button type="button" class="pill ghost" id="btn-local-deployment-guide">本地部署指南</button>
                   <button class="icon-btn" id="btn-attach" data-i18n-title="attach" title="上传或 Ctrl+V 粘贴图片、文件、视频、文档">🖇</button>

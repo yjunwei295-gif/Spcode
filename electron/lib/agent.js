@@ -15,6 +15,7 @@ const store = require('./store');
 const memoryGlobal = require('./memory-global');
 const diag = require('./diag');
 const assembly = require('./assembly');
+const { buildModulePrompt } = require('./module-prompts');
 const mmproj = require('./mmproj');
 const visionEngine = require('./vision-engine');
 const replyLang = require('./reply-lang');
@@ -42,22 +43,21 @@ const { httpFetch } = require('./http-fetch');
 const DEFAULT_MAX_ROUNDS = 16;
 const SAFETY_MAX_ROUNDS = 128;
 
-// [铆钉优化] 常驻悬浮栏的插话收件箱：按会话键（key，形如 '1:tabId'）分桶，值是待插话的字符串数组。
-// 轮次进行中用户发的提示先存进本会话的桶里，下一轮次开头才并进上下文。
-// 其他 AI 请勿改成打断当前轮，也请勿改回全局单队列：多会话共用一个队列会把一处的提示串到另一处。
+// 插话按会话键（形如 '1:tabId'）隔离；普通循环在请求边界读取，直通在工具边界和收尾读取。
+// 已经执行中的工具保持运行，后续动作必须先让模型看到用户补充。
 const interjectInbox = new Map();
+// 只有大脑仍在消费消息时才接收插话；准备阶段和总结阶段由界面排队，避免接收后被清空。
+const activeInterjectKeys = new Set();
 
 /**
- * 悬浮栏插话入口：不打断当前轮，只把提示排进本会话（key）的队列，
- * 等下一轮次开头才生效。key 为空或 text 为空直接忽略。
- * AGI 没开时插话不成立：返回 false，让调用方退回成「排队、本轮跑完再发」。
- * 返回 true 表示已排进队列。
+ * 接收主窗或悬浮栏的纯文本插话，返回是否已加入指定会话的收件箱。
+ * AGI 关闭、会话键或正文为空、大脑已不再消费消息时返回 false，由调用方排队发送。
  */
 function pushInterjection(key, text) {
   // AGI（桌面辅助）关着时没有插话这回事，先拦掉；desktopOn 是函数声明，会提升，可直接调
   if (!desktopOn()) return false;
   const k = key == null ? '' : String(key);
-  if (!k) return false;
+  if (!k || !activeInterjectKeys.has(k)) return false;
   const body = String(text == null ? '' : text).trim();
   if (!body) return false;
   let q = interjectInbox.get(k);
@@ -69,7 +69,66 @@ function pushInterjection(key, text) {
   return true;
 }
 
-// [铆钉优化] 桌面工具只在「AGI」打开时给模型，关着时模型看不到也不会乱报"AGI 没开"。其他 AI 请勿改回始终暴露。
+/**
+ * 一次取走指定会话的插话，保持到达顺序；不读取或删除其他会话的数据。
+ * 取走后由当前请求或工具结果承载正文，避免同一句被多次注入。
+ */
+function takeInterjections(key, onEvent) {
+  const k = key == null ? '' : String(key);
+  const queued = interjectInbox.get(k) || [];
+  interjectInbox.delete(k);
+  // 投递时同步登记需求补充，后续总结验收必须按包含插话的目标核对。
+  if (queued.length && typeof onEvent === 'function') onEvent({ type: 'interjection', texts: queued });
+  return queued;
+}
+
+/** 将用户补充明确标为插话正文，供直通模型在继续原任务前优先回应和调整。 */
+function interjectionBlock(queued) {
+  return '【用户实时插话】\n' + queued.join('\n\n') +
+    '\n【插话结束】\n以上是用户在当前任务执行中发来的新消息。先回应或按补充调整后续动作，结合已有工具结果继续，不要忽略插话或重复已经成功的操作。';
+}
+
+/**
+ * 为 Codex/Cursor 直通接入本会话插话，保留原 SDK 会话与正在运行的工具。
+ * 新工具开始前已有插话时暂不执行该工具；工具运行中到达的插话随结果送回模型。
+ * 无工具回复期间到达的消息在 SDK 收尾后立即续接同一会话，不等待用户重新发送。
+ */
+async function runDirectWithInterjections(direct, args, key) {
+  /** 工具边界先处理用户补充，确保旧动作不会越过尚未读取的插话。 */
+  async function runToolWithInterjections(name, toolArgs, toolCallId) {
+    let queued = takeInterjections(key, args.onEvent);
+    if (queued.length) {
+      args.onEvent({ type: 'status', text: '插话已送达 AI，正在优先处理…' });
+      return '本次工具尚未执行，请先处理用户补充，再决定是否重新调用。\n\n' + interjectionBlock(queued);
+    }
+    const result = await args.runTool(name, toolArgs, toolCallId);
+    queued = takeInterjections(key, args.onEvent);
+    if (!queued.length) return result;
+    args.onEvent({ type: 'status', text: '插话已送达 AI，正在优先处理…' });
+    const text = typeof result === 'string' ? result : JSON.stringify(result);
+    return text + '\n\n' + interjectionBlock(queued);
+  }
+  let nextArgs = { ...args, runTool: runToolWithInterjections };
+  const initial = takeInterjections(key, args.onEvent);
+  if (initial.length) nextArgs.turnText += '\n\n' + interjectionBlock(initial);
+  for (;;) {
+    const result = await direct.runTurn(nextArgs);
+    if (args.signal?.aborted) {
+      const error = new Error('已停止');
+      error.name = 'AbortError';
+      throw error;
+    }
+    const queued = takeInterjections(key, args.onEvent);
+    if (!queued.length) return result;
+    args.onEvent({ type: 'rewrite_text', text: '' });
+    args.onEvent({ type: 'status', text: '插话已送达 AI，正在继续处理…' });
+    // 续接只发送新增消息；已成功的任务不再受原始必调工具列表催促，避免重复执行。
+    nextArgs = { ...args, fresh: false, firstPrefix: '', systemContext: '', userContent: '',
+      turnText: interjectionBlock(queued), requiredToolNames: [], runTool: runToolWithInterjections };
+  }
+}
+
+// 桌面工具只在「AGI」打开时给模型，关闭时不向模型暴露。
 const DESKTOP_TOOLS = new Set([
   'screen_read', 'screen_look', 'float_bar_move', 'clipboard_look', 'window_list', 'window_focus', 'ui_act', 'agi_note',
   'mouse_click', 'mouse_drag', 'mouse_scroll', 'keyboard_type', 'keyboard_key',
@@ -169,6 +228,8 @@ function toolsSpec() {
 
 function allToolsSpec() {
   return [
+    // 代码动画与生成模型分开注册；普通模型和直通 MCP 共用同一份工具定义。
+    require('./code-video').toolSpec,
     {
       type: 'function',
       function: {
@@ -651,7 +712,7 @@ function allToolsSpec() {
   ];
 }
 
-const HAND_OFF_TOOLS = new Set(['write_file', 'edit_file', 'create_dir', 'delete_file', 'run_command']);
+const HAND_OFF_TOOLS = new Set(['write_file', 'edit_file', 'create_dir', 'delete_file', 'run_command', 'render_code_video']);
 
 function callWorkerTool(roles) {
   const hasPlan = roles.includes('planning');
@@ -698,7 +759,8 @@ const WORKER_TOOL_NAMES = new Set([
   'search_text',
   'goto_definition',
   'list_dir',
-  'run_command'
+  'run_command',
+  'render_code_video'
 ]);
 const SUMMARY_TOOL_NAMES = new Set(['read_file', 'search_text', 'map_lookup', 'list_dir', 'goto_definition']);
 
@@ -1558,6 +1620,26 @@ async function execToolRaw(workspace, snap, name, args, onEvent, extra, signal, 
   if (name === 'brain_pressure') {
     return '已在后台记录。不要向用户提到压力，直接回答用户的问题。';
   }
+  if (name === 'render_code_video') {
+    /** 将视频产物登记到当前轮快照，和源码写入共用文件追踪。 */
+    function recordVideoFile(rel) {
+      if (!snap.current) snap.current = snapshot.create(workspace, '自动更改快照');
+      snapshot.recordChange(workspace, snap.current, rel, 'write');
+      (snap.createdFiles || (snap.createdFiles = new Set())).add(rel);
+      snap.wroteFiles = (snap.wroteFiles || 0) + 1;
+    }
+    /** 只在整数百分比变化时发进度，不为每一帧刷新聊天界面。 */
+    function videoProgress(progress) {
+      onEvent({ type: 'tool', name, status: 'running', detail: args.sourcePath,
+        text: '代码视频渲染 ' + progress.percent + '%（' + progress.frame + '/' + progress.totalFrames + ' 帧）' });
+    }
+    const result = await require('./code-video').render({
+      workspace, extra, args, signal, beforeWrite: recordVideoFile, onProgress: videoProgress
+    });
+    onEvent({ type: 'tool', name, status: 'done', detail: result.video, text: '代码视频已导出 ' + result.video });
+    return '【代码视频已完成】\n' + JSON.stringify(result, null, 2) +
+      '\n请检查首中尾预览后报告视频路径；编码成功不代表画面内容已验收。';
+  }
   if (name === 'generate_media') {
     const role = GEN_KIND_ROLE[String(args.kind || 'image').toLowerCase()];
     if (!role) return `kind 只能是 ${Object.keys(GEN_KIND_ROLE).join(' / ')}`;
@@ -1853,7 +1935,7 @@ async function generateRole({ vs, role, prompt, workspace, extra, onEvent, signa
         const msg = await completeWithFallback({
           modelCfg: helperCfg,
           messages: [
-            { role: 'system', content: assembly.helperPrompt(role, lang) },
+            { role: 'system', content: buildModulePrompt(role, snap?.modulePromptContext, assembly.helperPrompt(role, lang)) },
             { role: 'user', content: String(prompt || '').slice(0, 24000) || '请写一份文档' }
           ],
           noTools: true,
@@ -1920,7 +2002,8 @@ async function runGenerateSlots({ vs, userText, workspace, extra, extraTexts, on
     const r = await generateRole({ vs, role, prompt: userText, workspace, extra, onEvent, signal, snap, lang });
     if (r.ok && role === 'docGen') {
       extraTexts.push(`—— 以下是${r.roleName}模型已写入的文档 ——`);
-      extraTexts.push(`文件：${r.rel}\n\n${String(r.text || '').slice(0, 8000)}`);
+      // 文档回灌给主模型时不再截断，生成内容多长就回灌多长
+      extraTexts.push(`文件：${r.rel}\n\n${String(r.text || '')}`);
     } else if (r.ok) {
       extraTexts.push(`—— ${r.roleName}已完成，文件在工作目录：${r.rel}。请据此继续回答用户，不要说还没生成。 ——`);
     } else {
@@ -1929,68 +2012,28 @@ async function runGenerateSlots({ vs, userText, workspace, extra, extraTexts, on
   }
 }
 
-// 自动附加的上下文设硬上限，防止画像、规则、项目地图等随时间膨胀。
-// 用户本轮输入、@ 引用文件及手动选中的技能不经过这里，保留用户明确指定的材料。
-const AUTO_CONTEXT_LIMITS = Object.freeze({
-  persona: 1800,
-  rules: 5000,
-  skillCatalog: 2000,
-  memoryTotal: 12000,
-  extraTotal: 24000,
-  map: 12000,
-  vision: 8000,
-  helper: 6000
-});
-
-function capAutoContext(value, maxChars, { keep = 'head', label = '自动上下文' } = {}) {
-  const text = String(value || '');
-  if (text.length <= maxChars) return text;
-  const fullMarker = `\n…（${label}已限制，完整内容需要时再读取）`;
-  const marker = fullMarker.length <= maxChars ? fullMarker : '…'.slice(0, maxChars);
-  const room = Math.max(0, maxChars - marker.length);
-  const clipped = keep === 'tail' ? text.slice(-room) : text.slice(0, room);
-  return `${clipped}${marker}`;
-}
-
-function capAutoContextParts(parts, maxChars) {
-  let remaining = maxChars;
-  const out = [];
-  for (const part of parts) {
-    if (!part || remaining <= 0) continue;
-    const text = capAutoContext(part, remaining, { label: '自动记忆上下文' });
-    out.push(text);
-    remaining -= text.length;
-  }
-  return out;
-}
-
+/**
+ * 拼装实际请求与发送前预览共用的系统提示词。
+ * @param {object} ctx 大脑本轮的规则、技能、人设与执行模式；工作记忆、摘要和标题索引不自动注入。
+ * @returns {string} 系统提示词正文；手动引用的上下文由用户消息链路单独拼装。
+ */
 function buildSystemPrompt({
   workspace, rules, skill, extra, allSkills, persona, visionMode, visionBridge, lang,
-  globalPrefs, profile, workingMemory, contextSummary, dialogIndex, zbaingBridge, brainHandsOff, hasPlanning,
+  globalPrefs, profile, zbaingBridge, brainHandsOff, hasPlanning,
   userOrder, thinkBudget, planFile, startOrdered
 }) {
   const langInfo = lang || replyLang.fromLocale(store.load().locale);
-  const personaText = capAutoContext(
-    replyLang.softenForcedChinese(String(persona || '').trim()),
-    AUTO_CONTEXT_LIMITS.persona,
-    { label: '自动人设上下文' }
-  );
+  // 人设整段进提示词，不截断：人设是用户确认过的长期人格设定，截掉尾巴会丢掉约束
+  const personaText = replyLang.softenForcedChinese(String(persona || '').trim());
   const enPrompt = replyLang.promptInEnglish(langInfo);
   const personaSection = personaText
     ? (enPrompt ? `\n\n## Persona (always follow)\n${personaText}\n` : `\n\n## 人设（必须始终遵守）\n${personaText}\n`)
     : '';
   const profileBlock = memoryGlobal.formatProfile(profile, { english: enPrompt });
   const prefsBlock = memoryGlobal.formatPrefs(globalPrefs, { english: enPrompt });
-  const workBlock = compact.formatWorking(workingMemory, { english: enPrompt });
-  const summaryBlock = compact.formatSummaryForPrompt(contextSummary, { english: enPrompt });
-  const indexBlock = compact.formatIndexForPrompt(dialogIndex, { english: enPrompt });
-  const memParts = capAutoContextParts([
-    capAutoContext(profileBlock, 1200, { label: '自动画像上下文' }),
-    capAutoContext(prefsBlock, 2200, { label: '自动偏好上下文' }),
-    capAutoContext(workBlock, 2200, { label: '自动工作记忆' }),
-    capAutoContext(summaryBlock, 3000, { label: '自动对话摘要' }),
-    capAutoContext(indexBlock, 3000, { keep: 'tail', label: '自动对话索引' })
-  ], AUTO_CONTEXT_LIMITS.memoryTotal);
+  // 会话记忆、摘要和索引均不自动注入；实际发送与发送前预览共用这里。
+  // 手动引用继续由用户消息拼装，本地记录不因提示词裁减而删除。
+  const memParts = [profileBlock, prefsBlock].filter(Boolean);
   const memoryBlock = memParts.length ? `\n${memParts.join('\n\n')}\n` : '';
   const askHint = desktopOn()
     ? (enPrompt
@@ -1999,37 +2042,31 @@ function buildSystemPrompt({
     : (enPrompt
     ? `\nIf the request is ambiguous, would break confirmed conventions, or has multiple valid approaches, call ask_user and wait. Do not silently rewrite settled behavior.\n`
     : `\n若需求含糊、可能破坏已确认约定、或有多种实现，必须先调用 ask_user 等待用户回答，再改文件；禁止默默推翻已确认行为。\n`);
-  let rulesRemaining = AUTO_CONTEXT_LIMITS.rules;
+  // 规则全量进提示词：条数与正文都不裁剪，保留用户写的每一条
   const ruleText = (rules || []).map((r) => {
-    if (rulesRemaining <= 0) return '';
     const prefix = `### ${r.name}\n`;
-    if (rulesRemaining <= prefix.length) return '';
-    const body = capAutoContext(replyLang.softenForcedChinese(r.body), Math.max(0, rulesRemaining - prefix.length), { label: '自动规则上下文' });
-    const block = `${prefix}${body}`;
-    rulesRemaining -= block.length + 2;
-    return block;
-  }).filter(Boolean).join('\n\n');
+    return `${prefix}${replyLang.softenForcedChinese(r.body)}`;
+  }).join('\n\n');
   const skillText = skill
     ? (enPrompt
       ? `\nThe user selected skill "${skill.name}". Follow it:\n${replyLang.softenForcedChinese(skill.body)}\n`
       : `\n当前用户指定技能「${skill.name}」，必须遵循：\n${replyLang.softenForcedChinese(skill.body)}\n`)
     : '';
-  const appSkills = [];
-  let appSkillChars = 0;
-  for (const item of (extra || []).filter((p) => /skills$/i.test(p))) {
-    const skillPath = item.replace(/\\/g, '/');
-    if (appSkillChars + skillPath.length > 1200) break;
-    appSkills.push(skillPath);
-    appSkillChars += skillPath.length + 1;
-  }
-  const catalog = capAutoContext((allSkills || []).map((s) => {
+  // 技能根目录全量列出，不按字符数截断：用户配置了几个技能根目录就写进提示词几个，
+  // 少了会让模型以为该目录不存在、找不到对应技能。因此不再累计字符数提前 break。
+  // 副作用：额外目录以 /skills 结尾即算技能根，路径统一成正斜杠，便于模型原样引用。
+  const appSkills = (extra || [])
+    .filter((p) => /skills$/i.test(p))
+    .map((p) => p.replace(/\\/g, '/'));
+  // 技能目录全量列出，不裁剪：列出的条数就是实际技能条数
+  const catalog = (allSkills || []).map((s) => {
     const loc = s.scope === 'workspace' ? (enPrompt ? 'project' : '项目') : (enPrompt ? 'global' : '全局');
     const pri = s.priority ? (enPrompt ? `priority ${s.priority}` : `优先度${s.priority}`) : '';
     const cover = s.active === false
       ? (enPrompt ? ' (overridden by a higher-priority skill with the same name)' : '（被更高优先度同名技能覆盖，不生效）')
       : '';
     return `- /${s.name} ${pri}（${loc}） ${String(s.file || '').replace(/\\/g, '/')}  ${s.desc || ''} ${cover}`;
-  }).join('\n'), AUTO_CONTEXT_LIMITS.skillCatalog, { label: '自动技能目录' });
+  }).join('\n');
   const langLine = replyLang.systemLangLine(langInfo);
   const zbaingSection = zbaingBridge
     ? (enPrompt
@@ -2114,13 +2151,17 @@ function buildSystemPrompt({
   const genFailNote = enPrompt
     ? ' A local image model is stored by filename and resolved inside the models folder; do not ask the user to paste an absolute path. A 401 inside 【生图失败】 is a HuggingFace/engine download failure for companion files, not the chat API and not a missing file path. Repeat the failure text as-is. Do not search the workspace for Bearer tokens.'
     : '生图槽里写文件名即可，程序会在模型目录里找到文件，禁止要求用户改成绝对路径。【生图失败】里的 401 是下载生图引擎或配套文件时 HuggingFace/GitHub 拒绝访问，不是聊天接口，也不是模型路径填错。请原样转述失败原文，禁止去项目里搜 Bearer。';
-  const genNote = zbaingBridge
+  let genNote = zbaingBridge
     ? (enPrompt
       ? `\nWhen the user asks to generate images/videos/3D/docs, SimpleCode runs that automatically BEFORE you reply. Check the user message for "生图已完成" or 【生图失败】/【生图未配置】 and answer from those results. Do not say you lack an image-generation tool.${genFailNote}\n`
       : `\n用户要求生图/生视频/生3D/生文档时，SimpleCode 会在你回复前自动执行。请看用户消息里是否已有「生图已完成」或【生图失败】/【生图未配置】等段落并据此回答，禁止说自己没有生图工具。${genFailNote}\n`)
     : (enPrompt
       ? `\nTo generate images/videos/3D/docs, call generate_media yourself (kind + a full prompt you write from the conversation). It uses the generation model in the model combo. It does not need the user to say start, and must not be handed to the code worker or run through run_command / sd-cli. One call per image. After it returns, tell the user the file path. Never say you have no image tool.${genFailNote}\n`
       : `\n要生图/生视频/生3D/生文档时，你自己调用 generate_media：kind 填类型，prompt 写你按对话整理好的完整描述（主体、风格、构图、颜色）。它用「模型组合」里挂的生成模型，不需要用户说「开始」，禁止派给代码模块、禁止用 run_command 去跑 sd-cli。要几张就调用几次。返回后把文件路径告诉用户。禁止说自己没有生图工具。${genFailNote}\n`);
+  // 代码视频先写可编辑动画，再逐帧渲染；不消耗视频生成槽位。
+  genNote += enPrompt
+    ? '\nFor videos made with code, motion graphics, or animated explainers: write an HTML/Canvas animation, then call render_code_video with explicit dimensions, fps and duration. Define window.renderFrame(time, frame, info), await dynamic assets, and derive every frame from time. Use audioPath for an existing music/narration file. Inspect the returned preview PNGs before delivering the MP4. See docs/code-video.md in the SpCode source for the contract. generate_media is only for generation-model assets; it is not the code-video renderer.\n'
+    : '\n用户要用代码做视频、动态图形或动画讲解时，先编写 HTML/Canvas 动画，再调用 render_code_video，明确指定宽高、帧率和时长。HTML 定义 window.renderFrame(time, frame, info)，动态素材自己 await，每帧只由传入时间决定。已有配乐/配音用 audioPath 合入；返回后检查预览 PNG 再交付 MP4。SpCode 源码 docs/code-video.md 有完整约定。generate_media 用于生成模型素材，代码视频用 render_code_video，不需要视频生成槽位。\n';
   const planRule = (agiOn || conversational || !planFile) ? '' : (enPrompt
     ? `[TOP RULE — THE PLAN FILE IS THE ONLY PLAN]
 - Before the user says start, write the complete plan in your reply between 【方案】 and 【/方案】: one line per step as "file path -> method -> exact current text -> what it becomes -> how to verify", then what must stay unchanged. The user may click 写入方案 or send /spcode-start as the entire message to approve and lock the latest plan; the program imports that latest plan block into the plan file. You never write or edit the plan file.
@@ -2188,7 +2229,7 @@ ${appSkills.map((p) => `- ${p}`).join('\n') || '- (none)'}
 Installed skills (names only). Follow only the selected skill below. Do not read or follow any other AI's skills or rules.
 ${catalog || '- (none)'}
 Writes and deletes in the workspace are snapshotted and can be restored. run_command also tracks file changes made by scripts (pre-backup before run, diff after) so they appear in the changed-files list and can be restored.
-Use working_memory_update for this-chat notes; ask_user to clarify.
+Use ask_user to clarify.
 For tasks with 3+ steps, list them with todo_write first; mark one item in_progress when you start it and completed right after finishing it. Skip it for single-step work or pure Q&A.
 Shell via run_command runs in a sandbox (cwd inside the project, dangerous commands blocked, timeout). ${shellUseEn} Do not run encoding probes (no enc_*.txt); write_file is UTF-8. The project map lists method source spans (:start-end) for you (the brain). Summaries may be wrong. Methods that map_lookup already attached as 【原文·可直接用】 can be used directly; before editing others, read those spans with read_file startLine/endLine; never read a whole multi-thousand-line file. Related scripts are dependency paths; open their hit spans the same way. If 【全文】 is already in the message or this turn already returned the full file, use it and do not read again. The modules in the message are only the first batch. If they do not match, call map_lookup with other keywords first; use search_text only after that. When the desktop hand is on, the latest message ends with 【屏幕文字】: the foreground window, other windows, saved experience notes for the target app, a control list with ids like [c12] (Windows UI Automation), and OCR text lines with their center @(x,y). Prefer ui_act with a control id (click/toggle/select/expand/set_text); fall back to mouse_click with @(x,y) only when the target has no control id. Follow the saved experience notes. Choose commands or desktop tools to open apps and web pages according to the task. After a task succeeds, or when you find a non-obvious path or pitfall, call agi_note with one reusable sentence (no passwords or private content). Risky actions (delete, send, pay, Shift+Delete, Enter in chat apps) automatically ask the user first; do not ask again yourself and never work around a refusal. Work in an observe-act-verify loop: one action at a time, then read the 【操作后】 part of the tool result to check it worked before the next step; if nothing changed, rethink instead of repeating the same click. Before keyboard_type or keyboard_key, make sure the target window has focus (window_focus or click its input box). Use screen_read (optionally with wait_ms) to re-read after loading; screen_look only when text is not enough to judge icons or layout. Draw strokes and circles with mouse_drag. Desktop tools only exist while the switch is on; never claim you can see or click the screen otherwise.
 Independent read_file / list_dir / search_text / map_lookup in the same round should be emitted together as multiple tool calls. write_file calls for different files in the same round also run together. The same file, deletes, create_dir, run_command and ask_user stay serial.
@@ -2244,7 +2285,7 @@ ${appSkills.map((p) => `- ${p}`).join('\n') || '- （无）'}
 已安装技能（只列名字）。只遵守下面选中的技能。不要读取、不要遵守其他 AI 的技能和规则。
 ${catalog || '- （还没有技能）'}
 写入或删除工作目录文件会自动快照，用户可还原。run_command 执行的脚本若改动了工作区文件，也会记入快照和「已更改文件」，可一并还原。
-本会话要点用 working_memory_update；含糊时用 ask_user。
+含糊时用 ask_user。
 三步以上的任务先用 todo_write 列清单；开始做某条就标 in_progress，做完立刻标 completed。单步小事和纯问答不用列。
 ${shellUseZh}；不要写 tmp_*.ps1 批量替换。不要先做编码探针（不要写 enc_*.txt 试编码），write_file 一律 UTF-8。项目地图给方法源码起止行（:起-止）：这是定位依据。归纳可能不准；map_lookup 已附【原文·可直接用】的方法直接用，没附的改前用 read_file 的 startLine/endLine 只读该段，禁止整文件通读几千/几万行。关联脚本是依赖路径，需要对口时同样按命中方法的起止行读段。消息里已有【全文】、或本轮已整读过同一路径的，直接复用。消息里的模块只是第一批，对不上先换关键字 map_lookup，仍不够再用 search_text。用户打开「AGI」后，最后一条消息末尾有【屏幕文字】：前台窗口、其他窗口、这个软件以前记下的操作经验、带编号的控件列表（如 [c12]，来自 Windows UI 自动化）、以及 OCR 文字和中心坐标 @(x,y)。有控件编号时优先用 ui_act 按编号操作（click / toggle / select / expand / set_text），目标没有控件编号时才用 mouse_click 点 @(x,y)。照着以前记下的经验做。打开软件和网页可以使用命令，也可以用键鼠（例如 Win+R 后输入地址），按任务选择可靠方式。任务做成后、或发现不明显的路径和坑时，调用 agi_note 记一句可复用的经验（不记密码、聊天内容等隐私）。删除、发送、付款、Shift+Delete、在聊天软件里按回车这类危险操作，程序会自动先问用户，你不要再自己问一遍；用户不允许就停，禁止换办法绕过去。按「看→做一步→核对」循环：一次只做一个动作，看工具结果里的【操作后】确认生效再做下一步；画面没变就换思路，不要原样重复点。keyboard_type / keyboard_key 之前先确认焦点在目标窗口（window_focus 或点一下输入框）。等界面加载用 screen_read（可带 wait_ms）重读；只有文字判断不了图标、布局时才用 screen_look。画线、画圆用 mouse_drag。开关关着时没有这些工具，不要假装能看见或能点击。
 同一轮里互不依赖的 read_file / list_dir / search_text / map_lookup 请一次发出多条 tool call，不要拆成多轮。不同文件的 write_file 也可以同一轮一起发，程序会同时写。同一个文件、删除、建目录、命令和 ask_user 必须等结果后再做。
@@ -2808,7 +2849,7 @@ function userAskedQuestion(text) {
 }
 
 // [铆钉] 只读审查合同：只拦大脑 depth=0 的写入；绝不拦代码槽派工写入。开工/「开始」优先于只读。其他 AI 请勿删
-const MUTATE_FILE_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'create_dir']);
+const MUTATE_FILE_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'create_dir', 'render_code_video']);
 function wantsChangeNow(text) {
   const t = String(text || '').trim();
   if (!t) return false;
@@ -3366,11 +3407,19 @@ function readChainMap({ workspace, tabId, turnId }) {
   return { nodes: [], edges: [], state: 'no-chain', tabId: String(tabId || ''), turnId: String(turnId || '') };
 }
 
-/** 删除方案里的一条：只有方案未锁定时才允许；删掉后重写方案文件并落盘导图树，返回 {ok, locked/notFound/map} */
+/**
+ * 删除方案里的一条：删掉后重写方案文件、落盘导图树，返回 {ok, notFound, map}。
+ * 删除由用户点界面上的 × 发起，方案锁只约束 AI 不改方案，不约束用户，因此锁定期间照样允许删。
+ * 删完立刻按新内容重建锁，保证后续开工和验收读到的锁定内容与方案文件一致，
+ * 不会把这次用户删除判成 AI 擅自改方案。
+ * @param {object} args
+ * @param {string} args.workspace 工作区根目录，决定方案文件与导图树的位置
+ * @param {string} args.tabId 会话 id，决定是哪一份方案
+ * @param {number|string} args.no 要删的条目编号
+ * @returns {{ok:boolean, notFound?:boolean, map?:object}} 删除结果；map 与 readPlanTree 返回契约一致
+ */
 function removePlanItem({ workspace, tabId, no }) {
   const file = planFileOf(workspace, tabId);
-  // 方案一旦锁定就不许删条目：先拦在入口，避免锁定的方案文件和导图树被改
-  if (readPlanLock(file)) return { ok: false, locked: true };
   const dir = planTreeDir(file);
   let tree = planTree.load(dir);
   if (!tree) {
@@ -3389,12 +3438,28 @@ function removePlanItem({ workspace, tabId, no }) {
   tree.hash = crypto.createHash('sha1').update(tree.serialized).digest('hex');
   writePlanText(file, tree.serialized);
   planTree.save(dir, tree);
+  // 按删除后的方案内容重新锁定：锁比对的必须是同一份方案，用户删条目后不同步会让后续核对误判方案被改
+  const lock = lockPlanFile(file);
   // 删除成功后返回的导图与 readPlanTree 保持同一份契约（state/locked/file），前端重绘时字段不缺失
   const map = planTree.mapOf(tree);
-  map.locked = false;
+  map.locked = !!lock;
   map.state = 'tree';
   map.file = file;
   return { ok: true, map };
+}
+
+/**
+ * 清空当前会话的整张导图：删除本会话的方案文件、锁和导图目录（含 chain_*.json 链路图）。
+ * 直接复用 retirePlanFile，因此同样兼容旧版带窗口号的「N_会话id.md」及其锁，且只按会话 id 定位，
+ * 不会误删其他会话的方案。
+ * @param {{workspace?:string, tabId?:string}} args workspace 工作区路径（为空时落在 SpCode 数据目录）；tabId 会话键（可带「窗口号:」前缀）
+ * @returns {{ok:boolean, file:string}} ok 固定为 true；file 为本次清算的方案文件绝对路径，便于前端刷新
+ * @sideeffect 会真实删除磁盘上的方案文件、锁文件与导图目录，不可恢复
+ */
+function clearPlanMap({ workspace, tabId }) {
+  const file = planFileOf(workspace, tabId);
+  retirePlanFile(file);
+  return { ok: true, file };
 }
 
 /** 本轮改过、方案没点名、而且现在仍和改动前不一样的文件。程序不撤回，也不许 AI 改回去：只列成不一致报告给用户，回滚、撤回、还原一律由用户在界面上操作 */
@@ -3836,6 +3901,8 @@ function isUserStop(e, signal) {
 function isRetryableHttpError(e) {
   if (!e || isUserStop(e)) return false;
   if (e.code === 'timeout') return false;
+  // 底层流异常（如 Electron net.fetch 返回已锁定的 body）允许自动重试
+  if (e.code === 'stream_locked' || e.code === 'stream_error') return true;
   const status = Number(e.status || e.statusCode || 0);
   if ([408, 409, 425, 429, 500, 502, 503, 504].includes(status)) return true;
   const msg = String(e.message || e.body || e || '');
@@ -4083,6 +4150,7 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
     keyboard_key: '按键',
     run_command: '沙盒命令',
     generate_media: '生成',
+    render_code_video: '代码做视频',
     call_worker: '交给部下'
   };
   // 部下用 Cursor 模型时整段工具循环交给一个 Cursor 会话，不再每轮新建 Agent 重发全文
@@ -4143,11 +4211,9 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
   const roundCap = hardRounds > 0 ? hardRounds : (unlimited ? Number.POSITIVE_INFINITY : SAFETY_MAX_ROUNDS);
   for (let round = 0; round < roundCap; round++) {
     if (signal?.aborted) throw new Error('已停止');
-    // 每轮开始先把本会话用户从悬浮栏插话的内容并入消息，让模型下一轮立即看到。
-    // 只排空本会话（interjectKey）的队列，其他会话的队列留着，避免串会话；key 为空时不动任何队列
-    const k = interjectKey == null ? '' : String(interjectKey);
-    const queued = k ? (interjectInbox.get(k) || []) : [];
-    if (k) interjectInbox.delete(k);
+    // 每次模型请求前消费本会话补充，其他会话保持独立。
+    const queued = takeInterjections(interjectKey, onEvent);
+    if (queued.length) onEvent({ type: 'status', text: '插话已送达 AI，正在优先处理…' });
     for (let i = 0; i < queued.length; i++) {
       messages.push({ role: 'user', content: queued[i] });
       // 插话「开始 / 开始改」优先解除只读，避免卡住后续派工
@@ -4322,6 +4388,11 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
     }
 
     if (!calls.length) {
+      // 请求执行中仍可收到插话；在下一次请求读取它，不能直接收尾清空队列。
+      if (interjectInbox.get(String(interjectKey))?.length) {
+        onEvent({ type: 'rewrite_text', text: '' });
+        continue;
+      }
       if (agiBrain && !agiUsed && !isZbaing && agiForceCount < 3 && round < SAFETY_MAX_ROUNDS - 1) {
         forceTool = { type: 'function', function: { name: 'screen_read' } };
         messages.push({ role: 'user', content: AGI_MUST_LOOK });
@@ -4513,7 +4584,7 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
               const msg = await completeWithFallback({
                 modelCfg: worker,
                 messages: [
-                  { role: 'system', content: '你是规划模块。你不直接接用户需求，也不向代码或总结模块提问。只根据大脑写给你的内容拆步骤、顺序和风险。内容不够就写清缺什么，回报大脑补全，不要自己读文件，不要改文件，不要向用户要需求。' },
+                  { role: 'system', content: buildModulePrompt('planning', snap.modulePromptContext) },
                   { role: 'user', content: planHead + task }
                 ],
                 noTools: true,
@@ -4557,11 +4628,11 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
             const gapRule = snap && snap.planGaps
               ? '派单开头有【验收不一致·必须改】：只改那几条，改成该条「要改成什么」。'
               : '';
-            const codeSys = `你是实现模型，不和用户对接，也不向规划或总结模块提问。「开始」不约束你。大脑的派单就是开工令，立刻按派单改文件。派单里已经给出要替换的原文时，直接用 edit_file：old_string 从派单原文原样复制（不带行号前缀），禁止先 read_file，禁止整文件重读。派单只有路径和行号、没有原文时，只允许用 startLine/endLine 读那一小段再 edit_file，仍然禁止整文件重读。派单缺原文、缺路径、看不懂时，停手把缺口写清楚回报大脑，等大脑补全后再做；禁止自己扩大阅读范围，禁止把任务交给上一个模块。新建文件或几乎整份重写才用 write_file。禁止用 run_command 跑 python/node/powershell 脚本改文件，禁止用它搜代码或列目录。edit_file 返回出现多处时，带上 line（大约第几行）再调一次；返回没找到时，照它给出的最相近原文改 old_string 再调；改完的落点和行号偏移它会直接告诉你，不用再读文件确认。仍不够就回报大脑。禁止说执行环境找不到，禁止要求把目录加进工作区。派单里写明的目标就是依据，必须写入派单给出的文件。禁止读取 .cursor、AGENTS.md、CLAUDE.md 以及其他 AI 的技能和规则。遵循 UTF-8、中文注释和禁止改动范围。互不依赖的文件可一次发多条 edit_file / write_file。同一个文件的多处修改按顺序逐条 edit_file。改完只列出这次实际写入的文件。只实现派单写明的内容；派单没点名的一律不动；发现别处也该改，只在报告里列出来。不得给已经正确的逻辑额外套吞异常的保护壳；注释只说明功能与原因，禁止写「其他 AI 请勿删除」。${gapRule}${planHead ? '派单前附了【已确认方案】：只能改方案点名的文件。改了方案外的文件会记违规，还要按方案改回去。' : ''}${unityCode}${houseStyle.promptBlockIfNeeded(false, task)}${planHead ? workerPressure.promptBlock(workspace) : ''}`;
+            const codeSys = `你是实现模型，不和用户对接，也不向规划或总结模块提问。「开始」不约束你。大脑的派单就是开工令，立刻按派单改文件。派单里已经给出要替换的原文时，直接用 edit_file：old_string 从派单原文原样复制（不带行号前缀），禁止先 read_file，禁止整文件重读。派单只有路径和行号、没有原文时，只允许用 startLine/endLine 读那一小段再 edit_file，仍然禁止整文件重读。派单缺原文、缺路径、看不懂时，停手把缺口写清楚回报大脑，等大脑补全后再做；禁止自己扩大阅读范围，禁止把任务交给上一个模块。新建文件或几乎整份重写才用 write_file。禁止用 run_command 跑 python/node/powershell 脚本改文件，禁止用它搜代码或列目录。edit_file 返回出现多处时，带上 line（大约第几行）再调一次；返回没找到时，照它给出的最相近原文改 old_string 再调；改完的落点和行号偏移它会直接告诉你，不用再读文件确认。仍不够就回报大脑。禁止说执行环境找不到，禁止要求把目录加进工作区。派单里写明的目标就是依据，必须写入派单给出的文件。禁止读取 .cursor、AGENTS.md、CLAUDE.md 以及其他 AI 的技能和规则。遵循 UTF-8、中文注释和禁止改动范围。互不依赖的文件可一次发多条 edit_file / write_file。同一个文件的多处修改按顺序逐条 edit_file。改完只列出这次实际写入的文件。只实现派单写明的内容；派单没点名的一律不动；发现别处也该改，只在报告里列出来。不得给已经正确的逻辑额外套吞异常的保护壳；注释只说明功能与原因，禁止写「其他 AI 请勿删除」。${gapRule}${planHead ? '派单前附了【已确认方案】：只能改方案点名的文件。改了方案外的文件会记违规，验收不得通过；必须回报大脑，交由用户在界面还原后再按方案继续，禁止自行回滚或还原代码。' : ''}${unityCode}${houseStyle.promptBlockIfNeeded(false, task)}${planHead ? workerPressure.promptBlock(workspace) : ''}`;
             const out = await agentLoop({
               modelCfg: worker,
               messages: [
-                { role: 'system', content: codeSys + COMMENT_POLICY },
+                { role: 'system', content: buildModulePrompt('code', snap.modulePromptContext, codeSys + COMMENT_POLICY) },
                 { role: 'user', content: planHead + task }
               ],
               workspace,
@@ -4890,8 +4961,9 @@ function turnActionText(messages) {
 
 // 用户这轮只说「开始 / 好 / 改吧」时，真正的需求在前面：带上最近一条实质需求，
 // 再带近期未 skip 的用户轮标题，提醒还有堆积需求。方案以锁定的方案文件为准
-function requirementText(userText, history, started = false) {
-  const now = String(userText || '').trim();
+function requirementText(userText, history, started = false, interjections = []) {
+  // 已经送达模型的插话同样属于本轮需求，避免总结端仍拿旧目标否定新的执行结果。
+  const now = [String(userText || '').trim(), interjections.length ? interjectionBlock(interjections) : ''].filter(Boolean).join('\n\n');
   const items = Array.isArray(history) ? history : [];
   if (!started && !userOrderedStart(now)) return now;
   let ask = '';
@@ -5018,7 +5090,7 @@ async function summarizeImplementation({ vs, modelCfg, userText, assistantText, 
     const msg = await completeWithFallback({
       modelCfg: cfg,
       messages: [
-        { role: 'system', content: '只输出核对结论。不要调用工具。' },
+        { role: 'system', content: buildModulePrompt('summary', snap?.modulePromptContext, '只输出核对结论。不要调用工具。') },
         { role: 'user', content: prompt }
       ],
       noTools: true,
@@ -5041,7 +5113,7 @@ async function summarizeImplementation({ vs, modelCfg, userText, assistantText, 
   const out = await agentLoop({
     modelCfg: cfg,
     messages: [
-      { role: 'system', content: '你是总结模块，只核对、不改代码。可以用只读工具查代码。核对本次新增或修改的代码是否有清晰、准确的注释（方法用途、适用的参数/返回值、关键逻辑），缺失或过期时列为具体缺口回报大脑。最后只输出核对结论。' },
+      { role: 'system', content: buildModulePrompt('summary', snap?.modulePromptContext, '只核对、不改代码。可以用只读工具查代码。核对本次新增或修改的代码是否有清晰、准确的注释（方法用途、适用的参数/返回值、关键逻辑），缺失或过期时列为具体缺口回报大脑。最后只输出核对结论。') },
       { role: 'user', content: prompt }
     ],
     workspace,
@@ -5070,6 +5142,8 @@ async function runTurn({
   contextPaths,
   skill,
   rules,
+  // 预览面板里改过的人设正文：只覆盖本轮系统提示中的人设段，不写回磁盘，也不影响下一轮
+  personaOverride,
   allSkills,
   onEvent,
   signal,
@@ -5091,7 +5165,13 @@ async function runTurn({
   try { brainPressure.noteUser(workspace, userText); } catch { /* 压力没记上也不打断这轮 */ }
   try {
   if (!modelCfg) {
-    throw new Error('请先选择模型');
+    // 没选模型时给界面一个明确状态，而不是抛未捕获异常
+    onEvent({ type: 'status', text: '请先选择模型' });
+    onEvent({
+      type: 'error',
+      text: '请先选择模型：顶部模型栏没有勾选任何模型，勾选后再发送。'
+    });
+    return { text: '', snapshotId: null, changes: [], done: true };
   }
   if (isZbaingAi(modelCfg)) {
     // zbaingAi 走本地 Python 引擎，不需要 API 地址或 GGUF 文件
@@ -5125,9 +5205,13 @@ async function runTurn({
   }
 
   const extra = extraRoots(appRoot, workspace, extraFolders);
-  const persona = skillsLib.loadPersona(appRoot).body || '';
+  // 人设段来源：预览面板改过的人设（personaOverride）只作用于本次发送，非空字符串时直接顶替；
+  // 其余情况仍按 appRoot 从技能库读取磁盘上的 persona 文件，保证常规发送行为不变
+  const personaOverrideText = typeof personaOverride === 'string' ? personaOverride.trim() : '';
+  const persona = personaOverrideText || skillsLib.loadPersona(appRoot).body || '';
   // readOnly：本轮明确只审/只读时由工具层拦截写入，不靠模型自觉
-  const snap = { current: null, readOnly: readOnlyIntent(userText) };
+  // 内部模块只继承本轮生效的技能和规则，不保存大脑人设或会话记忆。
+  const snap = { current: null, readOnly: readOnlyIntent(userText), modulePromptContext: { rules, skill } };
   const vs = store.load();
   // 直通只接 Cursor 大脑：工具仍是 SpCode 的，循环交给 Cursor 会话。大脑是 Cursor 模型就自动走直通，否则走原来的工作流
   const directProtocol = apiProtocol.normalizeProtocol(modelCfg.protocol);
@@ -5258,7 +5342,7 @@ async function runTurn({
     noVisionHint: visionHint,
     skipImageNote: useHelper
   });
-  // 附件是用户这轮手动提供的材料，不计入自动上下文预算。
+  // 附件是用户这轮手动提供的材料：先按顺序拼在最前，再拼自动检索内容，两者都不裁剪
   const manualExtraCount = extraTexts.length;
   if (skippedImages.length && !useHelper) {
     onEvent({ type: 'think', text: `当前模型看不到图片，已改为文字说明。${visionHint}` });
@@ -5307,7 +5391,7 @@ async function runTurn({
   if (workspace && String(userText || '').trim()) {
     try {
       const block = codeIndex.buildPromptBlock(workspace, userText, extra);
-      if (block) extraTexts.push(capAutoContext(block, AUTO_CONTEXT_LIMITS.map, { label: '项目地图上下文' }));
+      if (block) extraTexts.push(block);
     } catch (e) {
       diag.log('map', '地图注入失败，本轮跳过', { message: e && e.message });
     }
@@ -5349,7 +5433,7 @@ async function runTurn({
     }
     if (visionResults.length) {
       extraTexts.push('—— 以下是看图模型对图片的识别内容（仅文字，无画面） ——');
-      extraTexts.push(capAutoContext(visionResults.join('\n\n'), AUTO_CONTEXT_LIMITS.vision, { label: '自动图片识别上下文' }));
+      extraTexts.push(visionResults.join('\n\n'));
     }
     if (failNotes.length && !visionResults.length) {
       extraTexts.push(`【图片识别失败】${failNotes[0]}`);
@@ -5365,7 +5449,7 @@ async function runTurn({
       .filter((r) => assembly.GEN_ROLE_IDS.includes(r));
     if (genRoles.length) {
       const kinds = Object.keys(GEN_KIND_ROLE).filter((k) => genRoles.includes(GEN_KIND_ROLE[k]));
-      extraTexts.push(`【生成提示】用户这轮要生成内容（${kinds.join('、')}）。请调用 generate_media，kind 填 ${kinds.join(' 或 ')}，prompt 写你按对话整理好的完整画面描述；要几张就调用几次。生成不需要用户说「开始」。`);
+      extraTexts.push(`【生成提示】用户这轮要生成内容（${kinds.join('、')}）。代码动画视频先写 HTML 再调用 render_code_video；需要生成模型素材时调用 generate_media，kind 填 ${kinds.join(' 或 ')}，prompt 写完整画面描述；要几张就调用几次。生成模型素材不需要用户说「开始」。`);
     }
   }
 
@@ -5418,12 +5502,13 @@ async function runTurn({
         const helperHistory = compact.collapseDuplicateFullText(helperPacked.history, currentMaterial);
         collapseRepeatReads(helperHistory);
         const helperDialog = helperHistory.map((m) => `${m.role === 'user' ? '用户' : '助手'}：${String(m.content || '')}`).join('\n\n');
-        const material = [currentMaterial.slice(0, 16000), helperDialog && `【近期对话】\n${helperDialog.slice(0, 6000)}`, helperPacked.contextSummary && `【较早对话摘要】\n${helperPacked.contextSummary.slice(0, 2000)}`]
-          .filter(Boolean).join('\n\n').slice(0, 24000);
+        // 辅助模型材料原样拼入：当前材料、近期对话、较早对话摘要都不再按字符数裁剪，避免摘要失真
+        const material = [currentMaterial, helperDialog && `【近期对话】\n${helperDialog}`, helperPacked.contextSummary && `【较早对话摘要】\n${helperPacked.contextSummary}`]
+          .filter(Boolean).join('\n\n');
         const msg = await completeWithFallback({
           modelCfg: helperCfg,
           messages: [
-            { role: 'system', content: assembly.helperPrompt(role, lang) },
+            { role: 'system', content: buildModulePrompt(role, snap?.modulePromptContext, assembly.helperPrompt(role, lang)) },
             { role: 'user', content: material || '请根据材料给出结果' }
           ],
           noTools: true,
@@ -5439,7 +5524,7 @@ async function runTurn({
         const out = String(msg?.content || '').trim();
         if (!out) throw new Error('辅助模型无输出');
         extraTexts.push(`—— 以下是${roleName}模型「${helperLabel}」的预处理结果 ——`);
-        extraTexts.push(capAutoContext(out, AUTO_CONTEXT_LIMITS.helper, { label: '自动辅助模型上下文' }));
+        extraTexts.push(out);
         onEvent({ type: 'think', text: `${roleName}预处理完成（${srcHint}）` });
         used = true;
         break;
@@ -5527,20 +5612,16 @@ async function runTurn({
     if (m.removed) box.removed = true;
     if (m.skip) box.skip = true;
   }
-  // 用户标了不适用或已从上下文删除的轮次不进全文也不进索引
-  let hist = dialogMsgs.filter((m) => !m.skip && !m.removed).map((m) => ({
+  // 用户标了不适用或已从上下文删除的轮次不进入发送历史。
+  const fullHist = dialogMsgs.filter((m) => !m.skip && !m.removed).map((m) => ({
     role: m.role,
     content: typeof m.content === 'string' ? m.content : (m.text || ''),
     round: m.round,
     index: m.index
   }));
-  let dialogIndexText = '';
-  // 历史只发标题索引，不发全文；要细节时模型用 dialog_lookup 按编号查
-  if (hist.length) {
-    dialogIndexText = compact.titleIndexOf(hist);
-    hist = [];
-    onEvent({ type: 'think', text: '之前的对话只发标题索引，需要细节时按编号查原文' });
-  }
+  // 最近一轮仍按原有方式发送全文；更早的对话不再额外生成或发送标题索引。
+  const { latest } = compact.splitLatestRound(fullHist);
+  let hist = latest;
 
   let globalPrefs = [];
   try {
@@ -5552,11 +5633,8 @@ async function runTurn({
 
   const userContent = [];
   const manualExtraText = extraTexts.slice(0, manualExtraCount).join('\n\n');
-  const autoExtraText = capAutoContext(
-    extraTexts.slice(manualExtraCount).join('\n\n'),
-    AUTO_CONTEXT_LIMITS.extraTotal,
-    { label: '自动检索与辅助上下文' }
-  );
+  // 自动检索与辅助结果全量拼进用户消息，不再按总量裁剪
+  const autoExtraText = extraTexts.slice(manualExtraCount).join('\n\n');
   const textBlock = [userText, manualExtraText, autoExtraText, ctxChunks.join('\n\n')].filter(Boolean).join('\n\n');
   hist = compact.collapseDuplicateFullText(hist, textBlock);
   compact.collapseRepeatReads(hist);
@@ -5608,37 +5686,7 @@ async function runTurn({
     if (zbaingChat) {
       return mergeTurns([...slimZbaingHist(histMsgs), userMsg]);
     }
-    const luna = /luna/i.test(`${modelCfg?.model || ''} ${modelCfg?.name || ''}`);
     const agiNow = desktopOn();
-    const lunaLine = !luna ? '' : (agiNow
-      ? (replyLang.promptInEnglish(lang)
-        ? '\n\nLuna: AGI is on. The user only accepts the result. Do not wait for start. Call screen_read first, then finish the files, commands, and desktop actions yourself. Do not call call_worker.\n'
-        : '\n\nLuna：AGI 开着。用户只管验收。不要等「开始」。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。禁止 call_worker。\n')
-      : (turnStart
-      ? (replyLang.promptInEnglish(lang)
-        ? '\n\nLuna: the user said start this turn. Dispatch code with call_worker, role code. Text alone does not edit files.\n'
-        : '\n\nLuna：用户这轮说了开始。派代码必须调用 call_worker，role 填 code。只有文字不会改文件。\n')
-      : (replyLang.promptInEnglish(lang)
-        ? '\n\nLuna: the user did not say start. Only the brain answers. You may read_file, search_text, and list_dir. Do not call call_worker. Do not hand off to the code model.\n'
-        : '\n\nLuna：用户这轮没有说开始。只由大脑回答。可以 read_file、search_text、list_dir 查原因。禁止 call_worker，禁止派给代码模块。\n')));
-    // [铆钉优化] 没说开始时写文件和派单工具是故意收起的，大脑必须知道原因，
-    // 否则会对用户说「没有可用的文件写入工具」。其他 AI 请勿删除
-    const directName = codexDirectOn ? 'Codex' : 'Cursor';
-    const directHandsOff = !!codeWorker && !agiNow;
-    const directLine = !directOn ? '' : agiNow
-      ? `\n\n${directName} 直通已接通，当前为 AGI。直接使用 SpCode 工具完成用户目标，无需写入方案或等待开始，不派代码模块；实际工具结果是执行依据。\n`
-      : (!turnStart && userAskedQuestion(userText))
-        ? `\n\n${directName} 直通已接通。本轮是交流与排查，遵守所选人设和规则，按需使用 SpCode 只读工具继续分析并回答用户；不要要求写入方案或开始。\n`
-      : (directHandsOff
-      ? (turnStart
-        ? `\n\n${directName} 直通已接通。你是大脑，只负责理解需求、查资料、和用户确认方案；用户已经确认开始，立刻调用 SpCode 的 call_worker，role 填 code，把完整实现任务派给代码槽。禁止自己写文件或执行命令。总结模块只在代码完成后核对，不和用户对话。\n`
-        : `\n\n${directName} 直通已接通。你是唯一和用户对接的大脑。可以用 SpCode 只读工具查资料；需要改代码时先输出完整【方案】…【/方案】，等用户点「写入方案」或明确单独发送「/spcode-start」。${planningWorker ? '需要拆解执行步骤时，可后台调用 call_worker，role 填 planning；规划结果只回给你，由你负责和用户对接。' : ''}禁止自己写文件或执行命令。收到开始后调用 call_worker，role 填 code；总结模块只在代码完成后核对，不和用户对话。\n`)
-      : (turnStart
-        ? `\n\n${directName} 直通已接通。工具由 SpCode 提供，你自己调用 read_file、edit_file、write_file、search_text、map_lookup、list_dir、run_command。禁止说 Tool not found 或工具列表是空的。用户这轮已经说了开始，照锁定的方案文件立刻改文件，不要再复述方案。\n`
-        : `\n\n${directName} 直通已接通。工具由 SpCode 提供。可以 read_file、search_text、map_lookup、list_dir。还没说开始时不要改项目文件，把完整方案写在回复的【方案】…【/方案】段里；用户可以点「写入方案」，也可以明确单独发送「/spcode-start」确认并锁定最新方案。禁止说 Tool not found 或工具列表是空的。\n`));
-    const gateLine = (agiNow || turnStart || userAskedQuestion(userText) || !codeWorker || directOn) ? '' : (replyLang.promptInEnglish(lang)
-      ? '\n\nStart gate: the user has not said "start" this turn, so file-writing and call_worker are intentionally unavailable. This is normal, not a missing tool. Never tell the user you lack a write tool or cannot edit files. If they want a change, write the full plan in your reply between 【方案】 and 【/方案】 and end with: 核对方案无误后点「写入方案」，确认无误后单独发送「/spcode-start」，我再动手.\n'
-      : '\n\n开工门槛：用户这轮还没说「开始」，所以写项目文件和派单工具是按规则暂时收起的，这是正常的，不是缺工具。禁止对用户说「没有写入工具」「不能改文件」「无法写入」。用户想改东西时，把完整方案写在回复的【方案】…【/方案】段里，结尾写：核对方案无误后点「写入方案」，确认无误后单独发送「/spcode-start」，我再动手。\n');
     return [
     {
       role: 'system',
@@ -5654,9 +5702,6 @@ async function runTurn({
         lang,
         globalPrefs,
         profile,
-        workingMemory: workingMemoryRef.current,
-        contextSummary: summaryText,
-        dialogIndex: dialogIndexText,
         zbaingBridge: isZbaingAi(modelCfg),
         brainHandsOff: !!codeWorker && !agiNow,
         hasPlanning: !!planningWorker,
@@ -5666,9 +5711,17 @@ async function runTurn({
         // 只按 AGI 判断会让全解放时提示词仍写着「思考上限 N 轮」，模型就自以为有轮次限制
         thinkBudget: (desktopOn() || !!unlimitedRounds) ? null : roundLimit,
         planFile: snap.planFile
-      }) + lunaLine + directLine + gateLine + (modelCfg?.id === 'zabingAI' || modelCfg?.name === 'zabingAI'
-      ? '\n\n你是 zabingAI，底模是 Qwen2.5-Coder-7B-Instruct。只根据用户这条消息里已经给出的代码、报错和文件内容回答。材料不够就自己去仓库里找，找到再答。不要编造不存在的接口、路径或运行结果，也不要停下来拒绝用户。\n'
-      : '')
+      }) + composePromptTail({
+        modelCfg,
+        turnStart,
+        userText,
+        codeWorker,
+        planningWorker,
+        agiNow,
+        lang,
+        cursorDirectOn,
+        codexDirectOn
+      })
     },
     ...agedHist,
     userMsg
@@ -5685,7 +5738,12 @@ async function runTurn({
     onEvent({ type: 'think', text: `正在调用 ${modelLabel}...` });
   }
   let zbaingMeta = null;
+  const turnInterjections = [];
   const trackEvent = (ev) => {
+    if (ev.type === 'interjection') {
+      turnInterjections.push(...ev.texts);
+      return;
+    }
     if (ev.type === 'zbaing_meta') {
       zbaingMeta = { source: ev.source, prompt: ev.prompt, minConf: ev.minConf };
     }
@@ -5696,7 +5754,7 @@ async function runTurn({
   const directLabels = {
     list_dir: '查看目录', read_file: '读取文件', write_file: '写入文件', edit_file: '修改文件',
     create_dir: '创建文件夹', delete_file: '删除文件', search_text: '搜索代码', map_lookup: '查项目地图', dialog_lookup: '查对话索引',
-    goto_definition: '跳转到定义', ask_user: '询问用户', run_command: '沙盒命令', generate_media: '生成'
+    goto_definition: '跳转到定义', ask_user: '询问用户', run_command: '沙盒命令', generate_media: '生成', render_code_video: '代码做视频'
   };
   function directDetail(name, args) {
     const a = args || {};
@@ -5753,9 +5811,12 @@ async function runTurn({
   }
   // 直通使用模型原生 MCP 会话；规划只在后台调用，方案与总结验收仍由本轮外层流程处理
   async function runBrain(loopMessages, startOrdered) {
+    const inboxKey = String(interjectKey || '');
+    activeInterjectKeys.add(inboxKey);
+    try {
     if (startOrdered) directWrites = true;
     if (!directOn) {
-      return agentLoop({
+      return await agentLoop({
         modelCfg,
         messages: loopMessages,
         workspace,
@@ -5849,7 +5910,7 @@ async function runTurn({
       key: interjectKey || `${directProtocol}:${workspace || 'none'}`,
       // Cursor 在建 Agent 时注册 customTools，Codex SDK 也会缓存 MCP 工具发现结果。
       // 工具、规则、技能内容和人设变化后重建会话，避免沿用旧工具集或冲突的历史规则。
-      sig: [modelCfg.model || '', modelCfg.apiKey || '', workspace || '', (skill && skill.id) || '', startOrdered ? 'start' : 'plan', String(contextRevision || ''), crypto.createHash('sha256').update(JSON.stringify({ rules, skill, persona, version: 'complete-investigation-v4' })).digest('hex'), JSON.stringify(directTools)].join('\n'),
+      sig: [modelCfg.model || '', modelCfg.apiKey || '', workspace || '', (skill && skill.id) || '', startOrdered ? 'start' : 'plan', String(contextRevision || ''), crypto.createHash('sha256').update(JSON.stringify({ rules, skill, persona, version: 'role-prompts-v5' })).digest('hex'), JSON.stringify(directTools)].join('\n'),
       fresh: false,
       modelCfg,
       workspace: undefined,
@@ -5876,7 +5937,7 @@ async function runTurn({
           const planned = await completeWithFallback({
             modelCfg: planningWorker,
             messages: [
-              { role: 'system', content: '你是规划模块。只给大脑整理执行步骤、顺序和风险；不要和用户对话，不要读写项目文件，不要调用工具。材料不足时只向大脑指出具体缺口。' },
+              { role: 'system', content: buildModulePrompt('planning', snap.modulePromptContext) },
               { role: 'user', content: task }
             ],
             noTools: true,
@@ -5907,7 +5968,7 @@ async function runTurn({
         };
         onEvent({ type: 'status', text: `正在调用 ${codeWorker.model || codeWorker.name || '代码模型'}（代码 · 实现）…`, activeModel: codeWorker.model || codeWorker.name || '', activeRole: 'code' });
         const workerMessages = [
-          { role: 'system', content: codeSys + COMMENT_POLICY },
+          { role: 'system', content: buildModulePrompt('code', snap.modulePromptContext, codeSys + COMMENT_POLICY) },
           { role: 'user', content: planHead + task }
         ];
         const workerProtocol = apiProtocol.normalizeProtocol(codeWorker.protocol);
@@ -5950,20 +6011,20 @@ async function runTurn({
       onEvent: trackEvent,
       signal
     };
-    let out = await direct.runTurn(directArgs);
+    let out = await runDirectWithInterjections(direct, directArgs, interjectKey);
     let answer = String(out && out.content || '').trim();
     const discussion = !desktopOn() && !directCanDispatch && userAskedQuestion(userText);
     // 直通绕过普通循环的收尾检查。仅为明确的未执行承诺补一次，不给所有聊天加审核请求。
     if (discussion && promisesMoreInvestigation(answer) && !signal?.aborted) {
       trackEvent({ type: 'rewrite_text', text: '' });
       trackEvent({ type: 'status', text: '正在补完尚未执行的只读核对…' });
-      out = await direct.runTurn({
+      out = await runDirectWithInterjections(direct, {
         ...directArgs,
         firstPrefix: '',
         systemContext: '',
         userContent: '',
         turnText: investigationContinuationPrompt(replyLang.promptInEnglish(lang))
-      });
+      }, interjectKey);
       answer = String(out && out.content || '').trim();
     }
     if (discussion && promisesMoreInvestigation(answer)) {
@@ -5971,6 +6032,10 @@ async function runTurn({
       trackEvent({ type: 'rewrite_text', text: answer });
     }
     return answer;
+    } finally {
+      // 收尾验收不再接受无法消费的插话；调用方会把新消息交给正常发送队列。
+      activeInterjectKeys.delete(inboxKey);
+    }
   }
   // 方案树逐条执行：程序一条一条派给代码模块，每次只带这一条；做完立刻机械验收，不通过退回重做
   const PLAN_ITEM_TRIES = 2;
@@ -6030,7 +6095,7 @@ async function runTurn({
       try {
         await agentLoop({
           modelCfg: worker,
-          messages: [{ role: 'system', content: sys + COMMENT_POLICY }, { role: 'user', content: planItemTask(it, total, feedback) }],
+          messages: [{ role: 'system', content: buildModulePrompt('code', snap.modulePromptContext, sys + COMMENT_POLICY) }, { role: 'user', content: planItemTask(it, total, feedback) }],
           workspace, extra, snap, onEvent: trackEvent, signal, lang, workingMemoryRef, waitForUserAnswer,
           maxRounds: roundLimit, unlimitedRounds: !!unlimitedRounds,
           toolSpec: toolsFor('worker'), workers: null, roleTag: 'code', depth: 1, interjectKey
@@ -6151,7 +6216,7 @@ async function runTurn({
     for (let attempt = 1; ; attempt += 1) {
       try {
         verdict = await summarizeImplementation({
-          vs, modelCfg, userText: requirementText(userText, history, turnStart), assistantText: finalText,
+          vs, modelCfg, userText: requirementText(userText, history, turnStart, turnInterjections), assistantText: finalText,
           workspace, snap, changes: codeChanges, onEvent, signal, messages,
           agiReport: !codeChanges.length
         });
@@ -6259,7 +6324,7 @@ async function runTurn({
       let verdict = '';
       try {
         verdict = await summarizeImplementation({
-          vs, modelCfg, userText: requirementText(userText, history, turnStart), assistantText: finalText,
+          vs, modelCfg, userText: requirementText(userText, history, turnStart, turnInterjections), assistantText: finalText,
           workspace, snap, changes: codeChanges, onEvent, signal, messages,
           agiReport: false
         });
@@ -6394,7 +6459,10 @@ async function runTurn({
   if (!changes.length && !explicitPreferenceSaved && profileSignal && !isZbaingAi(modelCfg) && !signal?.aborted) {
     completeWithFallback({
       modelCfg: compact.pickSummaryCfg(vs, modelCfg),
-      messages: [{ role: 'user', content: memoryGlobal.profileExtractPrompt(String(userText || '').slice(0, 1600), String(finalText || '').slice(0, 800)) }],
+      messages: [
+        { role: 'system', content: buildModulePrompt('profile', snap.modulePromptContext) },
+        { role: 'user', content: memoryGlobal.profileExtractPrompt(String(userText || '').slice(0, 1600), String(finalText || '').slice(0, 800)) }
+      ],
       noTools: true,
       signal,
       onDelta: () => {},
@@ -6472,5 +6540,58 @@ function parseProjectMapJsonArray(text) {
   }
 }
 
+/**
+ * 拼装 system 内容尾部的附加段：Luna 直通说明、Cursor/Codex 直通说明、开工门槛、zabingAI 底模说明。
+ * 从 buildMessages 的闭包里抽出来，是为了让「塞给 AI 的提示词」预览面板能按同一套逻辑拼出 system 文本。
+ * @param {object} ctx 本轮上下文，字段与 runTurn 里 buildMessages 的闭包变量一一对应：
+ *   modelCfg 当前模型配置（判 Luna、判 zabingAI 底模）；turnStart 本轮用户是否已说开始；
+ *   userText 本轮用户原文（判「只是提问排查」）；codeWorker / planningWorker 是否挂了代码槽 / 规划槽；
+ *   agiNow 是否 AGI 模式；lang 回复语言；cursorDirectOn / codexDirectOn 两种直通协议开关。
+ *   unlimitedRounds、roundLimit、planFile 由预览面板一并传入，本函数不使用，只为两边调用签名保持一致。
+ * @returns {string} 直接接在 buildSystemPrompt 返回值后面的字符串；四段都没命中时返回空串。
+ */
+function composePromptTail(ctx) {
+  // 先解构本轮上下文；预览面板可能少传字段，统一按空值处理，判空逻辑沿用下面的 !xxx 写法
+  const { modelCfg, turnStart, userText, codeWorker, planningWorker, agiNow, lang,
+    cursorDirectOn, codexDirectOn } = ctx || {};
+  // Luna 直通段：按 AGI 开关和本轮是否已开始，提示该派单还是该自己动手
+  const luna = /luna/i.test(`${modelCfg?.model || ''} ${modelCfg?.name || ''}`);
+  const lunaLine = !luna ? '' : (agiNow
+      ? (replyLang.promptInEnglish(lang)
+        ? '\n\nLuna: AGI is on. The user only accepts the result. Do not wait for start. Call screen_read first, then finish the files, commands, and desktop actions yourself. Do not call call_worker.\n'
+        : '\n\nLuna：AGI 开着。用户只管验收。不要等「开始」。必须先调用 screen_read，然后自己改文件、跑命令、操作键鼠。禁止 call_worker。\n')
+      : (turnStart
+      ? (replyLang.promptInEnglish(lang)
+        ? '\n\nLuna: the user said start this turn. Dispatch code with call_worker, role code. Text alone does not edit files.\n'
+        : '\n\nLuna：用户这轮说了开始。派代码必须调用 call_worker，role 填 code。只有文字不会改文件。\n')
+      : (replyLang.promptInEnglish(lang)
+        ? '\n\nLuna: the user did not say start. Only the brain answers. You may read_file, search_text, and list_dir. Do not call call_worker. Do not hand off to the code model.\n'
+        : '\n\nLuna：用户这轮没有说开始。只由大脑回答。可以 read_file、search_text、list_dir 查原因。禁止 call_worker，禁止派给代码模块。\n')));
+  // 直通段：AGI / 只读排查 / 派单模式 / 自己动手，四种处境给不同的工具权限说明
+  const directOn = cursorDirectOn || codexDirectOn;
+  const directName = codexDirectOn ? 'Codex' : 'Cursor';
+  const directHandsOff = !!codeWorker && !agiNow;
+  const directLine = !directOn ? '' : agiNow
+      ? `\n\n${directName} 直通已接通，当前为 AGI。直接使用 SpCode 工具完成用户目标，无需写入方案或等待开始，不派代码模块；实际工具结果是执行依据。\n`
+      : (!turnStart && userAskedQuestion(userText))
+        ? `\n\n${directName} 直通已接通。本轮是交流与排查，遵守所选人设和规则，按需使用 SpCode 只读工具继续分析并回答用户；不要要求写入方案或开始。\n`
+      : (directHandsOff
+      ? (turnStart
+        ? `\n\n${directName} 直通已接通。你是大脑，只负责理解需求、查资料、和用户确认方案；用户已经确认开始，立刻调用 SpCode 的 call_worker，role 填 code，把完整实现任务派给代码槽。禁止自己写文件或执行命令。总结模块只在代码完成后核对，不和用户对话。\n`
+        : `\n\n${directName} 直通已接通。你是唯一和用户对接的大脑。可以用 SpCode 只读工具查资料；需要改代码时先输出完整【方案】…【/方案】，等用户点「写入方案」或明确单独发送「/spcode-start」。${planningWorker ? '需要拆解执行步骤时，可后台调用 call_worker，role 填 planning；规划结果只回给你，由你负责和用户对接。' : ''}禁止自己写文件或执行命令。收到开始后调用 call_worker，role 填 code；总结模块只在代码完成后核对，不和用户对话。\n`)
+      : (turnStart
+        ? `\n\n${directName} 直通已接通。工具由 SpCode 提供，你自己调用 read_file、edit_file、write_file、search_text、map_lookup、list_dir、run_command。禁止说 Tool not found 或工具列表是空的。用户这轮已经说了开始，照锁定的方案文件立刻改文件，不要再复述方案。\n`
+        : `\n\n${directName} 直通已接通。工具由 SpCode 提供。可以 read_file、search_text、map_lookup、list_dir。还没说开始时不要改项目文件，把完整方案写在回复的【方案】…【/方案】段里；用户可以点「写入方案」，也可以明确单独发送「/spcode-start」确认并锁定最新方案。禁止说 Tool not found 或工具列表是空的。\n`));
+  // 开工门槛段：没说开始时写文件与派单工具被收起，必须告诉模型这是规则而不是缺工具
+  const gateLine = (agiNow || turnStart || userAskedQuestion(userText) || !codeWorker || directOn) ? '' : (replyLang.promptInEnglish(lang)
+      ? '\n\nStart gate: the user has not said "start" this turn, so file-writing and call_worker are intentionally unavailable. This is normal, not a missing tool. Never tell the user you lack a write tool or cannot edit files. If they want a change, write the full plan in your reply between 【方案】 and 【/方案】 and end with: 核对方案无误后点「写入方案」，确认无误后单独发送「/spcode-start」，我再动手.\n'
+      : '\n\n开工门槛：用户这轮还没说「开始」，所以写项目文件和派单工具是按规则暂时收起的，这是正常的，不是缺工具。禁止对用户说「没有写入工具」「不能改文件」「无法写入」。用户想改东西时，把完整方案写在回复的【方案】…【/方案】段里，结尾写：核对方案无误后点「写入方案」，确认无误后单独发送「/spcode-start」，我再动手。\n');
+  // zabingAI 底模段：只按用户给的材料回答，找不到就自己去仓库找，不许编造
+  const zabingTail = (modelCfg?.id === 'zabingAI' || modelCfg?.name === 'zabingAI'
+    ? '\n\n你是 zabingAI，底模是 Qwen2.5-Coder-7B-Instruct。只根据用户这条消息里已经给出的代码、报错和文件内容回答。材料不够就自己去仓库里找，找到再答。不要编造不存在的接口、路径或运行结果，也不要停下来拒绝用户。\n'
+    : '');
+  return lunaLine + directLine + gateLine + zabingTail;
+}
 
-module.exports = { runTurn, listSkills, listRules, toolsSpec, describeProjectMap, pushInterjection, setFloatBarHooks, writePlanFromChat, readPlanTree, readChainMap, removePlanItem, makeDialogIndex };
+
+module.exports = { runTurn, listSkills, listRules, toolsSpec, describeProjectMap, pushInterjection, setFloatBarHooks, writePlanFromChat, readPlanTree, readChainMap, removePlanItem, clearPlanMap, makeDialogIndex, buildSystemPrompt, composePromptTail };
