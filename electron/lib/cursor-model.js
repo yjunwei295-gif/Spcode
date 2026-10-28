@@ -12,10 +12,50 @@ const MAX_IMAGES = 8;
 const modelParameterCache = new Map();
 const modelParameterPending = new Map();
 const MODEL_PARAMETER_CACHE_MS = 5 * 60 * 1000;
+// Cursor 按网络出口地区拒绝某些模型厂商；SDK 没有专门的错误码，只能认错误原文
+const REGION_BLOCK_RE = /not supported in your region|not available in your region|cursor\.com\/docs\/account\/regions/i;
+// 套餐用量走 Cursor 后台的非公开接口（SDK 没有账号额度接口），改版后会失效，失效时显示额度未知
+const USAGE_URL = 'https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage';
+const USAGE_CACHE_MS = 30 * 1000;
+let usageCache = null;
+let usageCacheAt = 0;
+let usageInFlight = null;
+
+/** SpCode 设置里的网络代理，规范成 http://host:port；没填返回空 */
+function configuredProxy() {
+  let proxy = '';
+  try { proxy = String(require('./store').load()?.proxy || '').trim(); } catch { return ''; }
+  if (!proxy) return '';
+  try {
+    const url = new URL(proxy.includes('://') ? proxy : `http://${proxy}`);
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return '';
+  }
+}
+
+// Cursor SDK 在主进程里用 Node 自己的网络模块直连，不认 Electron 的代理设置；直连出口在受限地区时
+// Cursor 会按地区拒绝 Claude 等模型。填了代理就让主进程默认 HTTPS 连接走代理，并让 SDK 改用 HTTP/1.1
+// （Node 的代理只支持 HTTP/1.1）。只在首次加载 SDK 时读一次，改代理后需重启
+function routeSdkThroughProxy(mod) {
+  const proxy = configuredProxy();
+  if (!proxy) return;
+  const env = { HTTPS_PROXY: proxy, HTTP_PROXY: proxy, NO_PROXY: 'localhost,127.0.0.1,::1' };
+  const https = require('https');
+  const http = require('http');
+  https.globalAgent = new https.Agent({ keepAlive: true, proxyEnv: env });
+  http.globalAgent = new http.Agent({ keepAlive: true, proxyEnv: env });
+  mod.Cursor.configure({ local: { useHttp1ForAgent: true } });
+  require('./diag').log('cursor', 'Cursor SDK 已改走网络代理', { proxy });
+}
 
 let sdkMod = null;
 function sdk() {
-  if (!sdkMod) sdkMod = require('@cursor/sdk');
+  if (!sdkMod) {
+    const mod = require('@cursor/sdk');
+    try { routeSdkThroughProxy(mod); } catch (e) { require('./diag').log('cursor', 'Cursor SDK 设置代理失败', { message: e && e.message }); }
+    sdkMod = mod;
+  }
   return sdkMod;
 }
 
@@ -46,6 +86,74 @@ let memStore = null;
 function agentStore() {
   if (!memStore) memStore = require('./cursor-store').createMemoryStore(sdk());
   return memStore.store;
+}
+
+/** 地区限制属于永久性错误，重试或发「继续」都没用；是这类错误时返回给用户看的中文错误，否则返回 null */
+function regionError(model, message) {
+  if (!REGION_BLOCK_RE.test(String(message || ''))) return null;
+  const err = new Error(`Cursor 模型「${model}」在当前地区不可用（Cursor 按网络出口地区限制该模型厂商），请换用其它模型或更换网络出口。`);
+  err.code = 'cursor_region_blocked';
+  return err;
+}
+
+/** 本轮失败时统一出错：地区限制给中文说明，其它照旧带上原文 */
+function runError(model, message) {
+  return regionError(model, message) || new Error(`Cursor 模型「${model}」没有完成：${message}`);
+}
+
+function cursorStateDb() {
+  const home = os.homedir();
+  if (process.platform === 'win32') return path.join(process.env.APPDATA || path.join(home, 'AppData', 'Roaming'), 'Cursor', 'User', 'globalStorage', 'state.vscdb');
+  if (process.platform === 'darwin') return path.join(home, 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'state.vscdb');
+  return path.join(home, '.config', 'Cursor', 'User', 'globalStorage', 'state.vscdb');
+}
+
+/** 只读取本机 Cursor 编辑器的登录令牌，只留在内存里，不落盘、不写日志 */
+function readEditorToken() {
+  const file = cursorStateDb();
+  if (!fs.existsSync(file)) return '';
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    const row = db.prepare("SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'").get();
+    return row ? String(row.value || '').trim() : '';
+  } finally {
+    db.close();
+  }
+}
+
+/** 本计费周期剩余百分比，口径同 Cursor 设置页：已用 ÷ 套餐上限 */
+async function readPlanRemaining() {
+  const token = readEditorToken();
+  if (!token) return null;
+  const { httpFetch } = require('./http-fetch');
+  const res = await httpFetch(USAGE_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: '{}',
+    signal: AbortSignal.timeout(10000)
+  });
+  if (!res.ok) return null;
+  const plan = (await res.json())?.planUsage;
+  const limit = Number(plan?.limit);
+  const used = Number(plan?.totalSpend);
+  if (!Number.isFinite(limit) || limit <= 0 || !Number.isFinite(used)) return null;
+  return Math.max(0, Math.min(100, Math.round(100 - (used / limit) * 100)));
+}
+
+/** 取不到百分比（接口失效、编辑器未登录）时显示额度未知，不抛错，免得挡住模型列表 */
+async function fetchUsageBalance() {
+  if (usageCache && Date.now() - usageCacheAt < USAGE_CACHE_MS) return usageCache;
+  if (usageInFlight) return usageInFlight;
+  usageInFlight = (async () => {
+    let remaining = null;
+    try { remaining = await readPlanRemaining(); } catch { /* 按额度未知显示 */ }
+    usageCache = { available: true, kind: 'rate-limits', text: remaining == null ? '额度未知' : `本月剩余 ${remaining}%` };
+    usageCacheAt = Date.now();
+    return usageCache;
+  })();
+  try { return await usageInFlight; }
+  finally { usageInFlight = null; }
 }
 
 /** Agent 关掉后释放它在对话库里的记录；稍等再删，免得 SDK 收尾时还在写 */
@@ -103,7 +211,7 @@ async function listModels(modelCfg) {
     models.push(m.id);
     catalog[m.id] = { id: m.id, name: m.displayName || m.id, priceText: m.displayName || '', input: null, output: null };
   }
-  return { ok: true, protocol: CURSOR_PROTOCOL, models, catalog, balance: { available: false } };
+  return { ok: true, protocol: CURSOR_PROTOCOL, models, catalog, balance: await fetchUsageBalance() };
 }
 
 /** 只使用厂商目录声明的高档推理参数；不猜测参数名，也不更换用户所选模型。 */
@@ -304,10 +412,12 @@ async function complete({ modelCfg, messages, tools, onDelta, onReason, signal }
     }
     if (collected) content = trimAfterLastCall(content);
     else if (res.status !== 'finished') {
-      throw new Error(`Cursor 模型「${modelCfg.model}」没有完成：${res.error?.message || res.status}`);
+      throw runError(modelCfg.model, res.error?.message || res.status);
     }
     if (!content && res.result) content = String(res.result);
     return { role: 'assistant', content, ...(reasoning ? { reasoning_content: reasoning } : {}) };
+  } catch (e) {
+    throw regionError(modelCfg.model, e?.message) || e;
   } finally {
     clearTimeout(idleTimer);
     if (signal) signal.removeEventListener('abort', onAbort);
@@ -361,5 +471,6 @@ function warmUp(modelCfg) {
 
 module.exports = {
   CURSOR_PROTOCOL, CURSOR_BASE_URL, complete, listModels, ensureLogin, flatten, warmUp,
-  sdk, apiKeyOf, localOptions, sandboxDir, releaseAgent, highModelSelection
+  sdk, apiKeyOf, localOptions, sandboxDir, releaseAgent, highModelSelection,
+  regionError, runError, fetchUsageBalance
 };

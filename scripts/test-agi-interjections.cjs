@@ -123,7 +123,7 @@ async function testDuringTool(harness) {
     return '原工具完整结果';
   };
   await brain.run(messages(), false);
-  check(harness.agent.test.takeInterjections('other')[0] === '另一个会话的消息', '本轮不会清掉其他会话消息');
+  check(harness.agent.test.takeInterjections('other')[0].text === '另一个会话的消息', '本轮不会清掉其他会话消息');
   harness.agent.test.activeInterjectKeys.delete('other');
 }
 /** 无工具生成与 SDK 收尾时的插话自动续接同一会话，停止不触发自动续接。 */
@@ -180,6 +180,30 @@ async function testOrdinary(harness) {
   const answer = await brain.run(ordinaryMessages, false);
   check(answer === '已收到普通补充' && calls > 1, '普通模型无工具收尾同样不吞插话');
 }
+/** 普通模型使用真实附件解析器，把插话PNG送入下一次多模态请求。 */
+async function testOrdinaryImages(harness) {
+  let calls = 0;
+  const imagePath = path.join(root, 'icons.png');
+  async function complete(args) {
+    calls++;
+    if (calls === 1) {
+      harness.agent.pushInterjection('ordinary-image', '', [{ path: imagePath, name: '参考图.png' }]);
+      return { role: 'assistant', content: '原答复' };
+    }
+    const imageMessage = args.messages.find(function image(message) { return message.role === 'user' && Array.isArray(message.content) && message.content.some(function part(p) { return p.type === 'image_url'; }); });
+    check(!!imageMessage, '普通模型下一次请求含插话图片内容块');
+    const part = imageMessage.content.find(function image(p) { return p.type === 'image_url'; });
+    check(Buffer.from(part.image_url.url.split(',')[1], 'base64').equals(fs.readFileSync(imagePath)), '普通模型收到的原图字节与附件一致');
+    return { role: 'assistant', content: '已看图调整' };
+  }
+  harness.setComplete(complete);
+  const brain = brainHarness(harness, null, 'ordinary-image', false);
+  brain.context.modelCfg = { protocol: 'openai', model: 'fixture', vision: true, baseUrl: 'http://unused' };
+  const history = messages();
+  history.push({ role: 'assistant', tool_calls: [{ id: 'screen', type: 'function', function: { name: 'screen_read', arguments: '{}' } }] });
+  history.push({ role: 'tool', tool_call_id: 'screen', content: '验收屏幕' });
+  check(await brain.run(history, false) === '已看图调整', '普通模型真实入口完成带图插话');
+}
 /** 在真实 Codex 适配器与本地 HTTP MCP 桥上验证正文传输，无需厂商凭据。 */
 async function testCodexBridge(harness) {
   const file = path.join(root, 'electron/lib/codex-direct.js');
@@ -232,7 +256,7 @@ async function testRoutes(harness) {
   const queued = [];
   const handlers = new Map();
   const context = {
-    fs, path, agent: harness.agent,
+    fs, path, require, agent: harness.agent,
     ipcMain: { handle: function handle(name, handler) { handlers.set(name, handler); } },
     getWin: function getWin() { return window; },
     resolveTurnTabId: function tabId(win, payload) { return payload.tabId; },
@@ -250,12 +274,19 @@ async function testRoutes(harness) {
     const reply = await handlers.get('chat:interject')({}, { tabId: 'tab', text: '主窗插话' });
     context.handleFloatBarSend({ key, text: '小窗插话' });
     const inbox = harness.agent.test.takeInterjections(key);
-    check(reply.ok && inbox.join('|') === '主窗插话|小窗插话', '真实主窗 IPC 与悬浮栏入口投递同一会话');
+    check(reply.ok && inbox.map(function body(item) { return item.text; }).join('|') === '主窗插话|小窗插话', '真实主窗 IPC 与悬浮栏入口投递同一会话');
     check(broadcasts.some(function status(item) { return item.kind === 'status' && item.text.includes('已接收'); }),
       '接收状态与投递状态分开显示');
     check(queued.length === 1 && queued[0].channel === 'chat:float-user-message' &&
       queued[0].payload.interjection === true && queued[0].payload.tabId === 'tab' && queued[0].payload.text === '小窗插话',
       '成功的小窗插话回传绑定会话登记历史，不重复投递');
+    queued.length = 0;
+    const imagePath = path.join(root, 'icons.png');
+    const pictureReply = await handlers.get('chat:interject')({}, { tabId: 'tab', text: '', attachments: [{ path: imagePath, name: '参考图.png' }] });
+    context.handleFloatBarSend({ key, text: '看图片', attachments: [{ path: imagePath, name: '参考图.png' }] });
+    const pictureInbox = harness.agent.test.takeInterjections(key);
+    check(pictureReply.ok && pictureInbox.length === 2 && pictureInbox.every(function image(item) { return item.attachments[0].path === imagePath; }), '主窗纯图和桌宠图文插话均保留原路径进入同一队列');
+    check(queued[0].payload.attachments[0].path === imagePath && queued[0].payload.images[0].startsWith('file:'), '桌宠插话回传历史包含可显示的原图');
     queued.length = 0;
     harness.agent.test.activeInterjectKeys.delete(key);
     const ended = await handlers.get('chat:interject')({}, { tabId: 'tab', text: '收尾补充' });
@@ -282,6 +313,8 @@ async function main() {
   await testDuringTool(harness);
   await testCompletion(harness);
   await testOrdinary(harness);
+  await testOrdinaryImages(harness);
+  check(harness.agent.toolsSpec().some(function memory(tool) { return tool.function.name === 'process_memory'; }), 'AGI工具列表已注册真实进程内存读取工具');
   await testCodexBridge(harness);
   await testRoutes(harness);
   check(unexpected.length === 0, '没有未处理异步异常');

@@ -59,7 +59,9 @@ const PROVIDER_PRESETS = [
   // Cursor 走 SDK，不需要真实地址；Key 可空，空时测试连接会打开浏览器登录 Cursor
   { id: 'cursor', name: 'Cursor', protocol: 'cursor', baseUrl: 'cursor://sdk' },
   // Codex SDK 复用本机 Codex CLI 登录；也可在 API Key 中填写 OpenAI API Key
-  { id: 'codex', name: 'Codex', protocol: 'codex', baseUrl: 'codex://sdk' }
+  { id: 'codex', name: 'Codex', protocol: 'codex', baseUrl: 'codex://sdk' },
+  // Claude Code SDK：Key 空时复用本机 Claude Code 登录；地址可改成兼容接口（如 DeepSeek 的 Anthropic 接口）绕开地区限制
+  { id: 'claudecode', name: 'Claude Code', protocol: 'claudecode', baseUrl: 'claudecode://sdk' }
 ];
 
 function filePath() {
@@ -100,6 +102,7 @@ function normalizeProtocol(raw) {
   if (p === 'google' || p === 'gemini') return 'gemini';
   if (p === 'cursor') return 'cursor';
   if (p === 'codex') return 'codex';
+  if (p === 'claudecode') return 'claudecode';
   return 'openai';
 }
 

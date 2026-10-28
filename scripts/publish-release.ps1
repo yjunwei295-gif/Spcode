@@ -44,10 +44,12 @@ function Call-GitHub($method, $url, $jsonFile) {
 
 Say '==== 开始发布 ===='
 $repo = 'yjunwei295-gif/Spcode'
-$tag = 'v1.0.0'
-$releaseTitle = 'SimpleCode 1.0.0'
-$assetName = 'SimpleCode-Setup-1.0.0.exe'
-$exePath = Join-Path $root 'dist\SimpleCode Setup 1.0.0.exe'
+# 发布版本和安装包名称统一来自项目版本，避免上传旧版安装包。
+$version = (Get-Content (Join-Path $root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
+$tag = 'v' + $version
+$releaseTitle = 'SimpleCode ' + $version
+$assetName = 'SimpleCode-Setup-' + $version + '.exe'
+$exePath = Join-Path $root ('dist\SimpleCode Setup ' + $version + '.exe')
 $notesPath = Join-Path $root 'scripts\release-notes.md'
 if (-not (Test-Path $exePath)) {
   throw ('找不到安装包：' + $exePath)

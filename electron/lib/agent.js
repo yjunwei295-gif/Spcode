@@ -32,6 +32,7 @@ const typecheck = require('./typecheck');
 const apiProtocol = require('./api-protocol');
 const cursorDirect = require('./cursor-direct');
 const codexDirect = require('./codex-direct');
+const claudeDirect = require('./claude-direct');
 const jsonSplit = require('./json-split');
 const sandbox = require('./sandbox');
 const toolXml = require('./tool-xml');
@@ -50,22 +51,25 @@ const interjectInbox = new Map();
 const activeInterjectKeys = new Set();
 
 /**
- * 接收主窗或悬浮栏的纯文本插话，返回是否已加入指定会话的收件箱。
- * AGI 关闭、会话键或正文为空、大脑已不再消费消息时返回 false，由调用方排队发送。
+ * 接收主窗或桌宠的正文与图片附件，返回是否已加入指定会话的收件箱。
+ * AGI关闭、无活动会话或消息全空时拒收；附件按快照保存，模型边界再解析像素。
  */
-function pushInterjection(key, text) {
+function pushInterjection(key, text, attachments = []) {
   // AGI（桌面辅助）关着时没有插话这回事，先拦掉；desktopOn 是函数声明，会提升，可直接调
   if (!desktopOn()) return false;
   const k = key == null ? '' : String(key);
   if (!k || !activeInterjectKeys.has(k)) return false;
   const body = String(text == null ? '' : text).trim();
-  if (!body) return false;
+  if (!body && !attachments.length) return false;
+  for (const att of attachments) {
+    if (!att || typeof att.path !== 'string' || !fs.existsSync(att.path)) throw new Error('插话附件不存在');
+  }
   let q = interjectInbox.get(k);
   if (!q) {
     q = [];
     interjectInbox.set(k, q);
   }
-  q.push(body);
+  q.push({ text: body, attachments: attachments.map(function copyAttachment(att) { return { path: att.path, name: att.name || path.basename(att.path) }; }) });
   return true;
 }
 
@@ -78,14 +82,13 @@ function takeInterjections(key, onEvent) {
   const queued = interjectInbox.get(k) || [];
   interjectInbox.delete(k);
   // 投递时同步登记需求补充，后续总结验收必须按包含插话的目标核对。
-  if (queued.length && typeof onEvent === 'function') onEvent({ type: 'interjection', texts: queued });
+  if (queued.length && typeof onEvent === 'function') onEvent({ type: 'interjection', texts: queued.map(require('./interjection-content').textOf) });
   return queued;
 }
 
 /** 将用户补充明确标为插话正文，供直通模型在继续原任务前优先回应和调整。 */
 function interjectionBlock(queued) {
-  return '【用户实时插话】\n' + queued.join('\n\n') +
-    '\n【插话结束】\n以上是用户在当前任务执行中发来的新消息。先回应或按补充调整后续动作，结合已有工具结果继续，不要忽略插话或重复已经成功的操作。';
+  return require('./interjection-content').block(queued);
 }
 
 /**
@@ -94,23 +97,34 @@ function interjectionBlock(queued) {
  * 无工具回复期间到达的消息在 SDK 收尾后立即续接同一会话，不等待用户重新发送。
  */
 async function runDirectWithInterjections(direct, args, key) {
+  /** 解析插话附件，原生视觉能力和普通图片发送采用同一模型判定。 */
+  async function prepareInterjections(items) {
+    async function parse(list) { return attachmentsToParts(list, { vision: true, signal: args.signal }); }
+    async function describe(urls) { return answerImagesForModel(urls, { modelCfg: args.modelCfg, signal: args.signal, onEvent: args.onEvent }); }
+    return require('./interjection-content').prepare(items, { parse, describe, vision: modelSupportsVision(args.modelCfg) });
+  }
   /** 工具边界先处理用户补充，确保旧动作不会越过尚未读取的插话。 */
   async function runToolWithInterjections(name, toolArgs, toolCallId) {
     let queued = takeInterjections(key, args.onEvent);
     if (queued.length) {
       args.onEvent({ type: 'status', text: '插话已送达 AI，正在优先处理…' });
-      return '本次工具尚未执行，请先处理用户补充，再决定是否重新调用。\n\n' + interjectionBlock(queued);
+      return require('./interjection-content').toolResult('本次工具尚未执行，请先处理用户补充，再决定是否重新调用。', await prepareInterjections(queued));
     }
     const result = await args.runTool(name, toolArgs, toolCallId);
     queued = takeInterjections(key, args.onEvent);
     if (!queued.length) return result;
     args.onEvent({ type: 'status', text: '插话已送达 AI，正在优先处理…' });
     const text = typeof result === 'string' ? result : JSON.stringify(result);
-    return text + '\n\n' + interjectionBlock(queued);
+    return require('./interjection-content').toolResult(text, await prepareInterjections(queued));
   }
   let nextArgs = { ...args, runTool: runToolWithInterjections };
   const initial = takeInterjections(key, args.onEvent);
-  if (initial.length) nextArgs.turnText += '\n\n' + interjectionBlock(initial);
+  if (initial.length) {
+    const prepared = await prepareInterjections(initial);
+    nextArgs.turnText += '\n\n' + prepared.text;
+    const original = Array.isArray(nextArgs.userContent) ? nextArgs.userContent : [{ type: 'text', text: String(nextArgs.userContent || '') }];
+    nextArgs.userContent = original.concat(prepared.parts);
+  }
   for (;;) {
     const result = await direct.runTurn(nextArgs);
     if (args.signal?.aborted) {
@@ -123,8 +137,9 @@ async function runDirectWithInterjections(direct, args, key) {
     args.onEvent({ type: 'rewrite_text', text: '' });
     args.onEvent({ type: 'status', text: '插话已送达 AI，正在继续处理…' });
     // 续接只发送新增消息；已成功的任务不再受原始必调工具列表催促，避免重复执行。
-    nextArgs = { ...args, fresh: false, firstPrefix: '', systemContext: '', userContent: '',
-      turnText: interjectionBlock(queued), requiredToolNames: [], runTool: runToolWithInterjections };
+    const prepared = await prepareInterjections(queued);
+    nextArgs = { ...args, fresh: false, firstPrefix: '', systemContext: '', userContent: prepared.parts.length ? prepared.parts : '',
+      turnText: prepared.text, requiredToolNames: [], runTool: runToolWithInterjections };
   }
 }
 
@@ -132,7 +147,7 @@ async function runDirectWithInterjections(direct, args, key) {
 const DESKTOP_TOOLS = new Set([
   'screen_read', 'screen_look', 'float_bar_move', 'clipboard_look', 'window_list', 'window_focus', 'ui_act', 'agi_note',
   'mouse_click', 'mouse_drag', 'mouse_scroll', 'keyboard_type', 'keyboard_key',
-  'sheet_read_image', 'sheet_write', 'sheet_to_wps'
+  'sheet_read_image', 'sheet_write', 'sheet_to_wps', 'process_memory'
 ]);
 
 // [铆钉优化] 悬浮小窗 hooks：由 electron/main.js 调 setFloatBarHooks 注册。
@@ -230,6 +245,9 @@ function allToolsSpec() {
   return [
     // 代码动画与生成模型分开注册；普通模型和直通 MCP 共用同一份工具定义。
     require('./code-video').toolSpec,
+    ...require('./code-audio').toolSpecs,
+    ...require('./artifact-studio').toolSpecs,
+    require('./process-memory').toolSpec,
     {
       type: 'function',
       function: {
@@ -487,6 +505,7 @@ function allToolsSpec() {
           type: 'object',
           properties: {
             command: { type: 'string', description: '要执行的命令，如 npm test 或 git status' },
+            activity: { type: 'string', enum: ['command', 'build', 'test'], description: '明确的执行用途，用于桌宠区分普通命令、构建和验证' },
             cwd: { type: 'string', description: '相对工作区的子目录，默认 .' }
           },
           required: ['command']
@@ -712,7 +731,7 @@ function allToolsSpec() {
   ];
 }
 
-const HAND_OFF_TOOLS = new Set(['write_file', 'edit_file', 'create_dir', 'delete_file', 'run_command', 'render_code_video']);
+const HAND_OFF_TOOLS = new Set(['write_file', 'edit_file', 'create_dir', 'delete_file', 'run_command', 'render_code_video', 'render_code_audio', 'analyze_audio', 'present_artifact', 'export_artifact']);
 
 function callWorkerTool(roles) {
   const hasPlan = roles.includes('planning');
@@ -760,7 +779,11 @@ const WORKER_TOOL_NAMES = new Set([
   'goto_definition',
   'list_dir',
   'run_command',
-  'render_code_video'
+  'render_code_video',
+  'render_code_audio',
+  'analyze_audio',
+  'present_artifact',
+  'export_artifact'
 ]);
 const SUMMARY_TOOL_NAMES = new Set(['read_file', 'search_text', 'map_lookup', 'list_dir', 'goto_definition']);
 
@@ -1133,7 +1156,11 @@ async function execTool(workspace, snap, name, args, onEvent, extra, signal, lan
       note = fixed.note;
     }
   }
-  const out = await execToolRaw(workspace, snap, name, args, onEvent, extra, signal, lang);
+  /** 中央入口覆盖普通模型和直通 MCP，只有实际执行的工具进入动作生命周期。 */
+  async function executeRaw(progress) {
+    return execToolRaw(workspace, snap, name, args, progress, extra, signal, lang);
+  }
+  const out = await require('./tool-activity').execute(name, args, executeRaw, onEvent);
   return note && typeof out === 'string' ? note + out : out;
 }
 
@@ -1620,6 +1647,41 @@ async function execToolRaw(workspace, snap, name, args, onEvent, extra, signal, 
   if (name === 'brain_pressure') {
     return '已在后台记录。不要向用户提到压力，直接回答用户的问题。';
   }
+  if (name === 'present_artifact' || name === 'export_artifact') {
+    /** 作品清单与导出文件沿用本轮快照，历史恢复不会丢掉作品入口。 */
+    function recordArtifactFile(rel) {
+      if (!snap.current) snap.current = snapshot.create(workspace, '自动更改快照');
+      snapshot.recordChange(workspace, snap.current, rel, 'write');
+      (snap.createdFiles || (snap.createdFiles = new Set())).add(rel);
+      snap.wroteFiles = (snap.wroteFiles || 0) + 1;
+    }
+    const studio = require('./artifact-studio');
+    if (name === 'present_artifact') {
+      const artifact = await studio.present({ workspace, args, beforeWrite: recordArtifactFile });
+      onEvent({ type: 'artifact', artifact });
+      return '【网页作品已登记】\n' + JSON.stringify(artifact, null, 2) + '\n用户可从作品卡片打开预览、下载 PNG 和源文件；动画可导出 MP4。用 export_artifact 导出并检查真实画面后再验收。';
+    }
+    /** 视频导出复用整数百分比进度，静态图片只在完成后报告。 */
+    function artifactProgress(progress) { onEvent({ type: 'tool', name, status: 'running', text: '作品导出 ' + progress.percent + '%' }); }
+    const result = await studio.exportArtifact({ workspace, args, signal, beforeWrite: recordArtifactFile, onProgress: artifactProgress });
+    const artifact = await studio.read(workspace, args.manifest);
+    onEvent({ type: 'artifact', artifact, exported: result });
+    return '【作品已导出】\n' + JSON.stringify(result, null, 2) + '\n请检查真实产物后再交付。';
+  }
+  if (name === 'render_code_audio' || name === 'analyze_audio') {
+    /** 音轨与检测时间线沿用当前轮快照，不覆盖旧音频或隐瞒文件写入。 */
+    function recordAudioFile(rel) {
+      if (!snap.current) snap.current = snapshot.create(workspace, '自动更改快照');
+      snapshot.recordChange(workspace, snap.current, rel, 'write');
+      (snap.createdFiles || (snap.createdFiles = new Set())).add(rel);
+      snap.wroteFiles = (snap.wroteFiles || 0) + 1;
+    }
+    const audio = require('./code-audio');
+    const task = name === 'render_code_audio' ? audio.render : audio.analyze;
+    const result = await task({ workspace, extra, args, signal, beforeWrite: recordAudioFile });
+    onEvent({ type:'tool', name, status:'done', detail:result.audio || result.timeline, text:name === 'render_code_audio' ? '代码音轨已生成' : '音频卡点候选已分析' });
+    return '【音频处理已完成】\n' + JSON.stringify(result, null, 2) + '\n先试听并核对实际音轨；根据时间线安排画面，通过 audioPath 合入相同音频。起音候选不等于已确认的音乐拍点。';
+  }
   if (name === 'render_code_video') {
     /** 将视频产物登记到当前轮快照，和源码写入共用文件追踪。 */
     function recordVideoFile(rel) {
@@ -1683,6 +1745,7 @@ async function execToolRaw(workspace, snap, name, args, onEvent, extra, signal, 
         out: (result.stdout || '').length,
         err: (result.stderr || '').length
       });
+      onEvent({ type: 'execution-result', outcome: result.code === 0 && !result.timedOut && !result.blocked ? 'success' : 'error' });
       return `${sandbox.formatResult(result)}\n（只读命令，未扫描/备份工作区）`;
     }
     const scanOpts = {
@@ -1725,7 +1788,12 @@ async function execToolRaw(workspace, snap, name, args, onEvent, extra, signal, 
       err: (result.stderr || '').length,
       tracked: cmdChanges.length
     });
+    onEvent({ type: 'execution-result', outcome: result.code === 0 && !result.timedOut && !result.blocked ? 'success' : 'error' });
     return sandbox.formatResult(result);
+  }
+  if (name === 'process_memory') {
+    if (!desktopOn()) throw new Error('读取进程内存需要开启 AGI');
+    return JSON.stringify(await require('./process-memory').run(args, signal));
   }
   if (DESKTOP_TOOLS.has(name)) {
     const desktopHand = require('./desktop-hand');
@@ -2158,10 +2226,18 @@ function buildSystemPrompt({
     : (enPrompt
       ? `\nTo generate images/videos/3D/docs, call generate_media yourself (kind + a full prompt you write from the conversation). It uses the generation model in the model combo. It does not need the user to say start, and must not be handed to the code worker or run through run_command / sd-cli. One call per image. After it returns, tell the user the file path. Never say you have no image tool.${genFailNote}\n`
       : `\n要生图/生视频/生3D/生文档时，你自己调用 generate_media：kind 填类型，prompt 写你按对话整理好的完整描述（主体、风格、构图、颜色）。它用「模型组合」里挂的生成模型，不需要用户说「开始」，禁止派给代码模块、禁止用 run_command 去跑 sd-cli。要几张就调用几次。返回后把文件路径告诉用户。禁止说自己没有生图工具。${genFailNote}\n`);
-  // 代码视频先写可编辑动画，再逐帧渲染；不消耗视频生成槽位。
+  // 代码视频先制作抓耳配乐并按内容选择卡点，再用缓动呈现可编辑动画；旁白可选，不消耗视频生成槽位。
   genNote += enPrompt
-    ? '\nFor videos made with code, motion graphics, or animated explainers: write an HTML/Canvas animation, then call render_code_video with explicit dimensions, fps and duration. Define window.renderFrame(time, frame, info), await dynamic assets, and derive every frame from time. Use audioPath for an existing music/narration file. Inspect the returned preview PNGs before delivering the MP4. See docs/code-video.md in the SpCode source for the contract. generate_media is only for generation-model assets; it is not the code-video renderer.\n'
-    : '\n用户要用代码做视频、动态图形或动画讲解时，先编写 HTML/Canvas 动画，再调用 render_code_video，明确指定宽高、帧率和时长。HTML 定义 window.renderFrame(time, frame, info)，动态素材自己 await，每帧只由传入时间决定。已有配乐/配音用 audioPath 合入；返回后检查预览 PNG 再交付 MP4。SpCode 源码 docs/code-video.md 有完整约定。generate_media 用于生成模型素材，代码视频用 render_code_video，不需要视频生成槽位。\n';
+    ? '\nFor videos made with code, motion graphics, or animated explainers: first prepare music and plan shots for the content, then write an HTML/Canvas animation and call render_code_video with explicit dimensions, fps and duration. Unless the user specifies otherwise, use 1920x1080 at 60 fps; preserve any user-specified aspect ratio or output settings. Define window.renderFrame(time, frame, info), await dynamic assets, and derive every frame from time. All motion must use easing functions to avoid abrupt movement. Use the SpCode icon as the mascot. If the user has not supplied an audio track, you must generate background music yourself. Let music drive the visuals. Voice-over is optional; do not add narration by default. First create a catchy score with a memorable melodic motif, a clear rhythm, and sections that build and release energy instead of a monotonous loop or notification tones. Then select verified musical cues for key reveals, scene changes, text emphasis and the ending while preserving reading time. Speech alone or barely audible music does not satisfy the background-music requirement. If narration is used, make it an auxiliary layer with emotional variation, natural pauses and emphasis; it must not mask the music. Otherwise communicate through music and captions. Preserve separate music and final audio tracks, plus a narration track only when used. Audition the exported MP4 to assess whether the music is catchy, audible and unclipped, and inspect whether key actions hit the selected cues; an audio stream, gain setting or estimated BPM alone does not establish success. Use audioPath for an existing music/narration file. Inspect the returned preview PNGs before delivering the MP4. See docs/code-video.md in the SpCode source for the contract. generate_media is only for generation-model assets; it is not the code-video renderer.\n'
+    : '\n用户要用代码做视频、动态图形或动画讲解时，先按内容准备配乐并确定分镜，再编写 HTML/Canvas 动画，调用 render_code_video 时明确指定宽高、帧率和时长。用户未指定规格时，默认 1920×1080、60fps；用户指定的画幅或参数优先。HTML 定义 window.renderFrame(time, frame, info)，动态素材自己 await，每帧只由传入时间决定。所有运动必须配合缓动函数（easing），避免生硬。吉祥物使用 SpCode 图标。用户未提供音轨时必须自行生成背景音乐。此类视频以音乐驱动画面，人声可选，不默认添加旁白。先把配乐做得抓耳：有容易记住的旋律动机、清晰节奏、铺垫与释放等段落起伏，避免整片单调重复或仅用提示音充当配乐；再根据内容选择实测音乐落点，让重点揭晓、镜头切换、文字强调和收尾卡上音乐，同时留足阅读时间。不能用只有人声或低到听不清的配乐代替背景音乐。若使用配音/旁白，必须有情绪起伏、自然停顿、重音和语气变化，作为辅助层，不能盖住音乐；无需人声时直接用音乐与字幕完成表达。保留独立配乐及最终音轨，有人声时再保留人声分轨；交付前必须试听实际导出的 MP4，核对音乐是否抓耳、清晰可辨、无削波，以及关键动作是否卡准选定落点，不能只凭音频流存在、音量参数或估算 BPM 判定通过。已有配乐/配音用 audioPath 合入；返回后检查预览 PNG 再交付 MP4。SpCode 源码 docs/code-video.md 有完整约定。generate_media 用于生成模型素材，代码视频用 render_code_video，不需要视频生成槽位。\n';
+  // 卡点必须来自实际音轨；分析值保留候选含义，镜头跟随同一音频秒数。
+  genNote += enPrompt
+    ? '\nFor videos with sound, prepare the audio first. Use render_code_audio on an HTML renderAudio(info) source with OfflineAudioContext, or use an existing track. Call analyze_audio with explicit detection parameters, audition onset/energy-rise candidates, then reference its timeline.js in the animation. Choose audio cues for the video narrative, reading time, key reveals, transitions and ending; write an explicit editable shot-to-cue plan instead of evenly distributing shots or animating every onset. Align shots, text and transitions to those selected verified audio times and pass the SAME audioPath to present_artifact/render_code_video. Do not deliver a silent video unless requested. Estimated BPM/onsets are not confirmed downbeats. See docs/code-audio.md.\n'
+    : '\n有声视频先准备音轨：可用 render_code_audio 执行 HTML 的 renderAudio(info)/OfflineAudioContext 合成，也可使用已有音乐。调用 analyze_audio 并明确检测参数，试听核对起音和能量增强候选，再在动画引用输出 timeline.js，按视频叙事、阅读时间、重点揭晓、转场与收尾选择落点，在源稿明确可修改的分镜与卡点对应表，避免均分镜头或每拍都做动作；让镜头、文字、转场跟随选定的音频时间；present_artifact/render_code_video 传同一 audioPath。用户未要求静音时应交付有声成品，不能把估算 BPM/起音当已确认重拍。见 docs/code-audio.md。\n';
+  // 代码创作以可编辑网页为源稿，登记作品后才能在聊天与历史中提供统一入口。
+  genNote += enPrompt
+    ? '\nFor code-created images, diagrams, plans, interactive tools and animation: write HTML/Canvas/SVG in the project, then call present_artifact with title and explicit dimensions. For animation also supply fps/duration and renderFrame(time,frame,info). Update the same source when revising, and present it again. The workbench provides preview, playback, seeking, PNG/source downloads and MP4 export. Use export_artifact and inspect actual files before delivery. Prefer code for code-expressible visuals; generate_media is for needed model-generated assets.\n'
+    : '\n用户要用代码画图、画方案/流程图、做交互演示和动画时，先编写项目内 HTML/Canvas/SVG 源稿，再调用 present_artifact，明确标题、宽高；动画同时声明 fps/duration 并定义 renderFrame(time,frame,info)。修改作品继续编辑同一源稿并再次登记。作品卡片提供网页预览、动画播放/拖动时间、PNG 和源文件下载、MP4 导出。用 export_artifact 导出并核对实际画面后交付。能用代码表达的画面优先代码创作，需要生成模型素材时再用 generate_media。\n';
   const planRule = (agiOn || conversational || !planFile) ? '' : (enPrompt
     ? `[TOP RULE — THE PLAN FILE IS THE ONLY PLAN]
 - Before the user says start, write the complete plan in your reply between 【方案】 and 【/方案】: one line per step as "file path -> method -> exact current text -> what it becomes -> how to verify", then what must stay unchanged. The user may click 写入方案 or send /spcode-start as the entire message to approve and lock the latest plan; the program imports that latest plan block into the plan file. You never write or edit the plan file.
@@ -2351,7 +2427,7 @@ function modelSupportsVision(modelCfg) {
   // 用户在「视觉设置」里明确指定过开关时，以开关为准
   if (typeof modelCfg?.vision === 'boolean') return modelCfg.vision;
   const id = `${modelCfg?.model || ''} ${modelCfg?.name || ''}`.toLowerCase();
-  return /vl|vision|llava|pixtral|moondream|minicpm-v|gpt-4o|gpt-4\.1|claude|gemini|qwen2\.5-vl|qwen3-vl/.test(id);
+  return /vl|vision|llava|pixtral|moondream|minicpm-v|gpt-4o|gpt-4\.1|gpt-5|gpt-6|claude|gemini|qwen2\.5-vl|qwen3-vl/.test(id);
 }
 
 function noVisionHint(modelCfg) {
@@ -2849,7 +2925,7 @@ function userAskedQuestion(text) {
 }
 
 // [铆钉] 只读审查合同：只拦大脑 depth=0 的写入；绝不拦代码槽派工写入。开工/「开始」优先于只读。其他 AI 请勿删
-const MUTATE_FILE_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'create_dir', 'render_code_video']);
+const MUTATE_FILE_TOOLS = new Set(['write_file', 'edit_file', 'delete_file', 'create_dir', 'render_code_video', 'render_code_audio', 'analyze_audio', 'present_artifact', 'export_artifact']);
 function wantsChangeNow(text) {
   const t = String(text || '').trim();
   if (!t) return false;
@@ -4093,7 +4169,8 @@ async function workerDirect({ modelCfg, messages, toolSpec, workspace, extra, sn
     onEvent({ type: 'tool', name, status: 'done', detail, text: `完成：${label}${detail ? ` ${detail}` : ''}` });
     return result;
   };
-  const direct = apiProtocol.normalizeProtocol(modelCfg.protocol) === 'codex' ? codexDirect : cursorDirect;
+  const workerDirectProtocol = apiProtocol.normalizeProtocol(modelCfg.protocol);
+  const direct = workerDirectProtocol === 'codex' ? codexDirect : workerDirectProtocol === 'claudecode' ? claudeDirect : cursorDirect;
   diag.log('agent', '部下走直通会话', { role: roleTag, provider: apiProtocol.normalizeProtocol(modelCfg.protocol), model: modelCfg.model });
   try {
     const out = await direct.runTurn({
@@ -4150,11 +4227,11 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
     keyboard_key: '按键',
     run_command: '沙盒命令',
     generate_media: '生成',
-    render_code_video: '代码做视频',
+    render_code_video: '代码做视频', render_code_audio: '代码合成音轨', analyze_audio: '分析音频卡点', present_artifact: '展示网页作品', export_artifact: '导出作品',
     call_worker: '交给部下'
   };
   // 部下用 Cursor 模型时整段工具循环交给一个 Cursor 会话，不再每轮新建 Agent 重发全文
-  if ((depth || 0) > 0 && !desktopOn() && ['cursor', 'codex'].includes(apiProtocol.normalizeProtocol(modelCfg && modelCfg.protocol))) {
+  if ((depth || 0) > 0 && !desktopOn() && ['cursor', 'codex', 'claudecode'].includes(apiProtocol.normalizeProtocol(modelCfg && modelCfg.protocol))) {
     return workerDirect({ modelCfg, messages, toolSpec, workspace, extra, snap, onEvent, signal, lang, workingMemoryRef, roleTag, labels: toolLabel });
   }
   let finalText = '';
@@ -4208,6 +4285,9 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
   const unlimited = (!!unlimitedRounds || agiBrain) && !(hardRounds > 0);
   // 用户回答里带的截图原图，等这一轮工具结果都放回对话后再作为一条用户消息追加
   const askImageParts = [];
+  /** 普通模型在请求边界接收与直通相同的附件像素或视觉识别结果。 */
+  async function parseInterjectionFiles(list) { return attachmentsToParts(list, { vision: true, signal }); }
+  async function describeInterjectionFiles(urls) { return answerImagesForModel(urls, { modelCfg, signal, onEvent, lang }); }
   const roundCap = hardRounds > 0 ? hardRounds : (unlimited ? Number.POSITIVE_INFINITY : SAFETY_MAX_ROUNDS);
   for (let round = 0; round < roundCap; round++) {
     if (signal?.aborted) throw new Error('已停止');
@@ -4215,12 +4295,15 @@ async function agentLoop({ modelCfg, messages, workspace, extra, snap, onEvent, 
     const queued = takeInterjections(interjectKey, onEvent);
     if (queued.length) onEvent({ type: 'status', text: '插话已送达 AI，正在优先处理…' });
     for (let i = 0; i < queued.length; i++) {
-      messages.push({ role: 'user', content: queued[i] });
+      const prepared = queued[i].attachments.length
+        ? await require('./interjection-content').prepare([queued[i]], { parse: parseInterjectionFiles, describe: describeInterjectionFiles, vision: modelSupportsVision(modelCfg) })
+        : { text: queued[i].text, parts: [] };
+      messages.push({ role: 'user', content: prepared.parts.length ? [{ type: 'text', text: prepared.text }, ...prepared.parts] : prepared.text });
       // 插话「开始 / 开始改」优先解除只读，避免卡住后续派工
-      if (snap && snap.readOnly && (wantsChangeNow(queued[i]) || userOrderedStart(queued[i]))) {
+      if (snap && snap.readOnly && (wantsChangeNow(queued[i].text) || userOrderedStart(queued[i].text))) {
         snap.readOnly = false;
       }
-      if (!orderedStart && (brainWithCode || agiBrain) && userOrderedStart(queued[i])) {
+      if (!orderedStart && (brainWithCode || agiBrain) && userOrderedStart(queued[i].text)) {
         orderedStart = true;
         activeTools = toolsFor('brain', brainRoles, true);
       }
@@ -5217,7 +5300,8 @@ async function runTurn({
   const directProtocol = apiProtocol.normalizeProtocol(modelCfg.protocol);
   const cursorDirectOn = directProtocol === 'cursor';
   const codexDirectOn = directProtocol === 'codex';
-  const directOn = cursorDirectOn || codexDirectOn;
+  const claudeDirectOn = directProtocol === 'claudecode';
+  const directOn = cursorDirectOn || codexDirectOn || claudeDirectOn;
   const codeWorker = codeWorkerOf(vs, modelCfg);
   const planningWorker = planningWorkerOf(vs, modelCfg);
   const detectedForPlan = assembly.detectRoles(userText, { hasImages: false, contextChars: 0 });
@@ -5449,7 +5533,7 @@ async function runTurn({
       .filter((r) => assembly.GEN_ROLE_IDS.includes(r));
     if (genRoles.length) {
       const kinds = Object.keys(GEN_KIND_ROLE).filter((k) => genRoles.includes(GEN_KIND_ROLE[k]));
-      extraTexts.push(`【生成提示】用户这轮要生成内容（${kinds.join('、')}）。代码动画视频先写 HTML 再调用 render_code_video；需要生成模型素材时调用 generate_media，kind 填 ${kinds.join(' 或 ')}，prompt 写完整画面描述；要几张就调用几次。生成模型素材不需要用户说「开始」。`);
+      extraTexts.push(`【生成提示】用户这轮要生成内容（${kinds.join('、')}）。用代码创作图片、方案、交互页面或动画时，先写 HTML/SVG，再调用 present_artifact 展示和 export_artifact 导出；代码视频也可调用 render_code_video。需要生成模型素材时调用 generate_media，kind 填 ${kinds.join(' 或 ')}，prompt 写完整画面描述；要几张就调用几次。生成模型素材不需要用户说「开始」。`);
     }
   }
 
@@ -5720,7 +5804,8 @@ async function runTurn({
         agiNow,
         lang,
         cursorDirectOn,
-        codexDirectOn
+        codexDirectOn,
+        claudeDirectOn
       })
     },
     ...agedHist,
@@ -5754,7 +5839,7 @@ async function runTurn({
   const directLabels = {
     list_dir: '查看目录', read_file: '读取文件', write_file: '写入文件', edit_file: '修改文件',
     create_dir: '创建文件夹', delete_file: '删除文件', search_text: '搜索代码', map_lookup: '查项目地图', dialog_lookup: '查对话索引',
-    goto_definition: '跳转到定义', ask_user: '询问用户', run_command: '沙盒命令', generate_media: '生成', render_code_video: '代码做视频'
+    goto_definition: '跳转到定义', ask_user: '询问用户', run_command: '沙盒命令', generate_media: '生成', render_code_video: '代码做视频', render_code_audio: '代码合成音轨', analyze_audio: '分析音频卡点', present_artifact: '展示网页作品', export_artifact: '导出作品'
   };
   function directDetail(name, args) {
     const a = args || {};
@@ -5854,7 +5939,7 @@ async function runTurn({
       return `[用户]\n${body}`;
     }).filter(Boolean).join('\n\n');
     const last = lastUser >= 0 ? list[lastUser] : null;
-    const direct = codexDirectOn ? codexDirect : cursorDirect;
+    const direct = codexDirectOn ? codexDirect : claudeDirectOn ? claudeDirect : cursorDirect;
     // 非 AGI 直通轮次要把「准备方案」和「执行授权」分开讲，否则模型会把未开工
     // 误解成连排查和方案都不能给，反复让用户先点开始。提问类消息（含报故障、
     // 补充事实、明确修复办法这类连续对话）允许继续只读排查并直接输出完整方案；
@@ -5972,7 +6057,7 @@ async function runTurn({
           { role: 'user', content: planHead + task }
         ];
         const workerProtocol = apiProtocol.normalizeProtocol(codeWorker.protocol);
-        const out = ['cursor', 'codex'].includes(workerProtocol)
+        const out = ['cursor', 'codex', 'claudecode'].includes(workerProtocol)
           ? await workerDirect({
             modelCfg: codeWorker,
             messages: workerMessages,
@@ -6553,7 +6638,7 @@ function parseProjectMapJsonArray(text) {
 function composePromptTail(ctx) {
   // 先解构本轮上下文；预览面板可能少传字段，统一按空值处理，判空逻辑沿用下面的 !xxx 写法
   const { modelCfg, turnStart, userText, codeWorker, planningWorker, agiNow, lang,
-    cursorDirectOn, codexDirectOn } = ctx || {};
+    cursorDirectOn, codexDirectOn, claudeDirectOn } = ctx || {};
   // Luna 直通段：按 AGI 开关和本轮是否已开始，提示该派单还是该自己动手
   const luna = /luna/i.test(`${modelCfg?.model || ''} ${modelCfg?.name || ''}`);
   const lunaLine = !luna ? '' : (agiNow
@@ -6568,8 +6653,8 @@ function composePromptTail(ctx) {
         ? '\n\nLuna: the user did not say start. Only the brain answers. You may read_file, search_text, and list_dir. Do not call call_worker. Do not hand off to the code model.\n'
         : '\n\nLuna：用户这轮没有说开始。只由大脑回答。可以 read_file、search_text、list_dir 查原因。禁止 call_worker，禁止派给代码模块。\n')));
   // 直通段：AGI / 只读排查 / 派单模式 / 自己动手，四种处境给不同的工具权限说明
-  const directOn = cursorDirectOn || codexDirectOn;
-  const directName = codexDirectOn ? 'Codex' : 'Cursor';
+  const directOn = cursorDirectOn || codexDirectOn || claudeDirectOn;
+  const directName = codexDirectOn ? 'Codex' : claudeDirectOn ? 'Claude' : 'Cursor';
   const directHandsOff = !!codeWorker && !agiNow;
   const directLine = !directOn ? '' : agiNow
       ? `\n\n${directName} 直通已接通，当前为 AGI。直接使用 SpCode 工具完成用户目标，无需写入方案或等待开始，不派代码模块；实际工具结果是执行依据。\n`

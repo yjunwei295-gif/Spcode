@@ -1,7 +1,19 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+/** 桌宠复用现有窗口；主进程按发送者身份路由到本实例。 */
+contextBridge.exposeInMainWorld('desktopPet', {
+  call: function call(method, payload) { return ipcRenderer.invoke('desktop-pet:invoke', { method: 'desktop-pet:' + method, payload }); },
+  onView: function onView(cb) {
+    function receive(_event, data) { cb(data); }
+    ipcRenderer.on('desktop-pet:view', receive);
+    return function unsubscribe() { ipcRenderer.removeListener('desktop-pet:view', receive); };
+  }
+});
+
 const api = {
   getState: () => ipcRenderer.invoke('app:state'),
+  /** 完成或跳过引导时持久化标记，避免依赖浏览器本地存储。 */
+  completeOnboarding: function completeOnboarding() { return ipcRenderer.invoke('app:completeOnboarding'); },
   setTheme: (theme) => ipcRenderer.invoke('app:theme', theme),
   setLocale: (locale) => ipcRenderer.invoke('app:locale', locale),
   setAutoSave: (v) => ipcRenderer.invoke('app:autoSave', v),
@@ -53,6 +65,9 @@ const api = {
   readWorkspaceFile: (rel) => ipcRenderer.invoke('workspace:read', rel),
   showInFolder: (rel) => ipcRenderer.invoke('shell:showInFolder', rel),
   filePreview: (abs) => ipcRenderer.invoke('file:preview', abs),
+  // 作品清单与预览只使用当前主窗绑定的项目。
+  listArtifacts: function listArtifacts() { return ipcRenderer.invoke('artifact:list'); },
+  openArtifact: function openArtifact(payload) { return ipcRenderer.invoke('artifact:open', payload); },
   cloneRepo: (payload) => ipcRenderer.invoke('git:clone', payload),
   sshConnect: (profile) => ipcRenderer.invoke('ssh:connect', profile),
 

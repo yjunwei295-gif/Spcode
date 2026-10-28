@@ -11,7 +11,7 @@ const toolSpec = {
   type: 'function',
   function: {
     name: 'render_code_video',
-    description: '用代码做视频：先用 write_file/edit_file 编写 HTML 动画，再调用本工具逐帧渲染为 H.264 MP4，不需要视频生成模型。HTML 必须定义 window.renderFrame(time, frame, info)，time 为秒、frame 从 0 开始、info 含 width/height/fps/duration/totalFrames；可返回 Promise。动画只依赖传入时间，不使用实时计时器、自动播放或随机数。相对素材路径相对于 HTML；图片与字体会等待就绪，动态素材由 renderFrame 自己 await。尺寸/帧率/时长必须明确指定；宽高为正偶数。可选 audioPath 配乐/配音，短音轨补静音、长音轨截到画面结束。需要 PATH 中有 FFmpeg。输出到 generated/ 唯一目录，返回视频、首中尾预览和参数记录；检查预览后再交付。',
+    description: '用代码做视频：先用 write_file/edit_file 编写 HTML 动画，再调用本工具逐帧渲染为 H.264 MP4，不需要视频生成模型。HTML 必须定义 window.renderFrame(time, frame, info)，time 为秒、frame 从 0 开始、info 含 width/height/fps/duration/totalFrames；可返回 Promise。动画只依赖传入时间，不使用实时计时器、自动播放或随机数。相对素材路径相对于 HTML；图片与字体会等待就绪，动态素材由 renderFrame 自己 await。本工具不自动填充缺失参数，调用方必须显式传入 width、height、fps、duration；用户未指定规格时，由助手选用 1920×1080、60fps 并作为参数显式传入，用户明确的画幅或参数优先；宽高为正偶数。可选 audioPath 配乐/配音，短音轨补静音、长音轨截到画面结束。需要 PATH 中有 FFmpeg。输出到 generated/ 唯一目录，返回视频、首中尾预览和参数记录；检查预览后再交付。',
     parameters: {
       type: 'object',
       properties: {
@@ -245,4 +245,5 @@ async function render({ workspace, extra, args, signal, onProgress, beforeWrite 
   }
 }
 
-module.exports = { toolSpec, render };
+// 图片作品和视频渲染共享同一套异步取消语义。
+module.exports = { toolSpec, render, awaitAbort };

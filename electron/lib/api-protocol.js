@@ -9,8 +9,9 @@ const wallet = require('./wallet');
 
 const cursorModel = require('./cursor-model');
 const codexModel = require('./codex-model');
+const claudeModel = require('./claude-model');
 
-const PROTOCOLS = ['openai', 'anthropic', 'gemini', 'cursor', 'codex'];
+const PROTOCOLS = ['openai', 'anthropic', 'gemini', 'cursor', 'codex', 'claudecode'];
 
 function normalizeProtocol(raw) {
   const p = String(raw || 'openai').toLowerCase().trim();
@@ -18,6 +19,7 @@ function normalizeProtocol(raw) {
   if (p === 'google' || p === 'gemini') return 'gemini';
   if (p === 'cursor') return 'cursor';
   if (p === 'codex') return 'codex';
+  if (p === 'claudecode') return 'claudecode';
   return 'openai';
 }
 
@@ -219,6 +221,8 @@ async function fetchJsonQuiet(url, headers, ms) {
 async function fetchAccountBalance(modelCfg) {
   const protocol = normalizeProtocol(modelCfg?.protocol);
   if (protocol === 'codex') return codexModel.fetchRateLimitBalance(modelCfg);
+  if (protocol === 'cursor') return cursorModel.fetchUsageBalance();
+  if (protocol === 'claudecode') return { available: false };
   const host = String(modelCfg?.baseUrl || '');
   if (protocol === 'anthropic' || protocol === 'gemini') {
     return { available: false };
@@ -502,6 +506,7 @@ async function listModels(modelCfg) {
   const protocol = normalizeProtocol(modelCfg?.protocol);
   if (protocol === 'cursor') return cursorModel.listModels(modelCfg);
   if (protocol === 'codex') return codexModel.listModels(modelCfg);
+  if (protocol === 'claudecode') return claudeModel.listModels(modelCfg);
   const baseUrl = modelCfg?.baseUrl;
   const apiKey = modelCfg?.apiKey;
   if (!baseUrl) throw new Error('请填写接口地址');
@@ -579,6 +584,7 @@ async function listModels(modelCfg) {
 async function testConnection(modelCfg) {
   if (modelCfg?.type === 'local') throw new Error('本地模型请用本地探测');
   if (normalizeProtocol(modelCfg?.protocol) === 'codex') return codexModel.testConnection(modelCfg);
+  if (normalizeProtocol(modelCfg?.protocol) === 'claudecode') return claudeModel.testConnection(modelCfg);
   const listed = await listModels(modelCfg);
   if (modelCfg?.model) {
     const hit = listed.models.find((id) => id === modelCfg.model || id.endsWith(`/${modelCfg.model}`));
@@ -1048,6 +1054,8 @@ async function complete({
       });
     } else if (protocol === 'codex') {
       msg = await codexModel.complete({ modelCfg, messages, onDelta: wrappedDelta, onReason: wrappedReason, signal: ctl.signal });
+    } else if (protocol === 'claudecode') {
+      msg = await claudeModel.complete({ modelCfg, messages, onDelta: wrappedDelta, onReason: wrappedReason, signal: ctl.signal });
     } else if (protocol === 'anthropic') {
       msg = await completeAnthropic({
         modelCfg, messages, stream, tools,

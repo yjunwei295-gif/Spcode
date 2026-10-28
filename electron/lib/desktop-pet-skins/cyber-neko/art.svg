@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1600" viewBox="0 0 800 800" aria-labelledby="title description">
+<title id="title">棱光猫娘 · 锐利漂亮</title>
+<desc id="description">锐利漂亮赛博猫娘：大尖猫耳、细上挑眉、大锐眼、侧垂雾紫闪电发；告别法师王冠图标脸。</desc>
+<!-- 后发：侧垂分层 + 少量底尖，不要头顶王冠感 -->
+<g id="hair-back" data-part="hair-back">
+ <path data-paint="hairShadow" fill="#554283" d="M215 300 255 160 330 90 400 70 480 90 555 165 605 305 620 440 565 560 485 515 440 620 400 645 360 620 315 515 235 560 180 430Z"/>
+ <path data-paint="hair" fill="#9b87e8" d="M235 295 270 170 335 100 400 82 475 100 540 175 585 300 598 430 550 540 475 500 435 595 400 612 365 595 325 500 250 540 202 420Z"/>
+ <path data-paint="hairLight" fill="#cfbdff" d="M310 240 355 150 400 125 455 150 495 240 465 265 400 235 340 265Z"/>
+ <!-- 大尖猫耳：必须一眼是猫 -->
+ <path data-paint="hair" fill="#9b87e8" d="M265 210 200 20 340 155Z"/>
+ <path data-paint="error" fill="#ff8aa8" d="M268 195 225 70 320 155Z"/>
+ <path data-paint="secondary" fill="#67cfff" d="M270 185 240 95 305 150Z"/>
+ <path data-paint="hair" fill="#9b87e8" d="M535 210 600 20 460 155Z"/>
+ <path data-paint="error" fill="#ff8aa8" d="M532 195 575 70 480 155Z"/>
+ <path data-paint="accent" fill="#63f0b3" d="M530 185 560 95 495 150Z"/>
+ <!-- 耳环细环 -->
+ <path data-paint="jacket" fill="#e9eef7" d="M255 175 275 175 275 182 270 182 270 200 260 200 260 182 255 182Z"/>
+ <path data-paint="jacket" fill="#e9eef7" d="M525 175 545 175 545 182 540 182 540 200 530 200 530 182 525 182Z"/>
+ <!-- 侧垂闪电发 -->
+ <path data-paint="hair" fill="#9b87e8" d="M210 350 145 400 165 435 120 505 160 480 205 425 220 455 255 380Z"/>
+ <path data-paint="hair" fill="#9b87e8" d="M590 350 655 400 635 435 680 505 640 480 595 425 580 455 545 380Z"/>
+ <path data-paint="secondary" fill="#67cfff" d="M155 405 130 470 158 480 185 425Z"/>
+ <path data-paint="accent" fill="#63f0b3" d="M645 405 670 470 642 480 615 425Z"/>
+</g>
+<!-- 白皙大脸瓜子 -->
+<g id="face" data-part="face">
+ <path data-paint="hairShadow" fill="#554283" d="M265 250 330 175 400 155 485 180 545 255 540 400 475 515 400 550 325 515 260 400Z"/>
+ <path data-paint="face" fill="#fff8ff" d="M280 260 340 190 400 172 470 195 530 265 525 395 465 505 400 530 335 505 275 395Z"/>
+ <path data-paint="faceEdge" fill="#d4c4ec" d="M290 280 320 260 342 405 368 475 400 520 378 525 335 475 285 390Z"/>
+ <path data-paint="faceEdge" fill="#d4c4ec" d="M468 240 520 265 514 400 468 475 438 490 482 390Z"/>
+ <!-- 粉颊锐条 -->
+ <path data-paint="error" fill="#ff8aa8" d="M300 400 350 412 342 428 294 414Z"/>
+ <path data-paint="error" fill="#ff8aa8" d="M450 405 505 392 512 408 460 422Z"/>
+</g>
+<!-- 大锐眼：细外高眉 + 紫虹 + 青小核 -->
+<g id="eyes" data-part="eyes">
+ <!-- 极细外高眉 -->
+ <path data-paint="ink" fill="#080c18" d="M282 258 355 292 360 300 288 270Z"/>
+ <path data-paint="ink" fill="#080c18" d="M440 292 528 258 520 270 435 300Z"/>
+ <!-- 细上眼线 -->
+ <path data-paint="ink" fill="#080c18" d="M292 308 382 285 386 296 298 316Z"/>
+ <path data-paint="ink" fill="#080c18" d="M414 288 518 305 512 318 410 300Z"/>
+ <!-- 大眼白 -->
+ <path data-paint="jacket" fill="#e9eef7" d="M295 315 385 295 395 360 325 380 288 340Z"/>
+ <path data-paint="jacket" fill="#e9eef7" d="M405 298 515 315 525 350 485 380 400 358Z"/>
+ <!-- 大紫虹 -->
+ <path data-paint="hair" fill="#9b87e8" d="M315 318 378 302 388 355 328 368 308 338Z"/>
+ <path data-paint="hair" fill="#9b87e8" d="M422 308 498 318 508 350 482 370 415 355Z"/>
+ <path data-paint="secondary" fill="#67cfff" d="M335 325 368 318 372 348 340 352Z"/>
+ <path data-paint="secondary" fill="#67cfff" d="M445 322 478 328 482 350 450 354Z"/>
+ <path data-paint="ink" fill="#080c18" d="M344 324 360 320 362 352 342 354Z"/>
+ <path data-paint="ink" fill="#080c18" d="M454 326 472 330 470 354 450 352Z"/>
+ <path data-paint="metalLight" fill="#f6fff9" d="M322 312 342 308 340 328 320 330Z"/>
+ <path data-paint="metalLight" fill="#f6fff9" d="M432 314 452 312 450 330 430 332Z"/>
+ <path data-paint="metalLight" fill="#f6fff9" d="M356 342 368 340 366 354 354 355Z"/>
+ <path data-paint="metalLight" fill="#f6fff9" d="M466 344 478 342 476 356 464 357Z"/>
+ <path data-paint="ink" fill="#080c18" d="M300 365 312 385 324 368Z"/>
+ <path data-paint="ink" fill="#080c18" d="M492 368 505 388 518 370Z"/>
+</g>
+<!-- 前发：额前三束斜切，两侧垂丝 -->
+<g id="hair-front" data-part="hair-front">
+ <path data-paint="hair" fill="#9b87e8" d="M275 230 245 130 280 115 265 55 310 85 345 160 330 180 360 225 325 245 285 238Z"/>
+ <path data-paint="hair" fill="#9b87e8" d="M368 225 352 120 378 100 368 48 400 72 432 48 422 100 448 120 432 225 400 248 380 235Z"/>
+ <path data-paint="hair" fill="#9b87e8" d="M465 230 505 130 480 115 525 55 500 85 455 160 470 180 440 225 475 245 510 235Z"/>
+ <path data-paint="hairLight" fill="#cfbdff" d="M300 195 285 130 320 122 310 80 340 145 338 190Z"/>
+ <path data-paint="hairLight" fill="#cfbdff" d="M400 198 390 125 418 130 410 80 435 145 422 192Z"/>
+ <path data-paint="hairShadow" fill="#554283" d="M260 238 215 160 240 145 200 90 245 120 285 190 275 220 295 245Z"/>
+ <path data-paint="hairShadow" fill="#554283" d="M540 238 585 160 560 145 600 90 555 120 515 190 525 220 505 245Z"/>
+ <path data-paint="accent" fill="#63f0b3" d="M230 135 190 65 260 122Z"/>
+ <path data-paint="secondary" fill="#67cfff" d="M570 130 610 60 535 120Z"/>
+ <path data-paint="jacket" fill="#e9eef7" d="M575 115 595 122 588 138 570 130Z"/>
+</g>
+<g id="mouth-guide" data-part="mouth-guide">
+ <path fill="none" stroke="#7a68b8" stroke-width="6" stroke-linecap="butt" stroke-linejoin="miter" d="M368 450 392 468 400 454 408 468 432 448"/>
+</g>
+</svg>

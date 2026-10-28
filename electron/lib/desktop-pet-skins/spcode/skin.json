@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "atlas": "atlas.png",
+  "cellSize": 192,
+  "columns": 12,
+  "fps": 12,
+  "anchor": [
+    96,
+    192
+  ],
+  "animations": {
+    "idle": {
+      "row": 0,
+      "frames": 12,
+      "loop": true
+    },
+    "thinking": {
+      "row": 1,
+      "frames": 12,
+      "loop": true
+    },
+    "speaking": {
+      "row": 2,
+      "frames": 12,
+      "loop": true
+    },
+    "reading": {
+      "row": 3,
+      "frames": 12,
+      "loop": true
+    },
+    "searching": {
+      "row": 4,
+      "frames": 12,
+      "loop": true
+    },
+    "writing": {
+      "row": 5,
+      "frames": 12,
+      "loop": true
+    },
+    "running": {
+      "row": 6,
+      "frames": 12,
+      "loop": true
+    },
+    "testing": {
+      "row": 7,
+      "frames": 12,
+      "loop": true
+    },
+    "desktop": {
+      "row": 8,
+      "frames": 12,
+      "loop": true
+    },
+    "generating": {
+      "row": 9,
+      "frames": 12,
+      "loop": true
+    },
+    "waiting": {
+      "row": 10,
+      "frames": 12,
+      "loop": true
+    },
+    "success": {
+      "row": 11,
+      "frames": 12,
+      "loop": false
+    },
+    "error": {
+      "row": 12,
+      "frames": 12,
+      "loop": true
+    },
+    "stopped": {
+      "row": 13,
+      "frames": 12,
+      "loop": true
+    },
+    "dragging": {
+      "row": 14,
+      "frames": 12,
+      "loop": true
+    },
+    "landing": {
+      "row": 15,
+      "frames": 12,
+      "loop": false
+    }
+  },
+  "id": "spcode",
+  "name": "SpCode 电路伙伴",
+  "author": "SpCode",
+  "character": "robot",
+  "colors": {
+    "body": "#f7fcf9",
+    "ink": "#214e3e",
+    "accent": "#0e9f67",
+    "secondary": "#76dfb3"
+  }
+}

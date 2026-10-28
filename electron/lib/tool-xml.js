@@ -212,7 +212,7 @@ function extractJsonObject(s) {
 function jsonBlobCalls(text) {
   const s = String(text || '');
   const out = [];
-  const startRe = /\{\s*"(?:name|tool|function)"\s*:\s*"(list_dir|read_file|write_file|edit_file|create_dir|mkdir|delete_file|search_text|semantic_search|map_lookup|goto_definition|run_command|generate_media|render_code_video|ask_user|working_memory_update|todo_write|call_worker|screen_read|screen_look|clipboard_look|window_list|window_focus|ui_act|agi_note|mouse_click|mouse_drag|mouse_scroll|keyboard_type|keyboard_key)"/g;
+  const startRe = /\{\s*"(?:name|tool|function)"\s*:\s*"(list_dir|read_file|write_file|edit_file|create_dir|mkdir|delete_file|search_text|semantic_search|map_lookup|goto_definition|run_command|generate_media|render_code_video|render_code_audio|analyze_audio|present_artifact|export_artifact|ask_user|working_memory_update|todo_write|call_worker|screen_read|screen_look|clipboard_look|window_list|window_focus|ui_act|agi_note|mouse_click|mouse_drag|mouse_scroll|keyboard_type|keyboard_key)"/g;
   let m;
   while ((m = startRe.exec(s))) {
     const obj = extractJsonObject(s.slice(m.index));
@@ -245,7 +245,7 @@ function looksLikeUnfinishedToolTurn(text) {
   const s = String(text || '').trim();
   if (!s || s.length > 4000) return false;
   if (looksLikeXmlTool(s)) return true;
-  if (/"name"\s*:\s*"(list_dir|read_file|search_text|semantic_search|map_lookup|write_file|edit_file|create_dir|mkdir|run_command|generate_media|render_code_video|call_worker|screen_read|screen_look|clipboard_look|window_focus|ui_act|mouse_click|mouse_drag|keyboard_type)"/.test(s)) return true;
+  if (/"name"\s*:\s*"(list_dir|read_file|search_text|semantic_search|map_lookup|write_file|edit_file|create_dir|mkdir|run_command|generate_media|render_code_video|render_code_audio|analyze_audio|present_artifact|export_artifact|call_worker|screen_read|screen_look|clipboard_look|window_focus|ui_act|mouse_click|mouse_drag|keyboard_type)"/.test(s)) return true;
   if (/(已完成|结果如下|如下所示|转换完成|已写入|一共有)/.test(s) && s.length > 80) return false;
   return /(调用|使用|准备|接下来|先).{0,24}(list_dir|read_file|search_text|semantic_search|map_lookup|write_file|edit_file|create_dir|mkdir|run_command|工具)|<(tool_call|tool_calls)|先(来)?(看|读|列|搜|打开|建).{0,24}(目录|文件夹|文件|pdf|json)|我(来|先|会).{0,16}(读取|查看|列出|搜索|创建).{0,20}(目录|文件夹|文件|pdf)/i.test(s);
 }

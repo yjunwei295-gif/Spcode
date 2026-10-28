@@ -2141,8 +2141,9 @@ function callModelForText(modelCfg, messages, signal) {
       .then((r) => (typeof r === "string" ? r : (r && r.content) || ""));
   }
   // 直通正在占用 Cursor 连接时，再开一个 Agent 会把正在干活的那条连接挤成 Connection stalled
-  if (['cursor', 'codex'].includes(apiProtocol.normalizeProtocol(modelCfg && modelCfg.protocol))
-    && (require('./cursor-direct').busy() || require('./codex-direct').busy())) {
+  if ((['cursor', 'codex'].includes(apiProtocol.normalizeProtocol(modelCfg && modelCfg.protocol))
+    && (require('./cursor-direct').busy() || require('./codex-direct').busy()))
+    || (apiProtocol.normalizeProtocol(modelCfg && modelCfg.protocol) === 'claudecode' && require('./claude-direct').busy())) {
     diag.log('map', '直通进行中，跳过这次归纳');
     return Promise.reject(new Error('直通进行中，暂缓归纳'));
   }

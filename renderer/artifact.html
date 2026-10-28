@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; media-src 'self' file:; script-src 'self'"><title>代码作品</title><link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="artifact.css"></head>
+<body class="artifact-page">
+<header class="artifact-toolbar"><div class="artifact-heading"><strong id="art-title">代码作品</strong><span id="art-size"></span></div><div class="artifact-actions"><button id="art-refresh">刷新</button><button id="art-source">下载源文件</button><button id="art-png" class="primary">下载 PNG</button><button id="art-mp4" class="primary" hidden>导出 MP4</button><button id="art-cancel" hidden>停止导出</button></div></header>
+<section id="art-player" class="artifact-player" hidden><button id="art-play">播放</button><input id="art-seek" type="range" min="0" value="0" step="any" aria-label="作品时间"><output id="art-time"></output><audio id="art-audio" preload="metadata"></audio></section>
+<main id="art-stage" class="artifact-stage" aria-label="作品预览"></main>
+<footer id="art-status" class="artifact-status" role="status">正在加载作品…</footer>
+<script src="artifact.js"></script></body></html>

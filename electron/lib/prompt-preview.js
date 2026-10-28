@@ -212,7 +212,8 @@ function build(ctx) {
   const directProtocol = apiProtocol.normalizeProtocol(modelCfg?.protocol);
   const cursorDirectOn = directProtocol === 'cursor';
   const codexDirectOn = directProtocol === 'codex';
-  const directOn = cursorDirectOn || codexDirectOn;
+  const claudeDirectOn = directProtocol === 'claudecode';
+  const directOn = cursorDirectOn || codexDirectOn || claudeDirectOn;
   // 代码槽即使和大脑是同一只模型也算配了：runTurn 里派工只看槽位是否存在
   const codeWorker = workerOf(vs, 'code');
   const planningWorker = planningWorkerOf(vs, modelCfg);
@@ -253,6 +254,7 @@ function build(ctx) {
     directOn,
     cursorDirectOn,
     codexDirectOn,
+    claudeDirectOn,
     codeWorker,
     planningWorker,
     agiNow,

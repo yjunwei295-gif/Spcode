@@ -31,9 +31,9 @@ HTML 必须定义 window.renderFrame(time, frame, info)：
       "audioPath": "video/music.wav"
     }
 
-audioPath 可省略，此时输出无声视频。音轨短于画面时补静音，长于画面时截断。
+底层 audioPath 可省略以支持明确要求的无声视频；正常有声视频应提供音轨。代码合成用 render_code_audio，分析现有音乐用 analyze_audio，先核对起音和能量增强时间，再安排画面卡点，详见 docs/code-audio.md。音轨短于画面时补静音，长于画面时截断。
 宽高必须为正偶数；fps 和 duration 为正数；总帧数为 ceil(duration * fps)，实际时长为总帧数 / fps。
-所有参数由任务明确指定，不通过实时屏幕录制决定时长。
+用户未指定视频规格时默认使用 1920×1080、60fps；用户指定的画幅、尺寸或帧率优先。调用工具仍须显式传入参数，时长按分镜与音频确定，不通过实时屏幕录制决定。
 
 ## 产物与验收
 

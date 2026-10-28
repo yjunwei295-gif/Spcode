@@ -3509,9 +3509,12 @@ html[data-theme="dark"] .start-go-submit:disabled {
 .todo-in_progress .todo-mark {
   border-color: var(--accent);
   border-right-color: transparent;
+}
+/* 任务状态与执行动画分开：历史快照、结束和等待输入时显示静态标记。 */
+.todo-in_progress.todo-running .todo-mark {
   animation: todo-spin 0.9s linear infinite;
 }
 @keyframes todo-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
-  .todo-in_progress .todo-mark { animation: none; }
+  .todo-in_progress.todo-running .todo-mark { animation: none; }
 }

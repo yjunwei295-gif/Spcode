@@ -23,7 +23,8 @@ const READ_ONLY_TOOLS = new Set([
   'semantic_search',
   'map_lookup',
   'goto_definition',
-  'dialog_lookup'
+  'dialog_lookup',
+  'process_memory'
 ]);
 
 function busy() { return activeRuns > 0; }
@@ -96,6 +97,7 @@ function startBridge(session) {
         const ctx = session.ctx;
         const result = await ctx.runTool(name, body.params?.arguments || {}, body.params?.toolCallId || '');
         if (ctx.stats) ctx.stats.calls.push(name);
+        if (result && Array.isArray(result.spcodeContent)) return sendJson(res, 200, { content: result.spcodeContent });
         return sendJson(res, 200, { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result ?? '') }] });
       }
       return sendJson(res, 400, { error: 'unsupported method' });

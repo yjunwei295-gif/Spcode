@@ -733,14 +733,36 @@
     color: #17120a;
   }
 </style>
+<link rel="stylesheet" href="desktop-pet.css" />
 </head>
-<body>
+<body class="pet-collapsed">
+<div id="pet-stage">
+  <!-- 常驻工作标识独立于详细气泡，长推理或工具原名不会盖掉当前工作类别。 -->
+  <div id="pet-activity" role="status" aria-live="polite" aria-atomic="true">
+    <svg id="pet-activity-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path id="pet-activity-path"></path></svg>
+    <span id="pet-activity-text"></span>
+  </div>
+  <button id="pet-label" type="button" title="点击展开对话，右键换肤">在这里陪你</button>
+  <canvas id="pet-canvas" width="192" height="192" role="img" aria-label="桌宠"></canvas>
+</div>
+<section id="pet-menu" hidden>
+  <header><strong>桌宠 · 外观与动作</strong><button id="pet-menu-close" type="button">返回对话</button></header>
+  <label>皮肤<select id="pet-skin"></select></label>
+  <label>动作预览<select id="pet-preview"></select></label>
+  <label>显示大小<input id="pet-scale" type="range" min="0.65" max="1.6" step="0.05" /></label>
+  <label>动作速度<input id="pet-speed" type="range" min="0.5" max="2" step="0.1" /></label>
+  <label><input id="pet-reduced" type="checkbox" />减少动态效果</label>
+  <p id="pet-hint">拖动角色移动；单击展开对话；右键更换皮肤。预览动作不会改变 AI 的实际工作状态。</p>
+  <p id="pet-error" role="alert"></p>
+  <footer><button id="pet-import" type="button">导入皮肤包</button><button id="pet-hide" type="button">隐藏宠物</button></footer>
+</section>
 <div id="frame">
   <div id="bar">
     <div id="top">
       <span id="dot" class="dot"></span>
       <button id="sess" type="button" title="当前会话：未绑定会话（点这里切换）">未绑定会话</button>
       <span id="status">空闲</span>
+      <button id="pet-settings-open" class="tbtn" type="button" title="换皮肤与动作预览">换肤</button>
       <button id="btnStop" class="tbtn" type="button" title="停止当前轮次">停止</button>
       <button id="btnHide" class="tbtn" type="button" title="收起悬浮栏">收起</button>
       <button id="btn-mini" class="tbtn" type="button" title="最小化（只留输入框和两条消息）">最小化</button>
@@ -1302,10 +1324,12 @@
     }
     if (kind === 'user') {
       addMessage('user', text);
+      statusEl.removeAttribute('data-reason');
       if (!waiting) setStatus('busy', '正在处理你的提示');
       return;
     }
     if (kind === 'tool') {
+      if (ev.activityOnly) return; // 动作专用元数据不重复插入聊天消息。
       addMessage('tool', text);
       if (!waiting) setStatus('busy', text);
       return;
@@ -1313,6 +1337,20 @@
     if (kind === 'status') {
       // 状态事件只刷顶栏文字，不再往消息区新增条目：一轮里「正在调用 xxx」会连发几十条，会把真实对话挤出去
       if (!waiting) setStatus('busy', text);
+      return;
+    }
+    if (kind === 'think' || kind === 'reason') {
+      // 思考全文进顶栏；推理增量累加，避免只显示「正在思考」。
+      if (!waiting) {
+        if (kind === 'reason') {
+          var prev = String(statusEl.getAttribute('data-reason') || '');
+          var next = prev + text;
+          statusEl.setAttribute('data-reason', next);
+          setStatus('busy', next);
+        } else {
+          if (!statusEl.getAttribute('data-reason')) setStatus('busy', text);
+        }
+      }
       return;
     }
     if (kind === 'ai') {
@@ -1337,6 +1375,7 @@
     if (kind === 'idle') {
       waiting = false;
       askEl.classList.add('hidden');
+      statusEl.removeAttribute('data-reason');
       setStatus('idle');
       return;
     }
@@ -1558,7 +1597,7 @@
     }
     if (!boundKey) {
       // 没绑定会话就不知道送给谁：图片先留着，等绑好会话再发，别把用户粘的图清掉
-      addMessage('sys', '小窗还没绑定对话，先在主窗里打开一个对话');
+      addMessage('sys', '宠物还没绑定对话，先在主窗里打开一个对话');
       return;
     }
     // 附件先拷一份快照，发送途中用户还能继续加图，不影响这一条
@@ -1591,7 +1630,8 @@
   }
 
   function doHide() {
-    if (bridge) bridge.hide();
+    // 收起聊天仍保留桌宠；隐藏整个宠物由右键菜单单独执行。
+    window.desktopPet.call('expand', false);
   }
 
   inputEl.addEventListener('input', growInput);
@@ -1775,5 +1815,7 @@
   if (bridge && typeof bridge.bind === 'function') bridge.bind('');
 })();
 </script>
+<script src="desktop-pet-state.js"></script>
+<script src="desktop-pet.js"></script>
 </body>
 </html>

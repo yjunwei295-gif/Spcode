@@ -1,7 +1,7 @@
 // 渲染层构建标记：用于诊断页面加载的是否为当前磁盘代码。
 // 每次改动渲染层资源（app.js / styles.css / index.html）都要 bump 这个值，
 // 否则旧页面缓存会继续跑磁盘上已经不存在的样式，排查“改了没生效”时会误判。
-window.__APP_BUILD = 'v20261024b';
+window.__APP_BUILD = 'v20261024c';
 import { t, setLocale, applyDom, getLocale, isNewChatTitle } from './i18n.js';
 import { renderMarkdown } from './markdown.js';
 
@@ -108,12 +108,14 @@ function syncCursorDirectBtn() {
     const model = slot?.apiId ? (state.models || []).find((x) => x.id === slot.apiId) : null;
     return model && model.type !== 'local' ? providerById(model.providerId)?.protocol : '';
   });
-  const directProtocols = [brainProtocol, ...roleProtocols].filter((p) => p === 'cursor' || p === 'codex');
+  const directProtocols = [brainProtocol, ...roleProtocols].filter((p) => p === 'cursor' || p === 'codex' || p === 'claudecode');
   const on = directProtocols.length > 0;
   btn.disabled = true;
   btn.classList.toggle('on', on);
   btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-  btn.textContent = directProtocols.includes('codex') ? 'Codex 直通' : (on ? 'Cursor 直通' : t('cursorDirect'));
+  btn.textContent = directProtocols.includes('codex') ? 'Codex 直通'
+    : directProtocols.includes('claudecode') ? 'Claude 直通'
+    : (on ? 'Cursor 直通' : t('cursorDirect'));
 }
 
 function syncRoundsInput(tab) {
@@ -394,6 +396,28 @@ function showWelcome() {
 let onboardingModulesResume = false;
 let localGuideContinueOnboarding = false;
 
+/** 完成或跳过引导后先保存到设置，再同步旧版浏览器标记；保存失败向调用方报告。 */
+async function completeOnboarding() {
+  await api.completeOnboarding();
+  localStorage.setItem('spcode.onboarding.completed', 'true');
+}
+
+/**
+ * 恢复启动时的引导状态，并将旧版完成标记或已配齐的三个必选模块迁移到设置。
+ * 使用与引导完成按钮相同的模块条件；全新或只配了一部分的用户仍进入引导。
+ */
+async function restoreOnboardingCompletion(settings) {
+  if (settings.onboardingCompleted === true) return true;
+  const requiredRoles = ['summary', 'code', 'planning'];
+  let configured = true;
+  for (const role of requiredRoles) {
+    if (!capValOf(settings.capabilityDefaults?.[role]?.primary)) configured = false;
+  }
+  if (localStorage.getItem('spcode.onboarding.completed') !== 'true' && !configured) return false;
+  await completeOnboarding();
+  return true;
+}
+
 async function startOnboarding() {
   const wizard = { step: 'providers', presets: [], selected: [], keyed: [], modelIndex: 0, remote: null, choices: new Map() };
   const describeElement = (el) => el ? {
@@ -436,9 +460,9 @@ async function startOnboarding() {
           <label class="check-row"><input type="checkbox" data-onboarding-provider="${i}" ${wizard.selected.includes(i) ? 'checked' : ''} />
             ${escapeHtml(p.name || p.id)} <span class="hint">${escapeHtml(p.protocol || '')}</span></label>`).join('') || `<p class="hint">${t('noProviders')}</p>`}</div>
         <div class="modal-actions"><button type="button" id="onboarding-skip">${t('onboardingSkip')}</button><button type="button" class="primary" id="onboarding-next">${t('onboardingNext')}</button></div>`);
-      $('onboarding-skip').onclick = () => {
+      $('onboarding-skip').onclick = async function skipOnboarding() {
+        await completeOnboarding();
         closeModal();
-        localStorage.setItem('spcode.onboarding.completed', 'true');
       };
       $('onboarding-next').onclick = () => {
         wizard.selected = [...document.querySelectorAll('[data-onboarding-provider]:checked')].map((el) => Number(el.dataset.onboardingProvider));
@@ -451,7 +475,7 @@ async function startOnboarding() {
     }
     if (wizard.step === 'keys') {
       if (wizard.keyIndex >= wizard.selected.length) {
-        wizard.keyed = wizard.keyed.filter((p) => p.apiKey || ['cursor', 'codex'].includes(p.protocol));
+        wizard.keyed = wizard.keyed.filter((p) => p.apiKey || ['cursor', 'codex', 'claudecode'].includes(p.protocol));
         if (!wizard.keyed.length) {
           wizard.step = 'empty';
           render();
@@ -676,13 +700,13 @@ function openOnboardingModules() {
       const read = readCapFromContainer(box);
       state.capabilityDefaults = await api.saveCapabilityDefaults(read);
       await persistModels();
+      await completeOnboarding();
     } catch (err) {
       alert(err && err.message ? err.message : t('saveFail'));
       return;
     }
     // 能力默认模型改变后重绘底部模型栏；否则引导页刚载入时的“大脑”单标签会残留。
     renderModelMenu();
-    localStorage.setItem('spcode.onboarding.completed', 'true');
     closeModal();
     showChat();
   };
@@ -1220,7 +1244,7 @@ function receiveFloatInterjection(payload) {
   }
   if (!tab) return;
   recordSubmittedText(tab, payload.text);
-  tab.messages.push({ role: 'system', text: `你（插话·已提交）：${payload.text}` });
+  tab.messages.push({ role: 'system', text: `你（插话·已提交）：${payload.text}`, images: payload.images || [], attachments: payload.attachments || [] });
   persistTab(tab);
   if (isActiveTab(tab)) {
     renderMessages();
@@ -1824,7 +1848,8 @@ function markTurnFailed(assistant, raw) {
   if (!assistant) return;
   const msg = cleanErrorMessage(raw);
   const note = t('errorPrefix', { msg });
-  const hint = t('errorContinueHint');
+  // 地区限制这类永久性错误，发「继续」也只会再失败一次
+  const hint = /在当前地区不可用/.test(msg) ? '' : t('errorContinueHint');
   const body = assistant.text || '';
   if (!assistant.errorShown && !body.includes(note) && !body.includes(msg)) {
     assistant.text = [body, note, hint].filter(Boolean).join('\n\n');
@@ -1843,6 +1868,7 @@ function thinkSummary(m) {
     const lastTool = tools[tools.length - 1];
     if (lastTool) return `${t('running')} · ${clipText(lastTool.text, 28)}`;
     const last = (m.thinking || [])[m.thinking.length - 1];
+    // 摘要只给状态词：推理正文放在折叠区里，不铺到标题上占地方。
     if (last?.type === 'reason') return t('reasoning');
     return m.text ? t('generating') : t('thinking');
   }
@@ -1861,6 +1887,7 @@ function thinkSummaryHtml(m) {
 }
 
 function thinkStepsHtml(m) {
+  // 进行中只留最近 8 条，推理正文裁到 280 字，避免长思考把对话区顶满。
   let list = (m.thinking || []).filter((s) => s.type === 'tool' || s.type === 'reason');
   if (m.thinkingOpen && list.length > 8) list = list.slice(-8);
   const html = list.map((s) => {
@@ -2258,15 +2285,21 @@ function onStartNoteInput(e) {
   goAll.disabled = picked.length < 1 && !String(m.startDraft == null ? '' : m.startDraft).trim();
 }
 
-// AI 用 todo_write 列的任务清单，每条回复存一份当时的快照
+/**
+ * 按回复快照显示待办状态，仅回复仍在执行且未等待答复时旋转进行中图标。
+ * 结束、停止与历史回复保留原任务状态，不把尚未完成的任务伪标为完成。
+ */
 function renderTodoCard(m) {
   const list = Array.isArray(m.todos) ? m.todos : [];
   if (!list.length) return '';
-  const rows = list.map((td) => {
+  const running = m.thinkingOpen === true && !m.askPending && !m.stopped;
+  const rows = [];
+  for (const td of list) {
     const st = ['pending', 'in_progress', 'completed', 'cancelled'].includes(td.status) ? td.status : 'pending';
-    return `<li class="todo-item todo-${st}"><span class="todo-mark"></span><span class="todo-text">${escapeHtml(String(td.content || ''))}</span></li>`;
-  }).join('');
-  return `<div class="todo-card"><div class="todo-head">To-dos ${list.length}</div><ul class="todo-list">${rows}</ul></div>`;
+    const animationClass = st === 'in_progress' && running ? ' todo-running' : '';
+    rows.push(`<li class="todo-item todo-${st}${animationClass}"><span class="todo-mark"></span><span class="todo-text">${escapeHtml(String(td.content || ''))}</span></li>`);
+  }
+  return `<div class="todo-card"><div class="todo-head">To-dos ${list.length}</div><ul class="todo-list">${rows.join('')}</ul></div>`;
 }
 
 function paintTodoCard(tab, m) {
@@ -2348,6 +2381,41 @@ function globalPrefListHtml() {
       </div>
     </div>`;
   }).join('');
+}
+
+/** 作品卡片只渲染标题与受控入口，不将生成的 HTML 注入聊天页面。 */
+function artifactCardsHtml(message) {
+  const items = message.artifacts || [];
+  if (!items.length) return '';
+  let html = '<div class="artifact-cards">';
+  for (const item of items) {
+    html += '<article class="artifact-card"><div><strong>' + escapeHtml(item.title) + '</strong><small>' +
+      escapeHtml(item.sourcePath) + ' · ' + item.width + ' × ' + item.height +
+      (item.duration === undefined ? '' : ' · ' + item.duration + 's / ' + item.fps + 'fps') +
+      '</small></div><button type="button" data-open-artifact="' + encodeURIComponent(item.manifest) + '">' + t('openArtifact') + '</button></article>';
+  }
+  return html + '</div>';
+}
+
+/** 重开作品统一交给独立窗口；无法加载的源文件明确提示。 */
+async function openArtifact(manifest) {
+  try { await api.openArtifact({ manifest, theme: state.theme }); }
+  catch (error) { alert(error.message); }
+}
+
+/** 项目作品库从磁盘清单恢复，即使没有打开原来的对话也能继续创作。 */
+async function openArtifactLibrary() {
+  try {
+    const items = await api.listArtifacts();
+    openModal('<div class="modal-card-inner"><h3>' + t('artifacts') + '</h3><div id="artifact-library">' +
+      (items.length ? artifactCardsHtml({ artifacts: items }) : '<p class="hint">' + t('noArtifacts') + '</p>') +
+      '</div><div class="modal-actions"><button id="art-library-close">' + t('close') + '</button></div></div>');
+    $('art-library-close').onclick = closeModal;
+    $('artifact-library').onclick = function openSelected(event) {
+      const button = event.target.closest('[data-open-artifact]');
+      if (button) openArtifact(decodeURIComponent(button.getAttribute('data-open-artifact')));
+    };
+  } catch (error) { alert(error.message); }
 }
 
 function milestoneListHtml() {
@@ -2523,7 +2591,7 @@ function cancelReveal(msg) {
  * @param {object} msg 消息对象，使用 text、revealLen 字段。
  * @param {boolean} done true 表示流式结束，改用 Markdown 渲染整段文本；false 时按 revealLen 截断为纯文本。
  * @returns {boolean} 找到并绘制了对应气泡返回 true；消息不在当前会话或气泡节点缺失返回 false（调用方据此走兜底补满）。
- * 副作用：切换 bubble 的 typewriter/md 类名、写 textContent 或 innerHTML、在贴底时调整消息区滚动位置。
+ * 副作用：切换 bubble 的 typewriter/md 类名、增量追加文字（重写时替换内容）、结束时渲染 Markdown，并在贴底时滚动。
  */
 function paintRevealBubble(msg, done) {
   const tab = activeSession();
@@ -2543,7 +2611,18 @@ function paintRevealBubble(msg, done) {
   } else {
     el.classList.remove('md');
     el.classList.add('typewriter', 'typing');
-    el.textContent = (msg.text || '').slice(0, msg.revealLen || 0);
+    const shown = (msg.text || '').slice(0, msg.revealLen || 0);
+    const node = el.firstChild;
+    // 正常流式只追加新字符，保留已排版的文字节点；重写或回退显示长度时才替换内容。
+    if (node && node.nodeType === Node.TEXT_NODE && el.childNodes.length === 1) {
+      if (shown.startsWith(node.data)) {
+        if (shown.length > node.length) node.appendData(shown.slice(node.length));
+      } else {
+        node.data = shown;
+      }
+    } else {
+      el.textContent = shown;
+    }
   }
   if (nearBottom) box.scrollTop = box.scrollHeight;
   return true;
@@ -2753,7 +2832,7 @@ function renderMessages(switching = false) {
           <button class="msg-fork" data-fork="${i}" title="${t('forkTitle')}">${t('fork')}</button>
         </span>
       </div>
-      ${m.role === 'assistant' ? renderThink(m, i) : ''}${m.role === 'assistant' ? renderTodoCard(m) : ''}${bubble}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, planIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
+      ${m.role === 'assistant' ? renderThink(m, i) : ''}${m.role === 'assistant' ? renderTodoCard(m) : ''}${bubble}${artifactCardsHtml(m)}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, planIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
     </div>`;
   }).join('');
   // [铆钉优化] 进入/切换对话一律滚到最新；同一标签页重绘时原来贴底就继续贴底，否则保持原位。其他 AI 请勿改回恢复 scrollPos 旧位置
@@ -3033,7 +3112,8 @@ function paintLiveAssistant() {
     bubble.classList.toggle('md', !typing);
     bubble.classList.toggle('typewriter', typing);
     bubble.classList.toggle('typing', typing && isTabSending(tab));
-    if (typing) bubble.textContent = (last.text || '').slice(0, last.revealLen || 0);
+    // 状态和工具事件也复用增量文字绘制，避免每 100ms 再替换一次长回复。
+    if (typing) paintRevealBubble(last, false);
     else bubble.innerHTML = renderMarkdown(last.text);
   }
   const usageHtml = usageLineHtml(last);
@@ -3392,10 +3472,10 @@ function rosterSlot(role) {
 
 function slotIsCursor(slot) {
   if (!slot) return false;
-  if (slot.protocol === 'cursor' || slot.protocol === 'codex') return true;
+  if (['cursor', 'codex', 'claudecode'].includes(slot.protocol)) return true;
   const m = slot.apiId ? (state.models || []).find((x) => x.id === slot.apiId) : null;
   const protocol = !!m && m.type !== 'local' ? providerById(m.providerId)?.protocol : '';
-  return protocol === 'cursor' || protocol === 'codex';
+  return ['cursor', 'codex', 'claudecode'].includes(protocol);
 }
 
 function idleRoster() {
@@ -4239,10 +4319,11 @@ async function send(options = {}) {
       attachments: state.attachments.map((a) => ({ ...a }))
     };
   };
-  // 运行中纯文本走插话，在工具或模型请求边界优先处理；带附件保持排队。
+  // 运行中的正文与图片走插话，其他文件仍按原队列提交。
   if (tab.sending || tab.draining) {
-    // 这次没有任何附件，且输入框里有纯文本：直接插话给当前轮，不用等整轮跑完
-    if (text && !state.attachments.length && options.action !== 'start-work' && text !== '/spcode-start') {
+    // 图片已有本地路径和预览，可与正文一同送入当前轮；纯图也可插话。
+    const imageOnlyAttachments = state.attachments.every(function isImage(att) { return !!att.preview; });
+    if ((text || state.attachments.length) && imageOnlyAttachments && options.action !== 'start-work' && text !== '/spcode-start') {
       // 提交时固定本条载荷并消费输入框；等待回执期间的新草稿不能被异步清空或混进队列。
       const item = snapItem();
       input.value = '';
@@ -4250,17 +4331,19 @@ async function send(options = {}) {
       scheduleComposerSave();
       state.contextPaths = [];
       renderChips();
+      state.attachments = []; // 本条附件已进入item快照，后续草稿不受异步回执影响。
+      renderChips();
       // 回执可能延迟，先持久化提交列表和已消费的草稿，重开也能召回本条插话。
       persistTab(tab);
       let res = null;
       try {
-        res = await api.chatInterject({ tabId: tab.id, text });
+        res = await api.chatInterject({ tabId: tab.id, text: item.text, attachments: item.attachments.map(function attachmentPath(att) { return { path: att.path, name: att.name }; }) });
       } catch {
         res = null;
       }
       if (res && res.ok === true) {
         // 插话保存在消息模型中，实时重绘、切换标签或重开会话时仍可查看原文。
-        tab.messages.push({ role: 'system', text: `你（插话·已提交）：${text}` });
+        tab.messages.push({ role: 'system', text: `你（插话·已提交）：${item.text}`, images: item.attachments.map(function imagePreview(att) { return att.preview; }), attachments: item.attachments.map(function attachmentPath(att) { return { path: att.path, name: att.name }; }) });
         persistTab(tab);
         if (isActiveTab(tab)) {
           renderMessages();
@@ -4779,6 +4862,13 @@ function onChatEvent(ev) {
     pushThink(last, 'tool', toolText);
     last.status = ev.status === 'running' ? `${t('running')} · ${toolText}` : '';
     if (touchUi) scheduleLivePaint();
+  } else if (ev.type === 'artifact') {
+    if (!Array.isArray(last.artifacts)) last.artifacts = [];
+    const artifactIndex = last.artifacts.findIndex(function sameArtifact(item) { return item.manifest === ev.artifact.manifest; });
+    if (artifactIndex === -1) last.artifacts.push(ev.artifact);
+    else last.artifacts[artifactIndex] = ev.artifact;
+    scheduleStreamSave(tab);
+    if (touchUi) { flushLivePaint(); renderMessages(); }
   } else if (ev.type === 'files') {
     last.changes = ev.changes;
     last.snapshotId = ev.snapshotId;
@@ -4858,7 +4948,11 @@ function onChatEvent(ev) {
     last.ask = null;
     if (ev.text) last.text = ev.text;
     if (ev.zbaingMeta) last.zbaing = ev.zbaingMeta;
-    if (ev.workingMemory) tab.workingMemory = ev.workingMemory;
+    if (ev.workingMemory) {
+      tab.workingMemory = ev.workingMemory;
+      // 完成事件携带最终任务状态时，同步本条已有清单；历史快照不改写。
+      if (last.todos) last.todos = Array.isArray(ev.workingMemory.todos) ? ev.workingMemory.todos : [];
+    }
     if (ev.contextSummary != null) tab.contextSummary = ev.contextSummary;
     last.activeModel = '';
     last.activeRole = '';
@@ -5328,6 +5422,7 @@ function openSettings() {
     if (p === 'gemini') return t('protocolGemini');
     if (p === 'cursor') return t('protocolCursor');
     if (p === 'codex') return t('protocolCodex');
+    if (p === 'claudecode') return t('protocolClaudeCode');
     return t('protocolOpenai');
   };
   const providerRows = (state.providers || []).map((p) => `
@@ -5422,6 +5517,7 @@ function openSettings() {
       <option value="gemini">${t('protocolGemini')}</option>
       <option value="cursor">${t('protocolCursor')}</option>
       <option value="codex">${t('protocolCodex')}</option>
+      <option value="claudecode">${t('protocolClaudeCode')}</option>
     </select>
     <label>${t('apiUrl')}</label><input id="p-url" placeholder="https://api.openai.com/v1" />
     <label id="p-key-label">${t('apiKey')}</label><input id="p-key" type="password" placeholder="sk-..." />
@@ -5732,6 +5828,7 @@ function openSettings() {
   $('p-protocol').onchange = () => {
     if ($('p-protocol').value === 'cursor') $('p-url').value = 'cursor://sdk';
     else if ($('p-protocol').value === 'codex') $('p-url').value = 'codex://sdk';
+    else if ($('p-protocol').value === 'claudecode') $('p-url').value = 'claudecode://sdk';
     syncProviderKeyVisibility();
   };
 
@@ -6921,6 +7018,7 @@ function bind() {
     showFileCtx(e, decodeURIComponent(raw));
   };
   $('btn-history').onclick = () => openHistory();
+  $('btn-artifacts').onclick = openArtifactLibrary;
   $('btn-more').onclick = openSettings;
 
   $('tabs').onclick = async (e) => {
@@ -7601,6 +7699,8 @@ function bind() {
       });
       return;
     }
+    const artifactManifest = e.target.closest('[data-open-artifact]')?.getAttribute('data-open-artifact');
+    if (artifactManifest) { await openArtifact(decodeURIComponent(artifactManifest)); return; }
     const previewFile = e.target.closest('[data-preview-file]')?.getAttribute('data-preview-file');
     if (previewFile) {
       const rel = decodeURIComponent(previewFile);
@@ -7990,7 +8090,8 @@ api.onIndexProgress(paintIndexCard);
   state.skills = initialSkills;
   state.persona = persona || '';
   state.globalMemory = globalMemory;
-  if (s.workspace && localStorage.getItem('spcode.onboarding.completed') === 'true') {
+  const onboardingCompleted = await restoreOnboardingCompletion(s);
+  if (s.workspace && onboardingCompleted) {
     await Promise.all([refreshMeta(), showProjectSession(s.workspace)]);
     // 启动时就已经落在一个标签上，这里也上报一次，小窗一打开就能看到当前标签
     if (api.floatBind) api.floatBind(String(state.activeTab || ''), String(activeSession()?.title || ''));
@@ -7998,7 +8099,7 @@ api.onIndexProgress(paintIndexCard);
   } else {
     showWelcome();
     syncAgentBtn();
-    if (localStorage.getItem('spcode.onboarding.completed') !== 'true') startOnboarding();
+    if (!onboardingCompleted) startOnboarding();
   }
   syncRoundsInput(activeSession());
   initClipboardPanel();

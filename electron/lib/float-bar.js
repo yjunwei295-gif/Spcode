@@ -4,6 +4,7 @@ const fs = require('fs');
 const { app, BrowserWindow, ipcMain, screen } = require('electron');
 const store = require('./store');
 const diag = require('./diag');
+const desktopPet = require('./desktop-pet-host');
 
 const DEFAULT_WIDTH = 420;
 const DEFAULT_HEIGHT = 280;
@@ -177,6 +178,8 @@ function writeSlotBounds(slotNo, bounds) {
 function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
   const slotNo = clampInt(slotIndex, 1, 99, 1);
   let win = null;
+  // 桌宠与聊天共用这个窗口，控制器负责形态和脚底定位。
+  let petController = null;
   let pageReady = false;
   let userHidden = false;
   let quitting = false;
@@ -217,6 +220,7 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
 
   function saveBoundsNow() {
     if (!win || win.isDestroyed()) return;
+    if (petController) { petController.save(); return; }
     try {
       const b = win.getBounds();
       // 紧凑态落盘要还原成正常高度：只加这一处判断，写盘路径与格式不动
@@ -320,6 +324,7 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
       pageReady = true;
       flushPending();
     });
+    petController = desktopPet.attach(win, slotNo, b);
     win.loadFile(path.join(__dirname, 'float-bar.html'));
     return win;
   }
@@ -328,7 +333,7 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     userHidden = false;
     const w = ensureWindow();
     if (w.isMinimized()) w.restore();
-    w.show();
+    w.showInactive();
     w.setAlwaysOnTop(true, 'pop-up-menu');
   }
 
@@ -448,39 +453,13 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
   }
 
   /**
-   * 最小化（紧凑）态切换：on=true 收起，on=false 还原。
-   * 位置口径：钉住底边、只压顶棚 —— 底边屏幕坐标全程不动，只把顶边往下压（高度改小）；
-   * 展开时再把顶边升回去，底边仍在原位，所以展开后位置跟进紧凑前完全一致，用户不用手动校准。
-   * 进紧凑前先把正常高度记到 savedHeight、把底边记到 savedBottomY（此时 compactOn 必为 false）。
-   * 紧凑期间与正常态一样关着系统缩放（自制抓柄接管，见 setWinResizable）；进出紧凑态这两处都传 false。
-   * 收 / 放两条路径都走 animateCompact 逐帧缓动（约 180ms），画面不再瞬移，底边全程不动。
-   * 状态没真变就直接 return，重复调同一个值不动窗口。
+   * 原最小化入口切换为桌宠形态，on=true收成角色，false展开原聊天。
+   * 控制器按角色脚底计算布局；屏幕边缘自动选择面板方向，输入与确认状态不重建。
    */
   function setCompact(on) {
-    const next = on === true;
-    if (next === compactOn) return;
-    const w = ensureWindow();
-    if (!w || w.isDestroyed()) return;
-    const b = w.getBounds();
-    if (next) {
-      // 进紧凑：先存正常高度和底边，再把顶边压到「底边 - 紧凑高度」，x / width 原样不动
-      if (!compactOn) savedHeight = b.height;
-      savedBottomY = b.y + b.height;
-      compactOn = true;
-      setWinResizable(false);
-      // 逐帧缓动收到紧凑高度：每帧自己重绘，最后一帧落定后才 syncCompactState 通知页面收成两条消息
-      animateCompact(COMPACT_HEIGHT, syncCompactState);
-    } else {
-      // 退出紧凑：底边取动画起点时的实时 bounds（用户紧凑期间拖动过小窗也不会错位，与 savedBottomY 同值），
-      // 用还原高度把顶边升回去，底边原地不动；缓动同样最后一帧才同步状态
-      compactOn = false;
-      const restore = savedHeight > 0 ? savedHeight : DEFAULT_HEIGHT;
-      animateCompact(restore, syncCompactState);
-      // 退出紧凑态同样保持「系统缩放关着」：所有 setResizable 调用点统一 false，正常态也不放开
-      setWinResizable(false);
-      savedHeight = 0;
-      savedBottomY = 0;
-    }
+    ensureWindow();
+    // 原来的最小化入口现在收成宠物，展开仍使用原聊天页面与输入内容。
+    petController.setExpanded(on !== true);
   }
 
   /**
@@ -507,7 +486,7 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     const saveHeight = compactOn ? (savedHeight > 0 ? savedHeight : DEFAULT_HEIGHT) : b.height;
     // 顶边同样按「底边 - 正常高度」换算：紧凑态直接写被压下去的顶边，下次启动位置会往上漂
     const saveY = compactOn ? (spot.y + b.height) - saveHeight : spot.y;
-    writeSlotBounds(slotNo, { x: spot.x, y: saveY, width: b.width, height: saveHeight });
+    petController.save();
     // 紧凑态挪完窗，钉住的底边跟着新位置走，展开时按这里记的底边把顶边升回去
     if (compactOn) savedBottomY = spot.y + b.height;
     return { ok: true, place: target, x: spot.x, y: spot.y, width: b.width, height: b.height };
@@ -600,9 +579,20 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     const bucket = buckets.get(boundKey);
     const items = bucket ? bucket.slice() : [];
     const ev = { kind: 'history', sessionKey: boundKey, items };
+    const asks = new Map();
+    for (const item of items) {
+      if (item.kind === 'ask') asks.set(item.turnId, item);
+      if (item.kind === 'answered' || item.kind === 'turn-end') asks.delete(item.turnId);
+    }
+    pendingAsk = asks.size ? Array.from(asks.values())[asks.size - 1] : null;
     const w = ensureWindow();
     if (pageReady && w && !w.isDestroyed()) {
       w.webContents.send('floatbar:event', ev);
+      if (pendingAsk) {
+        petController.setExpanded(true);
+        w.webContents.send('floatbar:ask', pendingAsk);
+        pendingAsk = null;
+      }
       return;
     }
     pendingEvent = ev;
@@ -610,7 +600,11 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
 
   function pushAsk(payload) {
     if (!payload) return;
+    // 提问也进入对应会话历史，切回该会话时恢复等待动作与确认卡片。
+    pushEvent(keyOf(payload.sessionKey), Object.assign({}, payload, { kind: 'ask' }));
+    if (keyOf(payload.sessionKey) !== boundKey) return;
     const w = ensureWindow();
+    petController.setExpanded(true);
     if (pageReady && w && !w.isDestroyed()) {
       w.webContents.send('floatbar:ask', payload);
       return;

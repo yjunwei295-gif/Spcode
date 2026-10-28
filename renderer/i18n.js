@@ -1,6 +1,7 @@
 let locale = 'zh';
 
 const zh = {
+  artifacts: '作品', openArtifact: '打开预览', noArtifacts: '还没有代码作品。让 AI 创作网页、图片、方案或动画后，会显示在这里。',
   loadEarlierMessages: '加载更早的消息（还有 {n} 条）',
   historyDeleteWhileSending: '请先停止当前回复，再删除对话记录。筛选勾选仍可正常调整。',
   file: '文件', newWindow: '新窗口', openProject: '打开项目', recents: '最近打开',
@@ -21,8 +22,8 @@ const zh = {
   desktopAliveTitle: 'AGI（测试版）：下命令后自动查看屏幕，使用系统鼠标点击、拖动并输入文字',
   cursorDirect: 'AI 直通',
   cursorDirectTitle: '大脑、总结、代码、规划有一个用 Cursor 或 Codex 模型时自动打开，都不用时关闭，不能手动切换。工具通过 SpCode 提供；大脑走直通时不走规划 / 部下，收工照常总结和方案验收',
-  floatBarToggle: '小窗',
-  floatBarToggleTitle: '显示或隐藏悬浮小窗（等同 Ctrl+Alt+Space）',
+  floatBarToggle: '宠物',
+  floatBarToggleTitle: '显示或隐藏桌面宠物（等同 Ctrl+Alt+Space）',
   agentRoundsTitle: '规划、大脑、代码各算各的轮数，互不扣减。开始改代码后不再吃这份轮数',
   agentRoundsDefault: '默认每角色轮数',
   agentRoundsHint: '每个角色各自一份轮数，规划用掉的不会让大脑或代码变少。开始写入、删除或建目录后不再受此限。当前对话可在输入栏旁改，范围 1–64。',
@@ -53,7 +54,7 @@ const zh = {
   modelsDir: '模型目录', downloadModel: '下载模型', pickDir: '选择目录', openDir: '打开目录',
   apiModels: 'API 模型', noApiModels: '还没有 API 模型', name: '名称', apiUrl: '接口地址',
   apiKey: 'API Key', modelId: '模型 ID', modelTag: '模型', testConn: '测试连接', done: '完成', add: '添加',
-  apiProtocol: '协议', protocolOpenai: 'OpenAI 兼容', protocolAnthropic: 'Anthropic', protocolGemini: 'Google Gemini', protocolCursor: 'Cursor（Key 可空，测试连接时浏览器登录）', protocolCodex: 'Codex（复用本机登录，也可填 OpenAI API Key）',
+  apiProtocol: '协议', protocolOpenai: 'OpenAI 兼容', protocolAnthropic: 'Anthropic', protocolGemini: 'Google Gemini', protocolCursor: 'Cursor（Key 可空，测试连接时浏览器登录）', protocolCodex: 'Codex（复用本机登录，也可填 OpenAI API Key）', protocolClaudeCode: 'Claude Code（Key 可空复用本机登录；地址可填 DeepSeek 等兼容接口）',
   fetchModels: '拉取模型列表', fetchModelsHint: '点拉取后，下方会列出该厂商全部可用模型（可滚动、可筛选）；勾选即加入已保存模型', fetchingModels: '正在拉取…',
   noRemoteModels: '未拉到模型列表', pickModel: '选择模型', noModelMatch: '没有匹配的模型',
   fetchModelsEmpty: '先选厂商，再点「拉取模型列表」',
@@ -292,6 +293,7 @@ const zh = {
 };
 
 const en = {
+  artifacts: 'Artifacts', openArtifact: 'Open preview', noArtifacts: 'No code artifacts yet. Ask AI to create a page, image, diagram or animation.',
   loadEarlierMessages: 'Load earlier messages ({n} remaining)',
   historyDeleteWhileSending: 'Stop the current reply before deleting chat history. You can still change context selections.',
   file: 'File', newWindow: 'New window', openProject: 'Open project', recents: 'Recent',
@@ -312,8 +314,8 @@ const en = {
   desktopAliveTitle: 'AGI (beta): observes the screen and uses the system mouse and keyboard to carry out your commands.',
   cursorDirect: 'AI direct',
   cursorDirectTitle: 'Turns on automatically when the brain, summary, code or planning slot uses Cursor or Codex, and off otherwise; it cannot be toggled by hand. Tools are provided by SpCode. When the brain uses direct mode there is no planning / worker, but the summary and plan check still run.',
-  floatBarToggle: 'Float',
-  floatBarToggleTitle: 'Show or hide the floating bar (same as Ctrl+Alt+Space)',
+  floatBarToggle: 'Pet',
+  floatBarToggleTitle: 'Show or hide the desktop pet (same as Ctrl+Alt+Space)',
   agentRoundsTitle: 'Planning, brain, and code each have their own rounds. Editing files does not consume them.',
   agentRoundsDefault: 'Default rounds per role',
   agentRoundsHint: 'Each role gets this many rounds. Planning does not reduce brain or code. Writes, deletes, and mkdir are not limited. Range 1–64.',
@@ -344,7 +346,7 @@ const en = {
   modelsDir: 'Models folder', downloadModel: 'Download model', pickDir: 'Choose folder', openDir: 'Open folder',
   apiModels: 'API models', noApiModels: 'No API models yet', name: 'Name', apiUrl: 'Base URL',
   apiKey: 'API key', modelId: 'Model ID', modelTag: 'Model', testConn: 'Test', done: 'Done', add: 'Add',
-  apiProtocol: 'Protocol', protocolOpenai: 'OpenAI compatible', protocolAnthropic: 'Anthropic', protocolGemini: 'Google Gemini', protocolCursor: 'Cursor (key optional; Test signs in via browser)', protocolCodex: 'Codex (uses local login or an OpenAI API key)',
+  apiProtocol: 'Protocol', protocolOpenai: 'OpenAI compatible', protocolAnthropic: 'Anthropic', protocolGemini: 'Google Gemini', protocolCursor: 'Cursor (key optional; Test signs in via browser)', protocolCodex: 'Codex (uses local login or an OpenAI API key)', protocolClaudeCode: 'Claude Code (key optional, reuses local login; URL may point to a compatible endpoint such as DeepSeek)',
   fetchModels: 'Fetch models', fetchModelsHint: 'Fetch loads the full remote catalog below (scrollable, filterable). Check to save.', fetchingModels: 'Fetching…',
   noRemoteModels: 'No models returned', pickModel: 'Pick a model', noModelMatch: 'No matching models',
   fetchModelsEmpty: 'Pick a provider, then click Fetch models',

@@ -1,0 +1,196 @@
+{
+  "name": "水晶猫娘",
+  "colors": {
+    "body": "#20283f",
+    "bodyLight": "#43506c",
+    "ink": "#080c18",
+    "accent": "#63f0b3",
+    "secondary": "#67cfff",
+    "hair": "#9b87e8",
+    "hairShadow": "#554283",
+    "hairLight": "#cfbdff",
+    "metalLight": "#f6fff9",
+    "face": "#f3eefc",
+    "faceEdge": "#c5b6e0",
+    "jacket": "#e9eef7",
+    "trim": "#8b9ab6",
+    "skirt": "#252e48",
+    "boot": "#151c31",
+    "error": "#ff8aa8"
+  },
+  "canvas": {
+    "width": 800,
+    "height": 800,
+    "rasterScale": 4,
+    "partPadding": 4,
+    "foot": [
+      400,
+      700
+    ],
+    "anchor": [
+      96,
+      180
+    ],
+    "figureHeight": 158,
+    "sourceHeight": 700
+  },
+  "parts": [
+    "hair-back",
+    "face",
+    "eyes",
+    "hair-front"
+  ],
+  "pivots": {
+    "head": [
+      400,
+      400
+    ],
+    "eyes": [
+      400,
+      335
+    ]
+  },
+  "motion": {
+    "breath": 0.004,
+    "idleSwing": 3,
+    "hairSwing": 1.3,
+    "blinkCenter": 0.84,
+    "blinkHalfWidth": 0.085,
+    "bounce": 1.3,
+    "successJump": 7,
+    "dragLift": 9,
+    "landingSquash": 0.09
+  },
+  "poses": {
+    "idle": [
+      3,
+      -4,
+      2,
+      -3,
+      0
+    ],
+    "thinking": [
+      5,
+      105,
+      0,
+      85,
+      4
+    ],
+    "speaking": [
+      5,
+      -23,
+      -5,
+      -25,
+      -2
+    ],
+    "reading": [
+      -12,
+      12,
+      -64,
+      64,
+      3
+    ],
+    "searching": [
+      8,
+      -50,
+      5,
+      -20,
+      -3
+    ],
+    "writing": [
+      -16,
+      16,
+      -70,
+      70,
+      3
+    ],
+    "running": [
+      -10,
+      10,
+      -62,
+      62,
+      -2
+    ],
+    "testing": [
+      -10,
+      -32,
+      -65,
+      -45,
+      1
+    ],
+    "desktop": [
+      -12,
+      -35,
+      -65,
+      -35,
+      -3
+    ],
+    "generating": [
+      -26,
+      26,
+      -58,
+      58,
+      0
+    ],
+    "waiting": [
+      4,
+      -8,
+      -4,
+      -8,
+      5
+    ],
+    "success": [
+      130,
+      -130,
+      -12,
+      12,
+      -3
+    ],
+    "error": [
+      3,
+      3,
+      -15,
+      15,
+      6
+    ],
+    "stopped": [
+      0,
+      0,
+      0,
+      0,
+      4
+    ],
+    "dragging": [
+      -7,
+      7,
+      4,
+      -4,
+      0
+    ],
+    "landing": [
+      20,
+      -20,
+      -10,
+      10,
+      0
+    ]
+  },
+  "mouths": {
+    "idle": [0, 2, 8],
+    "thinking": [-6, 0, 7],
+    "speaking": [-4, 2, 10],
+    "reading": [2, 2, 7],
+    "searching": [-4, 0, 8],
+    "writing": [4, 2, 7],
+    "running": [-2, 0, 8],
+    "testing": [2, 2, 8],
+    "desktop": [0, 2, 7],
+    "generating": [-6, 0, 9],
+    "waiting": [4, 3, 6],
+    "success": [-4, 0, 10],
+    "error": [4, 4, 6],
+    "stopped": [4, 3, 5],
+    "dragging": [-4, 0, 8],
+    "landing": [-2, 2, 8]
+  }
+}

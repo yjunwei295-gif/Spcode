@@ -48,9 +48,10 @@ function buildCustomTools(tools, session) {
         const ctx = session.ctx;
         if (!ctx) return { content: [{ type: 'text', text: '本轮已结束，工具没有执行。' }], isError: true };
         try {
-          const text = toolResultText(await ctx.runTool(f.name, args || {}, context?.toolCallId || ''));
+          const result = await ctx.runTool(f.name, args || {}, context?.toolCallId || '');
           if (ctx.stats) ctx.stats.calls.push(f.name);
-          return { content: [{ type: 'text', text }] };
+          if (result && Array.isArray(result.spcodeContent)) return { content: result.spcodeContent };
+          return { content: [{ type: 'text', text: toolResultText(result) }] };
         } catch (e) {
           return { content: [{ type: 'text', text: `工具失败：${e?.message || e}` }], isError: true };
         }
@@ -230,7 +231,7 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, syst
             continue;
           }
           closeSession(key);
-          throw new Error(`Cursor 模型「${modelCfg.model}」没有完成：${message}`);
+          throw cursorModel.runError(modelCfg.model, message);
         }
         if (!content && res.result) content = String(res.result);
         if (required.length && !required.some((name) => stats.calls.includes(name)) && actionRetries < 2) {
@@ -254,6 +255,11 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, syst
           else if (sending) sending.then((r) => { if (r && r.supports('cancel')) r.cancel().catch(() => {}); }, () => {});
           closeSession(key);
           throw abortError();
+        }
+        const blocked = cursorModel.regionError(modelCfg.model, e.message);
+        if (blocked) {
+          closeSession(key);
+          throw blocked;
         }
         if (transient(e.message) && networkRetries < 2) {
           networkRetries += 1;

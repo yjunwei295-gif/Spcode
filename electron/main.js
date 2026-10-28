@@ -80,6 +80,12 @@ let floatBarStartHandler = null;
 /** 小窗「绑定」回调（由 registerFloatBarIpc 里的 bindFromFloatBar 赋值） */
 let floatBarBindHandler = null;
 const workspaceByWin = new WeakMap();
+// 作品主窗入口沿用当前窗口的项目绑定，作品页面自身不持有主窗接口。
+require('./lib/artifact-window').registerIpc({
+  ipcMain,
+  getWorkspace: function artifactWorkspace(event) { return workspaceByWin.get(getWin(event)) || ''; },
+  getOwner: getWin
+});
 /** win -> Map(turnId, AbortController) */
 const abortByWin = new WeakMap();
 /** win -> Map(turnId, { resolve, reject, ask }) */
@@ -346,9 +352,20 @@ function forwardTurnEventToFloatBar(ev, turnId) {
     broadcastToFloatBars({ ...base, kind: 'status', text: String(ev.text || '') });
     return;
   }
+  // 思考提示与推理增量：桌宠标签要能显示思考全文，不能只剩「正在思考」。
+  if (ev.type === 'think' || ev.type === 'reason') {
+    if (typeof ev.text === 'string' && ev.text) {
+      broadcastToFloatBars({ ...base, kind: ev.type, text: ev.text });
+    }
+    return;
+  }
   if (ev.type === 'tool') {
     const step = String(ev.text || ev.detail || ev.name || '');
-    if (step) broadcastToFloatBars({ ...base, kind: 'tool', text: step });
+    if (step) broadcastToFloatBars({
+      ...base, kind: 'tool', text: step,
+      name: ev.name, status: ev.status, callId: ev.callId,
+      activity: ev.activity, outcome: ev.outcome, activityOnly: ev.activityOnly
+    });
     return;
   }
   if (ev.type === 'ask') {
@@ -382,7 +399,7 @@ function handleFloatBarSend(payload) {
   if (!msg && attList.length === 0) return;
   if (!key) {
     // 没有会话键就不知道发给谁，宁可提示也不塞进别人的对话
-    broadcastToFloatBars({ kind: 'error', text: '小窗还没绑定对话，先在主窗里打开一个对话' });
+    broadcastToFloatBars({ kind: 'error', text: '宠物还没绑定对话，先在主窗里打开一个对话' });
     return;
   }
   const target = winFromKey(key);
@@ -390,26 +407,20 @@ function handleFloatBarSend(payload) {
     broadcastToFloatBars({ kind: 'error', sessionKey: key, text: '对应的主界面已关闭，这条没发出去' });
     return;
   }
-  // 主窗正在跑一轮时，带图的消息不插队（插话只能带文本、图会丢）：
-  // 不广播成正式消息，只提示一句，并把文本与附件原样退回，让小窗自己留着重建
-  if (attList.length > 0 && turnIsRunning(target)) {
-    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '带图片的消息等这一轮结束再发' });
-    broadcastToFloatBars({ kind: 'attachments-back', sessionKey: key, attachments: attList, text: msg });
-    return;
-  }
+  // 正文与附件共同进入运行中的会话，纯图消息也可实时插话。
   // 小窗要显示带了几张图，所以广播文案里带上张数；images 只是占位，小窗不渲染图片本身
   const userText = attList.length > 0 ? msg + `（附 ${attList.length} 张图）` : msg;
   broadcastToFloatBars({ kind: 'user', sessionKey: key, text: userText, images: attList.map((a) => a.path) });
   if (turnIsRunning(target)) {
     let pushed = false;
     try {
-      pushed = agent.pushInterjection(key, msg) === true;
+      pushed = agent.pushInterjection(key, msg, attList) === true;
     } catch (e) {
       diag.log('floatbar', '插话失败', { message: e && e.message });
     }
     if (pushed) {
       // 已投递的插话也交给绑定会话记入历史；只登记，不经过 send 再次投递或覆盖当前草稿。
-      sendTo(target, 'chat:float-user-message', { tabId: key.slice(key.indexOf(':') + 1), text: msg, interjection: true });
+      sendTo(target, 'chat:float-user-message', { tabId: key.slice(key.indexOf(':') + 1), text: msg, attachments: attList, images: attList.map(function imageUrl(att) { return require('url').pathToFileURL(att.path).href; }), interjection: true });
       broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '插话已接收，将在当前工具或模型请求结束后优先处理' });
       return;
     }
@@ -987,6 +998,20 @@ function codexInUse(s) {
   ));
 }
 
+function claudeInUse(s) {
+  const models = s.models || [];
+  const isClaudeModel = (m) => {
+    if (!m || m.type === 'local') return false;
+    const p = (s.providers || []).find((x) => x && x.id === m.providerId);
+    return !!p && apiProtocol.normalizeProtocol(p.protocol) === 'claudecode';
+  };
+  if (isClaudeModel(models.find((m) => m && m.id === s.currentModelId))) return true;
+  return assembly.slotsOf(s).some((slot) => slot && (
+    apiProtocol.normalizeProtocol(slot.protocol) === 'claudecode'
+    || isClaudeModel(models.find((m) => m && m.id === slot.apiId))
+  ));
+}
+
 // 配了 Cursor 厂商就在后台预热 SDK，省掉第一次调用的冷启动；等主窗先起来再跑
 function warmUpCursor() {
   try {
@@ -1012,6 +1037,7 @@ function syncCursorDirect() {
     if (cursorInUse(s)) warmUpCursor();
     else require('./lib/cursor-direct').closeIdle();
     if (!codexInUse(s)) require('./lib/codex-direct').closeIdle();
+    if (!claudeInUse(s)) require('./lib/claude-direct').closeIdle();
   } catch (e) {
     diag.log('cursor', 'Cursor 直通会话整理失败', { message: e && e.message });
   }
@@ -1226,6 +1252,14 @@ ipcMain.handle('app:state', async (e) => {
     localFiles: listLocalFilesEnriched(modelsDir),
     assemblyKey: assembly.assemblyKey(s)
   };
+});
+
+/** 保存引导完成状态；只更新该标记，不改已有模型、供应商或会话。 */
+ipcMain.handle('app:completeOnboarding', function completeOnboarding() {
+  const s = store.load();
+  s.onboardingCompleted = true;
+  store.save(s);
+  return true;
 });
 
 ipcMain.handle('app:theme', (_e, theme) => {
@@ -2600,10 +2634,11 @@ ipcMain.handle('chat:send', async (e, payload) => {
   const order = store.load().skillOrder || [];
   const skills = agent.listSkills(APP_ROOT, ws, order);
   const allSkills = skillsLib.listDetailed(path.join(APP_ROOT, 'skills'), ws, order);
-  const onEvent = (ev) => {
-    sendTo(win, 'chat:event', turnId ? { ...ev, turnId } : ev);
+  /** 聊天事件维持原出口，动作专用元数据只转给桌宠，避免重复插入消息。 */
+  function onEvent(ev) {
+    if (!ev.activityOnly) sendTo(win, 'chat:event', turnId ? { ...ev, turnId } : ev);
     forwardTurnEventToFloatBar(ev, turnId);
-  };
+  }
   // 用当前对话勾着的那一组，可多个一起用。没带上来时才默认 zabingsk。
   const source = Array.isArray(payload.skillIds)
     ? payload.skillIds
@@ -2656,6 +2691,9 @@ ipcMain.handle('chat:send', async (e, payload) => {
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
   });
   setTurnRunning(win, turnId, true);
+  // 轮次状态按会话发送，其他标签页运行不会影响本会话的结束展示。
+  let turnOutcome = 'success';
+  broadcastToFloatBars({ kind: 'turn-start', turnId, sessionKey: makeSessionKey(win, tabId) });
   try {
     const result = await contextPreview.run(turnId, () => agent.runTurn({
       workspace: ws,
@@ -2686,6 +2724,7 @@ ipcMain.handle('chat:send', async (e, payload) => {
     }));
     return result;
   } catch (err) {
+    turnOutcome = ctl.signal.aborted || err.name === 'AbortError' ? 'stopped' : 'error';
     diag.log('agent', '本轮失败', { message: err && err.message });
     const msg = /No sequences left/i.test(String(err && err.message))
       ? '本地模型上下文占满了。请新开一个对话再试，或把过长的历史清掉。'
@@ -2693,6 +2732,8 @@ ipcMain.handle('chat:send', async (e, payload) => {
     onEvent({ type: 'error', message: msg });
     throw err;
   } finally {
+    if (ctl.signal.aborted) turnOutcome = 'stopped';
+    broadcastToFloatBars({ kind: 'turn-end', turnId, sessionKey: makeSessionKey(win, tabId), outcome: turnOutcome });
     setTurnRunning(win, turnId, false);
     turnOwner.delete(turnId);
     pendingAskMap(win).delete(turnId);
@@ -2708,13 +2749,14 @@ ipcMain.handle('chat:send', async (e, payload) => {
 ipcMain.handle('chat:interject', async (e, payload) => {
   const win = getWin(e);
   const text = payload && typeof payload.text === 'string' ? payload.text.trim() : '';
-  // 空文本不塞也不广播，直接告诉调用方原因
-  if (!text) return { ok: false, reason: 'empty' };
+  const attachments = Array.isArray(payload && payload.attachments) ? payload.attachments : [];
+  // 纯图插话同样有效；只有正文与附件均为空才拒收。
+  if (!text && !attachments.length) return { ok: false, reason: 'empty' };
   // 会话键算法与 chat:send 完全一致，保证主窗插话和小窗插话落进同一个桶
   const key = makeSessionKey(win, resolveTurnTabId(win, payload));
   try {
     // AGI 关闭或大脑不再消费消息时明确拒收，由渲染层保留正文并排队发送。
-    if (agent.pushInterjection(key, text) !== true) {
+    if (agent.pushInterjection(key, text, attachments) !== true) {
       return { ok: false, reason: 'not-accepting' };
     }
     broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '插话已接收，将在当前工具或模型请求结束后优先处理' });

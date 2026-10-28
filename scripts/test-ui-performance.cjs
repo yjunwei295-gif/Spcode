@@ -190,6 +190,8 @@ function fullPageSetup() {
   async function emptyList() { return []; }
   async function nullValue() { return null; }
   const api = {
+    // 完整页面启动会把旧版 localStorage 标记迁移到设置；测试 API 同步提供保存入口。
+    completeOnboarding: async function completeOnboarding() { return true; },
     getState: async function getState() { return { locale: 'zh', theme: 'dark', resolvedTheme: 'dark', autoSave: true,
       workspace: 'fixture', models: [{ id: 'fixture', name: '测试模型', type: 'api', model: 'fixture' }],
       currentModelId: 'fixture', providers: [], recents: [], localFiles: [], assemblies: {}, capabilityDefaults: {} }; },

@@ -1,0 +1,17 @@
+<!doctype html><meta charset="utf-8"><title>已知节奏音频夹具</title><script>
+/** 固定验收乐谱：100 BPM，16 拍，起始偏移 120ms，第五/第十一拍增加音量。 */
+const score={bpm:100,beats:16,offset:0.12,rises:[4,10],levels:[0.12,0.24,0.42],frequency:220,gate:0.22,attack:0.004};
+/** 使用真实离线 Web Audio 渲染测试音乐；调用方控制长度、采样率与声道。 */
+window.renderAudio=async function renderAudio(info){
+ const context=new OfflineAudioContext(info.channels,Math.ceil(info.duration*info.sampleRate),info.sampleRate);
+ for(let i=0;i<score.beats;i++){
+  const start=score.offset+i*60/score.bpm;
+  let section=0;for(const rise of score.rises)if(i>=rise)section++;
+  const oscillator=context.createOscillator(),gain=context.createGain();
+  oscillator.type='sine';oscillator.frequency.value=score.frequency;
+  gain.gain.setValueAtTime(0,start);gain.gain.linearRampToValueAtTime(score.levels[section],start+score.attack);gain.gain.exponentialRampToValueAtTime(0.0001,start+score.gate);
+  oscillator.connect(gain);gain.connect(context.destination);oscillator.start(start);oscillator.stop(start+score.gate);
+ }
+ return context.startRendering();
+};
+</script>

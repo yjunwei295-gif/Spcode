@@ -1,0 +1,29 @@
+/* 同一小窗的宠物外形；聊天和附件仍使用原页面节点。 */
+:root { --pet-size:192px; --pet-height:246px; }
+body.pet-collapsed #frame { display:none; }
+body.pet-expanded #frame { position:absolute;left:var(--panel-left);top:var(--panel-top);width:var(--panel-width);height:var(--panel-height); }
+body #grip, body #btn-mini { display:none; }
+#pet-stage { position:absolute;left:var(--pet-left);top:var(--pet-top);width:var(--pet-width);height:var(--pet-height); }
+#pet-canvas { position:absolute;right:calc((var(--pet-width) - var(--pet-size))/2);bottom:0;width:var(--pet-size);height:var(--pet-size);cursor:grab;touch-action:none; }
+#pet-canvas:active { cursor:grabbing; }
+/* 工作图标始终可见；不接管鼠标，继续由角色像素负责点击和拖动。 */
+#pet-activity { position:absolute;top:4px;left:50%;transform:translateX(-50%);z-index:2;display:flex;align-items:center;gap:6px;box-sizing:border-box;width:max-content;max-width:calc(100% - 8px);min-height:30px;padding:4px 8px;border:1px solid var(--accent);border-radius:6px;background:var(--panel);color:var(--text);font:600 12px/1.35 var(--font);pointer-events:none; }
+#pet-activity-icon { width:20px;height:20px;flex:none;color:var(--accent); }
+#pet-activity-text { min-width:0;overflow-wrap:anywhere; }
+body[data-pet-state='error'] #pet-activity { border-color:var(--danger); }
+body[data-pet-state='error'] #pet-activity-icon { color:var(--danger); }
+/* 详细内容从图标下方展开，保持状态类别与推理正文分开可读。 */
+#pet-label { position:absolute;top:var(--pet-detail-top);left:8px;right:8px;z-index:1;min-height:30px;max-height:120px;padding:6px 10px;overflow:auto;white-space:pre-wrap;word-break:break-word;line-height:1.45;background:var(--panel);color:var(--text);border:1px solid var(--border-strong);border-radius:6px;font:12px var(--font);cursor:pointer; }
+#pet-label { opacity:0;pointer-events:none;transition:opacity .16s ease; }
+#pet-stage:hover #pet-label,body[data-pet-state='waiting'] #pet-label,body[data-pet-state='error'] #pet-label,body[data-pet-state='thinking'] #pet-label,body[data-pet-state='speaking'] #pet-label,body[data-pet-state='reading'] #pet-label,body[data-pet-state='searching'] #pet-label,body[data-pet-state='writing'] #pet-label,body[data-pet-state='running'] #pet-label,body[data-pet-state='testing'] #pet-label,body[data-pet-state='desktop'] #pet-label,body[data-pet-state='generating'] #pet-label { opacity:1;pointer-events:auto; }
+#pet-menu { position:absolute;left:calc(var(--panel-left) + 8px);top:calc(var(--panel-top) + 8px);width:calc(var(--panel-width) - 16px);z-index:20;padding:14px;background:var(--panel);color:var(--text);border:1px solid var(--border-strong);border-radius:6px;max-height:calc(var(--panel-height) - 16px);overflow:auto; }
+#pet-menu[hidden] { display:none; }
+#pet-menu header { display:flex;justify-content:space-between;align-items:center;margin-bottom:12px; }
+#pet-menu label { display:flex;align-items:center;gap:10px;margin:12px 0; }
+#pet-menu select { flex:1;min-width:0;padding:6px;border:1px solid var(--border-strong);border-radius:4px;color:var(--text);background:var(--field);font:12px var(--font); }
+#pet-menu button { padding:6px 10px;color:var(--text);background:var(--field);border:1px solid var(--border-strong);border-radius:4px;cursor:pointer;font:12px var(--font); }
+#pet-menu button:hover { background:var(--hover); }
+#pet-menu footer { display:flex;gap:8px;flex-wrap:wrap; }
+#pet-error { color:var(--danger);white-space:pre-wrap;line-height:1.6; }
+#pet-hint { color:var(--muted);font-size:12px;line-height:1.6; }
+@media (prefers-reduced-motion:reduce) { #pet-stage { scroll-behavior:auto; } }
