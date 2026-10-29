@@ -5,11 +5,18 @@
   var chat=window.floatBar;
   var canvas=document.getElementById('pet-canvas');
   var ctx=canvas.getContext('2d',{willReadFrequently:true});
+  // 配饰独占透明画布，绝不把眼镜写进角色图集或主角色像素。
+  var glasses=document.getElementById('pet-glasses');
+  var glassesContext=glasses.getContext('2d');
   var label=document.getElementById('pet-label');
   var activityBadge=document.getElementById('pet-activity');
   var activityPath=document.getElementById('pet-activity-path');
   var activityText=document.getElementById('pet-activity-text');
   var lastActivity='';
+  var workIndicator=document.getElementById('pet-work-indicator');
+  var workPath=document.getElementById('pet-work-path');
+  // 仅正在产出或执行操作时点亮；等待、终止与拖动预览不伪装为工作。
+  var workingStates=['thinking','speaking','reading','searching','writing','running','testing','desktop','generating'];
   // 每种工作有独立矢量图标；文字复用状态配置，换肤不改变工作含义。
   var activityIcons={
     idle:'M5 8h12v8a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4ZM17 9h2a3 3 0 0 1 0 6h-2M8 3v2M12 3v2',
@@ -39,6 +46,11 @@
   var presentedState='idle';
   var previousFrame=document.createElement('canvas');
   var previousContext=previousFrame.getContext('2d');
+  // 配饰保存上一张实际显示帧，并在离屏画布绘制新帧，与角色共用同一个交叉淡化进度。
+  var previousGlasses=document.createElement('canvas');
+  var previousGlassesContext=previousGlasses.getContext('2d');
+  var glassesFrame=document.createElement('canvas');
+  var glassesFrameContext=glassesFrame.getContext('2d');
   /** 显示实际接口或资源错误，不用其他皮肤掩盖加载失败。 */
   function showError(error) { errorEl.textContent=String(error.message||error);menu.hidden=false; }
   /** 界面配置跟随主进程，大小变化不会重建消息区或输入框。 */
@@ -47,9 +59,16 @@
     current.expanded=data.expanded;current.settings=data.settings;
     document.body.classList.toggle('pet-expanded',data.expanded);
     document.body.classList.toggle('pet-collapsed',!data.expanded);
+    document.body.classList.toggle('pet-reduced-motion',data.settings.reducedMotion);
     document.documentElement.style.setProperty('--pet-size',current.config.layout.petSize*data.settings.scale+'px');
-    document.documentElement.style.setProperty('--pet-height',current.config.layout.petHeight*data.settings.scale+'px');
+    document.documentElement.style.setProperty('--pet-dialogue-lines',String(current.config.layout.dialogueLines));
+    // 脚下余额独占底部留白，角色与眼镜同步上移；尺寸及间隔统一由布局配置提供。
+    document.documentElement.style.setProperty('--pet-balance-height',current.config.layout.balanceHeight+'px');
+    document.documentElement.style.setProperty('--pet-info-gap',current.config.layout.infoGap+'px');
+    document.documentElement.style.setProperty('--pet-info-inset',current.config.layout.infoInset+'px');
+    document.documentElement.style.setProperty('--pet-footer-height',(current.config.layout.balanceHeight+current.config.layout.infoGap+current.config.layout.infoInset)+'px');
     var p=data.placement;
+    document.documentElement.style.setProperty('--pet-height',p.petHeight+'px');
     document.documentElement.style.setProperty('--pet-width',p.petWidth+'px');
     document.documentElement.style.setProperty('--pet-left',p.petLeft+'px');
     document.documentElement.style.setProperty('--pet-top',p.petTop+'px');
@@ -58,7 +77,7 @@
     document.documentElement.style.setProperty('--panel-width',p.panelWidth+'px');
     document.documentElement.style.setProperty('--panel-height',p.panelHeight+'px');
     lastHit=null;
-    lastActivity=''; // 缩放后重新测量状态条，保证详细气泡在它下方。
+    lastActivity=''; // 缩放或减少动态设置改变后同步信息槽与工作标记。
   }
   /** 先解码新图集再原子切换，异步加载顺序不会让旧皮肤覆盖新选择。 */
   async function loadSkin() {
@@ -71,6 +90,8 @@
     skin=selected;image=next;animationStart=performance.now();lastState='';
     previewState='';paintMenu();
     canvas.width=skin.cellSize;canvas.height=skin.cellSize;
+    glasses.width=skin.cellSize;glasses.height=skin.cellSize;
+    glassesFrame.width=skin.cellSize;glassesFrame.height=skin.cellSize;
   }
   /** 菜单只更新皮肤选项，不触碰真实任务状态。 */
   function paintMenu() {
@@ -83,6 +104,16 @@
     document.getElementById('pet-scale').value=String(current.settings.scale);
     document.getElementById('pet-speed').value=String(current.settings.speed);
     document.getElementById('pet-reduced').checked=current.settings.reducedMotion;
+    document.getElementById('pet-glasses-enabled').checked=current.settings.glasses;
+    // 控件与主进程共用图集像素范围，数值不随桌宠显示缩放变化。
+    var horizontal=document.getElementById('pet-glasses-offset-x');
+    horizontal.min=String(current.config.glasses.position.min);horizontal.max=String(current.config.glasses.position.max);horizontal.step=String(current.config.glasses.position.step);
+    horizontal.value=String(current.settings.glassesOffsetX);
+    document.getElementById('pet-glasses-offset-x-value').textContent=String(current.settings.glassesOffsetX)+' px（负数左移）';
+    var offset=document.getElementById('pet-glasses-offset-y');
+    offset.min=String(current.config.glasses.position.min);offset.max=String(current.config.glasses.position.max);offset.step=String(current.config.glasses.position.step);
+    offset.value=String(current.settings.glassesOffsetY);
+    document.getElementById('pet-glasses-offset-value').textContent=String(current.settings.glassesOffsetY)+' px（负数上移）';
     document.getElementById('pet-scale').min=String(current.config.layout.minScale);
     document.getElementById('pet-scale').max=String(current.config.layout.maxScale);
     document.getElementById('pet-scale').step=String(current.config.layout.scaleStep);
@@ -110,20 +141,28 @@
   /** 等待确认使用同一状态入口，原页面继续负责问句与回答选项。 */
   function ask(ev) { event(Object.assign({},ev,{kind:'ask'})); }
   /**
-   * 显示真实工作类别的常驻图标和短标签。
+   * 将真实工作类别同步到右上角 HUD 与辅助阅读短句。
    * state 来自已过滤会话事件的状态机；预览明确标注，拖动不覆盖正在执行的工作。
-   * 只在状态或布局变化时更新 DOM，并按实际高度放置详细气泡。
+   * 只在状态或布局变化时更新 DOM；正文与余额由纵向信息区排布，同时显示。
    */
   function paintActivity(state) {
     var key=(previewState?'preview:':'actual:')+state;
     if(key===lastActivity)return;
     lastActivity=key;
-    var text=(previewState?'预览 · ':'')+current.config.labels[state];
-    activityPath.setAttribute('d',activityIcons[state]);
+    // 实际空闲不输出状态短句或图标；手动动作预览仍明确标注。
+    var idle=state==='idle'&&!previewState;
+    var text=idle?'':(previewState?'预览 · ':'')+current.config.labels[state];
+    activityBadge.hidden=idle;
+    activityPath.setAttribute('d',idle?'':activityIcons[state]);
     activityText.textContent=text;
     activityBadge.dataset.state=state;
     activityBadge.title=text;
-    document.documentElement.style.setProperty('--pet-detail-top',(activityBadge.offsetHeight+10)+'px');
+    // 与短标签共用状态来源和图形，不受角色拖起/落地姿态覆盖；预览沿用明确的预览标注。
+    workIndicator.hidden=workingStates.indexOf(state)<0;
+    workIndicator.dataset.state=state;
+    workIndicator.title=text;
+    workPath.setAttribute('d',activityIcons[state]);
+    // 正文与脚下余额独立布局，实际空闲隐藏正文时余额仍保持在角色下方。
   }
   /** 帧序来自皮肤声明，减少动态时固定展示有辨识度的首帧。 */
   function tick(now) {
@@ -136,11 +175,13 @@
     else if(now<landingUntil)state='landing';
     presentedState=state;
     document.body.dataset.petState=state;
-    // 提起和落地只展示对应动画，悬停也不显示动作提示气泡。
-    label.hidden=state==='dragging'||state==='landing';
+    // 实际空闲只显示余额；提起和落地也不显示动作提示气泡。
+    label.hidden=(state==='idle'&&!previewState)||state==='dragging'||state==='landing';
     if(state!==lastState){
       previousFrame.width=canvas.width;previousFrame.height=canvas.height;
       previousContext.drawImage(canvas,0,0);
+      previousGlasses.width=glasses.width;previousGlasses.height=glasses.height;
+      previousGlassesContext.drawImage(glasses,0,0);
       lastState=state;animationStart=now;
     }
     var clip=skin.animations[state];
@@ -157,10 +198,21 @@
     ctx.globalAlpha=blend;
     ctx.drawImage(image,frame*skin.cellSize,clip.row*skin.cellSize,skin.cellSize,skin.cellSize,0,0,canvas.width,canvas.height);
     ctx.globalAlpha=1;
-    // 有细节（含思考全文）就整段显示；没有时才退回状态短标签。
+    // 配饰复用角色的动作、帧号与缓出权重，连续切换时保留上一张实际混合画面。
+    glassesContext.clearRect(0,0,glasses.width,glasses.height);
+    if(current.settings.glasses){
+      var glassesConfig=Object.assign({},current.config.glasses,{horizontalOffset:current.settings.glassesOffsetX,verticalOffset:current.settings.glassesOffsetY});
+      window.DesktopPetGlasses.paint(glassesFrameContext,glassesConfig,skin,state,frame);
+      glassesContext.globalAlpha=1-blend;glassesContext.drawImage(previousGlasses,0,0);
+      glassesContext.globalAlpha=blend;glassesContext.drawImage(glassesFrame,0,0);
+      glassesContext.globalAlpha=1;
+      glasses.dataset.state=glassesFrame.dataset.state;glasses.dataset.frame=String(frame);
+    }else glasses.dataset.state='';
+    // 气泡仅使用已筛选的思考与对话，全文可在展开面板阅读；工具只改变动作。
     var shown=previewState?('预览 · '+current.config.labels[state]):(model.detail&&String(model.detail).trim()?String(model.detail):current.config.labels[state]);
     label.textContent=label.hidden?'':shown;
-    label.title=label.hidden?'':shown;
+    // 外侧正文按配置保留三行阅读并省略溢出；点击查看完整对话，脚下余额同时保留。
+    label.title=label.hidden?'':'点击展开完整对话';
     canvas.setAttribute('aria-label',shown||current.config.labels[state]);
   }
   /** 当前帧 Alpha 决定角色可点击区，透明边角与手脚间的空隙可穿透。 */
@@ -168,7 +220,7 @@
     if(!image)return false;
     if(!menu.hidden&&menu.contains(e.target))return true;
     if(current.expanded&&document.getElementById('frame').contains(e.target))return true;
-    if(e.target===label)return true;
+    if(e.target===label||document.getElementById('pet-balance').contains(e.target))return true;
     var b=canvas.getBoundingClientRect();
     if(e.clientX<b.left||e.clientX>=b.right||e.clientY<b.top||e.clientY>=b.bottom)return false;
     var x=Math.floor((e.clientX-b.left)*canvas.width/b.width),y=Math.floor((e.clientY-b.top)*canvas.height/b.height);
@@ -238,6 +290,15 @@
   document.getElementById('pet-scale').addEventListener('input',function(e){settings({scale:Number(e.target.value)}).catch(showError);});
   document.getElementById('pet-speed').addEventListener('change',function(e){settings({speed:Number(e.target.value)}).catch(showError);});
   document.getElementById('pet-reduced').addEventListener('change',function(e){settings({reducedMotion:e.target.checked}).catch(showError);});
+  /** 将用户勾选的眼镜开关交给现有设置接口，保存成功后同步菜单与叠加层。 */
+  function changeGlasses(e) { settings({glasses:e.target.checked}).catch(showError); }
+  document.getElementById('pet-glasses-enabled').addEventListener('change',changeGlasses);
+  /** 拖动左右滑条实时保存水平图集像素偏移，保留上下位置与角色状态。 */
+  function changeGlassesHorizontalPosition(e) { settings({glassesOffsetX:Number(e.target.value)}).catch(showError); }
+  document.getElementById('pet-glasses-offset-x').addEventListener('input',changeGlassesHorizontalPosition);
+  /** 拖动上下滑条实时保存图集像素偏移；不修改眼部锚点、角色图集或工作状态。 */
+  function changeGlassesPosition(e) { settings({glassesOffsetY:Number(e.target.value)}).catch(showError); }
+  document.getElementById('pet-glasses-offset-y').addEventListener('input',changeGlassesPosition);
   preview.addEventListener('change',function(){previewState=preview.value;animationStart=performance.now();});
   document.getElementById('pet-import').addEventListener('click',async function(){try{var result=await bridge.call('import');if(!result.cancelled){current=result;paintMenu();}}catch(error){showError(error);}});
   document.getElementById('pet-hide').addEventListener('click',function(){chat.hide();});

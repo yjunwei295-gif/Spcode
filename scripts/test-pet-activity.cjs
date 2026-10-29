@@ -25,10 +25,22 @@ function inspect(){
   const stage=document.getElementById('pet-stage').getBoundingClientRect();
   const b=badge.getBoundingClientRect(),t=text.getBoundingClientRect(),l=label.getBoundingClientRect();
   const style=getComputedStyle(badge);
+  const work=document.getElementById('pet-work-indicator'),w=work.getBoundingClientRect();
+  const orbit=work.querySelector('.pet-work-orbit'),workStyle=getComputedStyle(work);
+  const pet=document.getElementById('pet-canvas').getBoundingClientRect();
+  const balance=document.getElementById('pet-balance').getBoundingClientRect();
   return {state:badge.dataset.state,text:text.textContent,path:icon.getAttribute('d'),iconLength:icon.getTotalLength(),
     detail:label.textContent,detailHidden:label.hidden,opacity:style.opacity,display:style.display,
     pointerEvents:style.pointerEvents,badgeBottom:b.bottom,labelTop:l.top,badgeLeft:b.left,badgeRight:b.right,
     stageLeft:stage.left,stageRight:stage.right,badgeHeight:b.height,textHeight:t.height,textScroll:text.scrollWidth,textWidth:t.width,
+    workHidden:work.hidden,workState:work.dataset.state,workPath:document.getElementById('pet-work-path').getAttribute('d'),
+    workLeft:w.left,workRight:w.right,workTop:w.top,workBottom:w.bottom,workWidth:w.width,petTop:pet.top,petBottom:pet.bottom,
+    balanceTop:balance.top,balanceBottom:balance.bottom,stageTop:stage.top,stageBottom:stage.bottom,
+    labelClamp:getComputedStyle(label).webkitLineClamp,labelLineHeight:parseFloat(getComputedStyle(label).lineHeight),
+    workPointer:workStyle.pointerEvents,workRendering:workStyle.imageRendering,
+    labelOpacity:getComputedStyle(label).opacity,labelHeight:l.height,labelBottom:l.bottom,balanceOpacity:getComputedStyle(document.getElementById('pet-balance')).opacity,
+    statusClip:style.clipPath,
+    orbitTransform:getComputedStyle(orbit).transform,orbitAnimation:getComputedStyle(orbit).animationName,
     expanded:desktopPetInspect().expanded,skin:desktopPetInspect().skin};
 }
 /** 将核对函数送入实际渲染进程执行。 */
@@ -66,11 +78,17 @@ async function run(){
   wc.on('console-message',function(ev,level,message){if(level>=3)errors.push(message);});
   for(let i=0;i<80;i++){
     await wait(100);
-    if(await wc.executeJavaScript('!!(window.desktopPetInspect&&desktopPetInspect().skin&&document.getElementById("pet-activity-text").textContent)'))break;
+    if(await wc.executeJavaScript('!!(window.desktopPetInspect&&desktopPetInspect().skin)'))break;
   }
   let current=await snapshot();
-  ok('空闲时图标与文字常驻，无需悬停',current.state==='idle'&&current.text===config.labels.idle&&current.opacity==='1'&&current.display==='flex');
+  ok('实际空闲清空状态短句与图标',current.state==='idle'&&current.text===''&&current.path===''&&current.display==='none');
+  ok('精简常态只显示一行余额',current.detailHidden&&current.detail===''&&current.balanceOpacity==='1');
+  const initialBounds=win.getBounds();
+  ok('默认窗口按配置容纳三行正文与余额且角色尺寸保持不变',initialBounds.width===Math.max(config.layout.hudMinWidth,Math.round(config.layout.petWidth*config.defaultScale))&&initialBounds.height===Math.max(Math.round(config.layout.petHeight*config.defaultScale),Math.ceil(config.layout.petSize*config.defaultScale+config.layout.hudHeight)));
   ok('图标不抢角色鼠标命中和拖动',current.pointerEvents==='none');
+  ok('空闲不显示右上角工作 HUD',current.workHidden);
+  // HUD 专项不执行依赖外部桌面置顶窗口的原生命中测试，完整测试仍保留该项。
+  if(!process.argv.includes('--hud-only')){
   // 从当前皮肤的实际不透明像素取鼠标目标，避免旧测试固定坐标落在角色透明区。
   const target=await wc.executeJavaScript('('+function opaquePoint(){
     const c=document.getElementById('pet-canvas'),r=c.getBoundingClientRect();
@@ -92,21 +110,24 @@ async function run(){
   await background.loadURL('data:text/html,<body style="background:white">');
   background.setAlwaysOnTop(true,'pop-up-menu');background.showInactive();
   win.setAlwaysOnTop(true,'screen-saver');win.showInactive();win.moveTop();
-  // 当前桌面存在并行鼠标操作；用渲染进程输入核对命中逻辑，不与用户争用系统光标。
-  wc.sendInputEvent({type:'mouseMove',x:-1,y:-1});
-  await wc.executeJavaScript('desktopPet.call("hit",false)');
+  // 测试窗口不抢焦点；直接派发指针事件经过生产命中逻辑，避免 sendInputEvent 依赖前台焦点。
+  await wc.executeJavaScript('document.dispatchEvent(new PointerEvent("pointermove",{bubbles:true,clientX:-1,clientY:-1}))');
+  await wait(80);
   ok('透明边角仍穿透到真实底层窗口',(await nativeAt(b.x+2,b.y+2))===background.getNativeWindowHandle().readBigUInt64LE().toString());
-  wc.sendInputEvent({type:'mouseMove',x:Math.round(target.x),y:Math.round(target.y)});
+  await wc.executeJavaScript('document.getElementById("pet-canvas").dispatchEvent(new PointerEvent("pointermove",{bubbles:true,clientX:'+Math.round(target.x)+',clientY:'+Math.round(target.y)+'}))');
   await wait(80);
   const actual=await nativeAt(Math.round(b.x+target.x),Math.round(b.y+target.y));
   console.log('NATIVE '+JSON.stringify({actual,expected:win.getNativeWindowHandle().readBigUInt64LE().toString(),target,b}));
   ok('页面输入命中实际角色像素后恢复原生窗口命中',actual===win.getNativeWindowHandle().readBigUInt64LE().toString());
   background.destroy();
+  }else console.log('SKIP 原生桌面命中；本次仅运行 HUD 专项');
   const paths=new Set();
   for(const state of config.states){
     await preview(state);
     current=await snapshot();
     ok('预览图标 '+state,current.state===state&&current.text==='预览 · '+config.labels[state]&&current.iconLength>5);
+    const active=['thinking','speaking','reading','searching','writing','running','testing','desktop','generating'].includes(state);
+    ok('工作 HUD 显隐与状态一致 '+state,current.workHidden===!active&&current.workState===state&&current.workPath===current.path);
     paths.add(current.path);
   }
   ok('十六种状态各有独立图标',paths.size===config.states.length);
@@ -126,7 +147,8 @@ async function run(){
     event({kind:'tool',callId:'call-'+i,name:one.name,activity:one.activity,status:'running',text:one.name});
     await wait(550);
     current=await snapshot();
-    ok('真实工具驱动 '+one.state,current.state===one.state&&current.text===config.labels[one.state]&&current.detail===one.name);
+    ok('真实工具驱动动作且不显示工具文本 '+one.state,current.state===one.state&&current.text===config.labels[one.state]&&current.detail===config.labels[one.state]);
+    ok('真实工具点亮右上角工作 HUD '+one.state,!current.workHidden&&current.workState===one.state);
     event({kind:'tool',callId:'call-'+i,name:one.name,status:'done'});
   }
   await wait(550);
@@ -134,25 +156,60 @@ async function run(){
   await wait(550);
   current=await snapshot();
   ok('长推理保留全文且不覆盖思考短标签',current.text===config.labels.thinking&&current.detail.length>600);
-  ok('详细气泡位于状态图标下方',current.labelTop>=current.badgeBottom+5);
+  ok('工作时正文与下方余额同时可见，不挤占角色空间',current.labelOpacity==='1'&&current.balanceOpacity==='1'&&current.labelBottom<=current.petTop&&current.balanceTop-current.petBottom>=config.layout.infoGap-0.1&&current.balanceBottom<=current.stageBottom);
   const frames=[];
   for(const value of [config.layout.minScale,config.defaultScale,1,config.layout.maxScale]){
     await scale(value);
     current=await snapshot();
-    ok('缩放 '+value+' 图标与文字不越界且气泡不重叠',
-      current.badgeLeft>=current.stageLeft&&current.badgeRight<=current.stageRight&&current.labelTop>=current.badgeBottom+5&&current.textScroll<=Math.ceil(current.textWidth));
+    ok('缩放 '+value+' 精简信息槽与角色不重叠',
+      current.labelBottom<=current.petTop&&current.balanceTop-current.petBottom>=config.layout.infoGap-0.1&&current.balanceBottom<=current.stageBottom&&current.labelClamp===String(config.layout.dialogueLines)&&Math.abs(current.labelHeight-current.labelLineHeight*config.layout.dialogueLines-10)<1);
+    ok('缩放 '+value+' 工作 HUD 位于角色右上且不遮挡信息区',
+      !current.workHidden&&current.workLeft>(current.stageLeft+current.stageRight)/2&&current.workRight<=current.stageRight&&
+      current.workTop>=current.petTop&&current.workBottom<=current.petBottom&&current.workWidth>=38);
     frames.push({scale:value,...current});
   }
   await scale(config.defaultScale);
   event({kind:'tool',callId:'capture',name:'edit_file',status:'running',text:'electron/lib/desktop-pet.js'});
   await wait(550);
+  current=await snapshot();
+  ok('工作 HUD 平滑矢量缩放且鼠标穿透',current.workRendering==='auto'&&current.workPointer==='none');
+  // 强制浏览器真实 :hover 状态，核对悬停及移开均同时显示正文和余额，不抢用户鼠标焦点。
+  wc.debugger.attach('1.3');
+  await wc.debugger.sendCommand('DOM.enable');
+  await wc.debugger.sendCommand('CSS.enable');
+  const dom=await wc.debugger.sendCommand('DOM.getDocument');
+  const stageNode=await wc.debugger.sendCommand('DOM.querySelector',{nodeId:dom.root.nodeId,selector:'#pet-stage'});
+  await wc.debugger.sendCommand('CSS.forcePseudoState',{nodeId:stageNode.nodeId,forcedPseudoClasses:['hover']});
+  await wait(200);
+  current=await snapshot();
+  ok('悬停时正文与下方余额同时显示',current.labelOpacity==='1'&&current.balanceOpacity==='1'&&current.labelBottom<=current.petTop&&current.petBottom<current.balanceTop);
+  fs.writeFileSync(path.join(output,'hover.png'),(await wc.capturePage()).toPNG());
+  await wc.debugger.sendCommand('CSS.forcePseudoState',{nodeId:stageNode.nodeId,forcedPseudoClasses:[]});
+  await wait(200);
+  current=await snapshot();
+  ok('移开后正文与下方余额仍同时显示',current.labelOpacity==='1'&&current.balanceOpacity==='1'&&current.labelBottom<=current.petTop&&current.petBottom<current.balanceTop);
+  wc.debugger.detach();
+  const firstTransform=current.orbitTransform;
+  await wait(180);
+  current=await snapshot();
+  ok('工作光环确实随时间旋转',current.orbitAnimation==='pet-work-orbit'&&current.orbitTransform!==firstTransform);
   fs.writeFileSync(path.join(output,'writing.png'),(await wc.capturePage()).toPNG());
+  // 截取实际渲染的 HUD，不以 CSS 声明代替像素输出。
+  fs.writeFileSync(path.join(output,'work-icon.png'),(await wc.capturePage({x:Math.floor(current.workLeft),y:Math.floor(current.workTop),width:Math.ceil(current.workWidth),height:Math.ceil(current.workWidth)})).toPNG());
+  await wc.executeJavaScript('document.getElementById("pet-reduced").checked=true;document.getElementById("pet-reduced").dispatchEvent(new Event("change"))');
+  await wait(180);
+  current=await snapshot();
+  ok('减少动态效果停转但保留工作标识',!current.workHidden&&current.orbitAnimation==='none');
+  await wc.executeJavaScript('document.getElementById("pet-reduced").checked=false;document.getElementById("pet-reduced").dispatchEvent(new Event("change"))');
+  await wait(180);
+  ok('恢复动态效果重新启动光环',(await snapshot()).orbitAnimation==='pet-work-orbit');
   bar.pushEvent('another:tab',{kind:'tool',turnId:'other',callId:'other',name:'read_file',status:'running'});
   await wait(100);
   ok('其他会话不改变工作图标',(await snapshot()).state==='writing');
   event({kind:'ask',question:'请确认测试操作'});
-  await wait(120);
-  ok('等待回答优先显示独立图标',(await snapshot()).state==='waiting');
+  await wait(220);
+  current=await snapshot();
+  ok('等待回答同时显示正文与下方余额并关闭工作 HUD',current.state==='waiting'&&current.workHidden&&current.labelOpacity==='1'&&current.balanceOpacity==='1'&&current.labelBottom<=current.petTop&&current.petBottom<current.balanceTop);
   event({kind:'answered'});
   await wait(120);
   ok('回答后恢复仍在执行的工作',(await snapshot()).state==='writing');
@@ -163,13 +220,15 @@ async function run(){
   ok('回复时显示对话图标',(await snapshot()).state==='speaking');
   event({kind:'turn-end',outcome:'success'});
   await wait(120);
-  ok('完成时显示完成图标',(await snapshot()).state==='success');
+  current=await snapshot();
+  ok('完成时显示完成图标并关闭工作 HUD',current.state==='success'&&current.workHidden);
   event({kind:'turn-start'});
   event({kind:'turn-end',outcome:'error'});
   await wait(120);
-  ok('失败时显示问题图标',(await snapshot()).state==='error');
+  current=await snapshot();
+  ok('失败时显示问题图标并关闭工作 HUD',current.state==='error'&&current.workHidden);
   ok('图标加载与绘制没有渲染错误',errors.length===0);
-  fs.writeFileSync(path.join(output,'results.json'),JSON.stringify({passed:results,frames,errors},null,2),'utf8');
+  fs.writeFileSync(path.join(output,'results.json'),JSON.stringify({passed:results,skipped:process.argv.includes('--hud-only')?['原生桌面命中：外部置顶窗口与系统光标独立影响，未计为通过']:[],initialBounds,frames,errors},null,2),'utf8');
   console.log('RESULT '+results.length+' 项通过；截图 '+path.join(output,'writing.png'));
   bar.destroy();app.quit();
 }

@@ -737,13 +737,31 @@
 </head>
 <body class="pet-collapsed">
 <div id="pet-stage">
-  <!-- 常驻工作标识独立于详细气泡，长推理或工具原名不会盖掉当前工作类别。 -->
+  <!-- 辅助阅读保留真实工作短句，视觉状态由右上角工作 HUD 呈现。 -->
   <div id="pet-activity" role="status" aria-live="polite" aria-atomic="true">
     <svg id="pet-activity-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path id="pet-activity-path"></path></svg>
     <span id="pet-activity-text"></span>
   </div>
-  <button id="pet-label" type="button" title="点击展开对话，右键换肤">在这里陪你</button>
+  <!-- 正文固定在角色上方；余额独立放在角色脚下，实际空闲只隐藏正文。 -->
+  <div id="pet-info">
+    <button id="pet-label" type="button" title="点击展开对话，右键换肤">在这里陪你</button>
+  </div>
+  <button id="pet-balance" type="button" title="展开账户额度与对话"><span>大脑额度</span><strong id="pet-balance-value">等待同步</strong><span aria-hidden="true">↗</span></button>
   <canvas id="pet-canvas" width="192" height="192" role="img" aria-label="桌宠"></canvas>
+  <!-- 独立配饰画布，只在显示时叠加；原角色与原图资源不被改写。 -->
+  <canvas id="pet-glasses" width="192" height="192" aria-hidden="true"></canvas>
+  <!-- 工作 HUD 锚定角色右上方：平滑 SVG 与角色像素层分离，装饰不参与鼠标命中。 -->
+  <div id="pet-work-indicator" hidden aria-hidden="true">
+    <svg viewBox="0 0 64 64" fill="none" aria-hidden="true">
+      <path class="pet-work-frame" d="M4 20V10l6-6h10M44 4h10l6 6v10M60 44v10l-6 6H44M20 60H10l-6-6V44"/>
+      <circle class="pet-work-track" cx="32" cy="32" r="25"/>
+      <g class="pet-work-orbit"><path d="M32 7a25 25 0 0 1 23.8 17.3M32 57A25 25 0 0 1 8.2 39.7"/><circle cx="55.8" cy="24.3" r="2"/></g>
+      <g class="pet-work-counter"><path d="M13 32a19 19 0 0 1 19-19M51 32a19 19 0 0 1-19 19"/></g>
+      <path class="pet-work-core" d="m32 17 13 7.5v15L32 47l-13-7.5v-15Z"/>
+      <svg x="22" y="22" width="20" height="20" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path id="pet-work-path"/></svg>
+      <path class="pet-work-signal" d="M25 54h3m3 0h3m3 0h3"/>
+    </svg>
+  </div>
 </div>
 <section id="pet-menu" hidden>
   <header><strong>桌宠 · 外观与动作</strong><button id="pet-menu-close" type="button">返回对话</button></header>
@@ -751,6 +769,11 @@
   <label>动作预览<select id="pet-preview"></select></label>
   <label>显示大小<input id="pet-scale" type="range" min="0.65" max="1.6" step="0.05" /></label>
   <label>动作速度<input id="pet-speed" type="range" min="0.5" max="2" step="0.1" /></label>
+  <!-- 眼镜开关只控制独立配饰层，偏好由现有桌宠设置保存。 -->
+  <label><input id="pet-glasses-enabled" type="checkbox" />显示赛博眼镜</label>
+  <!-- 两轴共用配置中的图集像素范围，各自实时预览并保存；负数左移或上移。 -->
+  <label>眼镜左右<input id="pet-glasses-offset-x" type="range" aria-label="眼镜左右位置，负数左移，正数右移" /><output id="pet-glasses-offset-x-value" for="pet-glasses-offset-x"></output></label>
+  <label>眼镜上下<input id="pet-glasses-offset-y" type="range" aria-label="眼镜上下位置，负数上移，正数下移" /><output id="pet-glasses-offset-value" for="pet-glasses-offset-y"></output></label>
   <label><input id="pet-reduced" type="checkbox" />减少动态效果</label>
   <p id="pet-hint">拖动角色移动；单击展开对话；右键更换皮肤。预览动作不会改变 AI 的实际工作状态。</p>
   <p id="pet-error" role="alert"></p>
@@ -770,6 +793,11 @@
       <div id="sessList" class="hidden"></div>
     </div>
     <div id="msgs"></div>
+    <!-- 当前大脑的账户额度放在对话下方，先阅读对话，再查看余额。 -->
+    <details id="pet-wallet">
+      <summary><span>大脑额度 <small>ACCOUNT</small></span><strong id="pet-wallet-total">等待同步</strong></summary>
+      <div id="pet-wallet-accounts"></div>
+    </details>
     <!-- 开始区：从顶栏整段挪到消息区下方、输入区上方；里面的金色按钮照旧由 paintStartButtons 动态生成 -->
     <span id="startArea" class="hidden"></span>
     <div id="ask" class="hidden">
@@ -920,7 +948,20 @@
         var one = items[i];
         // AI 正文走 Markdown 渲染（内部先整段转义再套格式，见 float-bar-md.js）；
         // 用户自己发的、工具与系统提示一律纯文本 textContent，绝不进 innerHTML
-        if (one.kind === 'ai' && window.FloatBarMd && typeof window.FloatBarMd.render === 'function') {
+        if (one.kind === 'thought') {
+          row = document.createElement('details');
+          row.className = 'msg thought';
+          row.open = one.open;
+          row.dataset.index = String(i);
+          var heading = document.createElement('summary');
+          heading.textContent = '思考';
+          var content = document.createElement('div');
+          content.className = 'thought-content';
+          content.textContent = one.text;
+          row.appendChild(heading);
+          row.appendChild(content);
+          row.addEventListener('toggle', onThoughtToggle);
+        } else if (one.kind === 'ai' && window.FloatBarMd && typeof window.FloatBarMd.render === 'function') {
           row.className = 'msg ai md';
           row.innerHTML = window.FloatBarMd.render(one.text);
         } else {
@@ -935,6 +976,31 @@
     scrollMsgsToBottom();
   }
 
+  /** 保存手动折叠状态，后续流式片段更新时维持用户的阅读选择。 */
+  function onThoughtToggle(event) {
+    var index = Number(event.currentTarget.dataset.index);
+    if (items[index] && items[index].kind === 'thought') items[index].open = event.currentTarget.open;
+  }
+
+  /** 每轮思考独立累计；首个正文片段替换短提示，历史回灌使用同一入口。 */
+  function upsertThought(turnId, text, delta) {
+    if (!text) return;
+    var id = String(turnId == null ? '' : turnId);
+    for (var i = items.length - 1; i >= 0; i--) {
+      var one = items[i];
+      if (one.kind !== 'thought' || one.turnId !== id) continue;
+      if (delta) {
+        one.text = one.hasReason ? one.text + text : text;
+        one.hasReason = true;
+      } else if (!one.hasReason) one.text = text;
+      paint();
+      return;
+    }
+    items.push({ kind: 'thought', turnId: id, text: text, hasReason: delta, open: true });
+    while (items.length > MAX_ITEMS) items.shift();
+    paint();
+  }
+
   function addMessage(kind, text) {
     var body = String(text == null ? '' : text).trim();
     if (!body) return;
@@ -947,13 +1013,14 @@
     paint();
   }
 
-  // 取消息区末尾那条同 turnId 的 ai 条目下标；turnId 为空、消息区为空或末尾不是同轮 ai 时返回 -1
+  /** 查找同轮回复，思考片段穿插到达时仍合并到原回复，不生成重复对话卡。 */
   function lastAiIndex(turnId) {
     var id = String(turnId == null ? '' : turnId);
-    if (!id || !items.length) return -1;
-    var last = items[items.length - 1];
-    if (last.kind !== 'ai') return -1;
-    return String(last.turnId == null ? '' : last.turnId) === id ? items.length - 1 : -1;
+    if (!id) return -1;
+    for (var i = items.length - 1; i >= 0; i--) {
+      if (items[i].kind === 'ai' && items[i].turnId === id) return i;
+    }
+    return -1;
   }
 
   // 整段覆盖：末尾已是同 turnId 的 ai 条目就把文本整段替换，否则在末尾新增一条（沿用原裁剪）
@@ -1328,29 +1395,11 @@
       if (!waiting) setStatus('busy', '正在处理你的提示');
       return;
     }
-    if (kind === 'tool') {
-      if (ev.activityOnly) return; // 动作专用元数据不重复插入聊天消息。
-      addMessage('tool', text);
-      if (!waiting) setStatus('busy', text);
-      return;
-    }
-    if (kind === 'status') {
-      // 状态事件只刷顶栏文字，不再往消息区新增条目：一轮里「正在调用 xxx」会连发几十条，会把真实对话挤出去
-      if (!waiting) setStatus('busy', text);
-      return;
-    }
+    // 工具事件仍由桌宠状态机消费，命令、参数与工具输出不进入消息区或顶栏。
+    if (kind === 'tool' || kind === 'status') return;
     if (kind === 'think' || kind === 'reason') {
-      // 思考全文进顶栏；推理增量累加，避免只显示「正在思考」。
-      if (!waiting) {
-        if (kind === 'reason') {
-          var prev = String(statusEl.getAttribute('data-reason') || '');
-          var next = prev + text;
-          statusEl.setAttribute('data-reason', next);
-          setStatus('busy', next);
-        } else {
-          if (!statusEl.getAttribute('data-reason')) setStatus('busy', text);
-        }
-      }
+      upsertThought(ev.turnId, text, kind === 'reason');
+      if (!waiting) setStatus('busy', '正在思考');
       return;
     }
     if (kind === 'ai') {
@@ -1815,7 +1864,9 @@
   if (bridge && typeof bridge.bind === 'function') bridge.bind('');
 })();
 </script>
+<script src="desktop-pet-quota.js"></script>
 <script src="desktop-pet-state.js"></script>
+<script src="desktop-pet-glasses.js"></script>
 <script src="desktop-pet.js"></script>
 </body>
 </html>

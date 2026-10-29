@@ -21,6 +21,8 @@ const api = {
   saveProxy: (proxy) => ipcRenderer.invoke('app:proxy', proxy),
   saveCommandSandbox: (cfg) => ipcRenderer.invoke('app:commandSandbox', cfg),
   saveMaxAgentRounds: (n) => ipcRenderer.invoke('app:maxAgentRounds', n),
+  /** 持久化本地生图参数，单次工具调用可逐项覆盖。 */
+  saveLocalImageGeneration: function saveLocalImageGeneration(options) { return ipcRenderer.invoke('app:localImageGeneration', options); },
   // 开启 AGI 时同时传入用户当前选中的会话，后台接单不猜目标。
   setDesktopAlive: function setDesktopAlive(on, tabId) { return ipcRenderer.invoke('desktop:setAlive', !!on, tabId); },
   /** 屏幕请求只交给既有会话队列，不通过输入框模拟发送。 */
@@ -82,6 +84,8 @@ const api = {
   testModel: (model) => ipcRenderer.invoke('models:test', model),
   listRemoteModels: (model) => ipcRenderer.invoke('models:listRemote', model),
   fetchAccountBalance: (model) => ipcRenderer.invoke('models:accountBalance', model),
+  /** 将主窗已取得的余额快照同步给桌宠，不重复请求余额接口。 */
+  reportAccountQuota: function reportAccountQuota(snapshot) { ipcRenderer.send('floatbar:account-quota', snapshot); },
   listLocalModels: () => ipcRenderer.invoke('models:listLocal'),
   pickModelsDir: () => ipcRenderer.invoke('models:pickDir'),
   openModelsDir: () => ipcRenderer.invoke('models:openDir'),

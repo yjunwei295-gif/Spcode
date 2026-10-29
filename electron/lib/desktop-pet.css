@@ -4,18 +4,40 @@ body.pet-collapsed #frame { display:none; }
 body.pet-expanded #frame { position:absolute;left:var(--panel-left);top:var(--panel-top);width:var(--panel-width);height:var(--panel-height); }
 body #grip, body #btn-mini { display:none; }
 #pet-stage { position:absolute;left:var(--pet-left);top:var(--pet-top);width:var(--pet-width);height:var(--pet-height); }
-#pet-canvas { position:absolute;right:calc((var(--pet-width) - var(--pet-size))/2);bottom:0;width:var(--pet-size);height:var(--pet-size);cursor:grab;touch-action:none; }
+#pet-canvas { position:absolute;right:calc((var(--pet-width) - var(--pet-size))/2);bottom:var(--pet-footer-height);width:var(--pet-size);height:var(--pet-size);cursor:grab;touch-action:none; }
 #pet-canvas:active { cursor:grabbing; }
-/* 工作图标始终可见；不接管鼠标，继续由角色像素负责点击和拖动。 */
-#pet-activity { position:absolute;top:4px;left:50%;transform:translateX(-50%);z-index:2;display:flex;align-items:center;gap:6px;box-sizing:border-box;width:max-content;max-width:calc(100% - 8px);min-height:30px;padding:4px 8px;border:1px solid var(--accent);border-radius:6px;background:var(--panel);color:var(--text);font:600 12px/1.35 var(--font);pointer-events:none; }
+/* 眼镜和角色共享同一矩形；配饰不接管点击，独立使用平滑缩放呈现金属光边。 */
+#pet-glasses { position:absolute;right:calc((var(--pet-width) - var(--pet-size))/2);bottom:var(--pet-footer-height);width:var(--pet-size);height:var(--pet-size);pointer-events:none;image-rendering:auto; }
+/* 状态沿用真实事件；装饰不接管鼠标，继续由角色像素负责点击和拖动。 */
+/* 状态短句继续供辅助阅读，视觉状态交给右上角 HUD，避免再占一整行。 */
+#pet-activity { position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;pointer-events:none; }
 #pet-activity-icon { width:20px;height:20px;flex:none;color:var(--accent); }
 #pet-activity-text { min-width:0;overflow-wrap:anywhere; }
 body[data-pet-state='error'] #pet-activity { border-color:var(--danger); }
 body[data-pet-state='error'] #pet-activity-icon { color:var(--danger); }
-/* 详细内容从图标下方展开，保持状态类别与推理正文分开可读。 */
-#pet-label { position:absolute;top:var(--pet-detail-top);left:8px;right:8px;z-index:1;min-height:30px;max-height:120px;padding:6px 10px;overflow:auto;white-space:pre-wrap;word-break:break-word;line-height:1.45;background:var(--panel);color:var(--text);border:1px solid var(--border-strong);border-radius:6px;font:12px var(--font);cursor:pointer; }
-#pet-label { opacity:0;pointer-events:none;transition:opacity .16s ease; }
-#pet-stage:hover #pet-label,body[data-pet-state='waiting'] #pet-label,body[data-pet-state='error'] #pet-label,body[data-pet-state='thinking'] #pet-label,body[data-pet-state='speaking'] #pet-label,body[data-pet-state='reading'] #pet-label,body[data-pet-state='searching'] #pet-label,body[data-pet-state='writing'] #pet-label,body[data-pet-state='running'] #pet-label,body[data-pet-state='testing'] #pet-label,body[data-pet-state='desktop'] #pet-label,body[data-pet-state='generating'] #pet-label { opacity:1;pointer-events:auto; }
+/* 工作 HUD 尺寸、色彩与动效周期集中可调；锚在角色画布右上方，与上方信息区分开。 */
+:root { --pet-work-size:clamp(38px,calc(var(--pet-size) * .28),68px);--pet-work-cyan:#56efff;--pet-work-violet:#bf83ff;--pet-work-orbit-time:3.6s;--pet-work-counter-time:2.8s;--pet-work-pulse-time:1.8s; }
+#pet-work-indicator { position:absolute;right:6px;top:calc(100% - var(--pet-footer-height) - var(--pet-size) + var(--pet-info-gap));width:var(--pet-work-size);height:var(--pet-work-size);z-index:3;pointer-events:none;color:var(--pet-work-cyan);image-rendering:auto;filter:drop-shadow(0 0 4px #56efff66); }
+#pet-work-indicator[hidden] { display:none; }
+#pet-work-indicator>svg { display:block;width:100%;height:100%;overflow:visible;shape-rendering:geometricPrecision; }
+.pet-work-frame { stroke:var(--pet-work-violet);stroke-width:1.2;stroke-linecap:round; }
+.pet-work-track { fill:#0b1228dc;stroke:#56efff30;stroke-width:.7; }
+.pet-work-orbit { stroke:var(--pet-work-cyan);stroke-width:1.8;stroke-linecap:round;transform-origin:32px 32px;animation:pet-work-orbit var(--pet-work-orbit-time) ease-in-out infinite; }
+.pet-work-orbit circle { fill:var(--pet-work-cyan);stroke:none; }
+.pet-work-counter { stroke:var(--pet-work-violet);stroke-width:1;stroke-linecap:round;transform-origin:32px 32px;animation:pet-work-orbit var(--pet-work-counter-time) ease-in-out infinite reverse; }
+.pet-work-core { fill:#172442e8;stroke:#56efff88;stroke-width:.8; }
+.pet-work-signal { stroke:var(--pet-work-cyan);stroke-width:1.7;stroke-linecap:round;animation:pet-work-pulse var(--pet-work-pulse-time) ease-in-out infinite; }
+@keyframes pet-work-orbit { from { transform:rotate(0deg); } to { transform:rotate(360deg); } }
+@keyframes pet-work-pulse { 0%,100% { opacity:.3; } 50% { opacity:1; } }
+/* 同时尊重桌宠设置与系统减少动态偏好，静态工作标记继续可见。 */
+body.pet-reduced-motion #pet-work-indicator * { animation:none; }
+@media (prefers-reduced-motion:reduce) { #pet-work-indicator * { animation:none; } }
+/* 正文信息区独立锚在角色上方；余额在脚下，两者同时可见且各自可点击。 */
+#pet-info { position:absolute;top:var(--pet-info-inset);left:8px;right:8px;display:flex;flex-direction:column;pointer-events:none; }
+/* 行数来自布局配置，按实际行高加上下内边距和边框计算高度；超出省略，全文在展开面板阅读。 */
+#pet-label { position:relative;z-index:1;flex:none;box-sizing:border-box;height:calc(var(--pet-dialogue-lines) * 1lh + 10px);padding:4px 8px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:var(--pet-dialogue-lines);overflow:hidden;white-space:pre-wrap;word-break:break-word;text-align:left;background:var(--panel);color:var(--text);border:1px solid var(--border-strong);border-radius:6px;font:11px/1.35 var(--font);cursor:pointer;pointer-events:auto; }
+/* 实际空闲及拖动不显示正文，不产生空白气泡或点击区域；余额仍保持在角色脚下。 */
+#pet-label[hidden],#pet-activity[hidden] { display:none; }
 #pet-menu { position:absolute;left:calc(var(--panel-left) + 8px);top:calc(var(--panel-top) + 8px);width:calc(var(--panel-width) - 16px);z-index:20;padding:14px;background:var(--panel);color:var(--text);border:1px solid var(--border-strong);border-radius:6px;max-height:calc(var(--panel-height) - 16px);overflow:auto; }
 #pet-menu[hidden] { display:none; }
 #pet-menu header { display:flex;justify-content:space-between;align-items:center;margin-bottom:12px; }
@@ -26,4 +48,27 @@ body[data-pet-state='error'] #pet-activity-icon { color:var(--danger); }
 #pet-menu footer { display:flex;gap:8px;flex-wrap:wrap; }
 #pet-error { color:var(--danger);white-space:pre-wrap;line-height:1.6; }
 #pet-hint { color:var(--muted);font-size:12px;line-height:1.6; }
+/* 账户 HUD 沿用原黑金主题；双层细线与电路光轨提供辨识度。 */
+#pet-balance { position:absolute;left:8px;right:8px;bottom:var(--pet-info-inset);z-index:2;display:flex;pointer-events:auto;align-items:center;gap:5px;box-sizing:border-box;height:var(--pet-balance-height);padding:4px 6px;border:1px solid var(--accent);border-radius:6px;background:var(--panel);color:var(--accent);box-shadow:inset 0 0 14px var(--hover),0 0 12px var(--hover);font:10px var(--mono);cursor:pointer; }
+#pet-balance::before { content:'';position:absolute;left:12px;right:12px;top:-3px;height:1px;background:var(--accent);opacity:.45; }
+#pet-balance strong { flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:600 11px var(--mono);text-align:right; }
+#pet-balance:hover { background:var(--hover);box-shadow:var(--primary-shadow); }
+#pet-wallet { flex:0 0 auto;max-height:38%;overflow:auto;margin:8px 10px 4px;border:1px solid var(--border-strong);border-radius:6px;background:var(--card);box-shadow:inset 0 1px 0 var(--hover); }
+#pet-wallet summary { display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;cursor:pointer;color:var(--accent);background:var(--hover); }
+#pet-wallet summary::after { content:'⌄';font:14px var(--mono); }
+#pet-wallet[open] summary::after { content:'⌃'; }
+#pet-wallet summary span { flex:none;font-size:11px; }
+#pet-wallet summary small { margin-left:6px;font:9px var(--mono);color:var(--muted); }
+#pet-wallet-total { margin-left:auto;text-align:right;overflow-wrap:anywhere;font:600 16px var(--mono); }
+/* 当前大脑只有一个所属账户，明细整行展示，避免半宽空白与长额度挤在一侧。 */
+#pet-wallet-accounts { display:grid;grid-template-columns:minmax(0,1fr);gap:1px;background:var(--border); }
+.pet-account { min-width:0;padding:10px 12px;background:var(--card); }
+.pet-account-heading { display:flex;flex-wrap:wrap;align-items:center;gap:5px;color:var(--muted);font-size:11px; }
+.pet-account-heading span { color:var(--text);overflow-wrap:anywhere; }
+.pet-account-heading small { font-size:9px;padding:1px 4px;border:1px solid var(--border-strong);border-radius:4px; }
+.pet-account strong { display:block;margin-top:7px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--accent);font:600 12px/1.5 var(--mono); }
+/* 思考单独成卡，长内容可选中和折叠；命令不会生成消息节点。 */
+#msgs .thought { border:1px solid var(--border-strong);border-left:2px solid var(--accent);border-radius:6px;background:var(--hover);padding:0; }
+#msgs .thought summary { padding:7px 10px;color:var(--accent);font-size:11px;cursor:pointer; }
+#msgs .thought-content { padding:0 10px 10px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65;color:var(--muted);user-select:text; }
 @media (prefers-reduced-motion:reduce) { #pet-stage { scroll-behavior:auto; } }

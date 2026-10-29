@@ -17,8 +17,9 @@ ipcMain.handle('desktop-pet:invoke', function (event, data) {
 function attach(win, slotNo, initialBounds) {
   const file = path.join(app.getPath('userData'), 'desktop-pets', 'slot-' + slotNo + '.json');
   const library = createLibrary(app.getPath('userData'));
-  let settings = { skin: config.defaultSkin, scale: config.defaultScale, speed: 1, reducedMotion: false, footX: initialBounds.x + initialBounds.width - config.layout.petWidth * config.defaultScale / 2, footY: initialBounds.y + initialBounds.height };
-  if (fs.existsSync(file)) settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+  let settings = { skin: config.defaultSkin, scale: config.defaultScale, speed: 1, reducedMotion: false, glasses: config.glasses.defaultEnabled, glassesOffsetX: config.glasses.horizontalOffset, glassesOffsetY: config.glasses.verticalOffset, footX: initialBounds.x + initialBounds.width - config.layout.petWidth * config.defaultScale / 2, footY: initialBounds.y + initialBounds.height };
+  // 旧版偏好补齐眼镜开关与两轴偏移，保留已保存的皮肤、位置和用户调整。
+  if (fs.existsSync(file)) settings = Object.assign({ glasses: config.glasses.defaultEnabled, glassesOffsetX: config.glasses.horizontalOffset, glassesOffsetY: config.glasses.verticalOffset }, JSON.parse(fs.readFileSync(file, 'utf8')));
   let expanded = false;
   let dragging = null;
   let ignoring = false;
@@ -27,16 +28,24 @@ function attach(win, slotNo, initialBounds) {
   endpoints.set(win.webContents.id, methods);
   /** 同一窗口的方法只登记在它的专属表内。 */
   function register(channel, fn) { methods.set(channel, fn); }
-  /** 获取当前形态的尺寸，所有可调尺寸来自配置文件。 */
+  /** 角色随设置缩放；hudHeight 为信息区留高，hudMinWidth 保证余额在小比例下仍可读。 */
+  function petSize() {
+    return {
+      width: Math.max(config.layout.hudMinWidth, Math.round(config.layout.petWidth * settings.scale)),
+      height: Math.max(Math.round(config.layout.petHeight * settings.scale), Math.ceil(config.layout.petSize * settings.scale + config.layout.hudHeight))
+    };
+  }
+  /** 获取当前形态的尺寸；HUD 留白与面板尺寸统一来自配置文件。 */
   function size() {
-    const petHeight = Math.round(config.layout.petHeight * settings.scale);
-    return { width: expanded ? config.layout.panelWidth : Math.round(config.layout.petWidth * settings.scale), height: expanded ? config.layout.panelHeight + petHeight : petHeight };
+    const pet = petSize();
+    return { width: expanded ? config.layout.panelWidth : pet.width, height: expanded ? config.layout.panelHeight + pet.height : pet.height };
   }
   /** 将整个角色拉回所在显示器工作区，展开时按可用空间放置。 */
   function layout() {
     const area = screen.getDisplayNearestPoint({ x: Math.round(settings.footX), y: Math.round(settings.footY) }).workArea;
-    const pw = Math.round(config.layout.petWidth * settings.scale);
-    const ph = Math.round(config.layout.petHeight * settings.scale);
+    const pet = petSize();
+    const pw = pet.width;
+    const ph = pet.height;
     settings.footX = Math.max(area.x + pw / 2, Math.min(settings.footX, area.x + area.width - pw / 2));
     settings.footY = Math.max(area.y + ph, Math.min(settings.footY, area.y + area.height));
     const petX = Math.round(settings.footX - pw / 2);
@@ -121,6 +130,18 @@ function attach(win, slotNo, initialBounds) {
       settings.speed = data.speed;
     }
     if ('reducedMotion' in data) settings.reducedMotion = data.reducedMotion === true;
+    // 配饰开关随当前桌宠实例保存，不改变皮肤或工作状态。
+    if ('glasses' in data) settings.glasses = data.glasses === true;
+    // 两轴偏移使用图集像素并独立保存；X 负数左移、正数右移，与页面共用配置范围。
+    if ('glassesOffsetX' in data) {
+      if (!Number.isFinite(data.glassesOffsetX) || data.glassesOffsetX < config.glasses.position.min || data.glassesOffsetX > config.glasses.position.max) throw new Error('眼镜左右位置超出允许范围');
+      settings.glassesOffsetX = data.glassesOffsetX;
+    }
+    // Y 负数上移、正数下移，调整 X 时保留已保存的 Y 值。
+    if ('glassesOffsetY' in data) {
+      if (!Number.isFinite(data.glassesOffsetY) || data.glassesOffsetY < config.glasses.position.min || data.glassesOffsetY > config.glasses.position.max) throw new Error('眼镜上下位置超出允许范围');
+      settings.glassesOffsetY = data.glassesOffsetY;
+    }
     layout();
     save();
     return payload();

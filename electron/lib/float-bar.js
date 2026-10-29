@@ -196,6 +196,8 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
   let savedBottomY = 0;
   /** sessionKey → 最近 30 条事件 */
   const buckets = new Map();
+  /** 余额是可替换快照，单独保存，避免定期刷新挤掉对话历史。 */
+  const quotas = new Map();
   /** 页面当前绑定的会话键：只有它的事件才即时投递 */
   let boundKey = '';
 
@@ -252,6 +254,8 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
         win.webContents.send('floatbar:event', ev);
       }
     }
+    // 余额独立于事件队列；页面首次加载或重载时总能取得当前绑定的最新快照。
+    win.webContents.send('floatbar:event', { kind: 'quota', sessionKey: boundKey, snapshot: quotas.has(boundKey) ? quotas.get(boundKey) : null });
     if (pendingAsk) {
       const ask = pendingAsk;
       pendingAsk = null;
@@ -546,6 +550,13 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     // 强制补 sessionKey：payload 自己带了的以它为准
     ev.sessionKey = (ev.sessionKey == null || ev.sessionKey === '') ? key : keyOf(ev.sessionKey);
 
+    // 余额不属于轮次消息，不计入每会话的 30 条历史限额。
+    if (ev.kind === 'quota') {
+      quotas.set(ev.sessionKey, ev.snapshot);
+      const target = ensureWindow();
+      if (pageReady && ev.sessionKey === boundKey) target.webContents.send('floatbar:event', ev);
+      return;
+    }
     let bucket = buckets.get(ev.sessionKey);
     if (!bucket) {
       bucket = [];
@@ -588,6 +599,7 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     const w = ensureWindow();
     if (pageReady && w && !w.isDestroyed()) {
       w.webContents.send('floatbar:event', ev);
+      w.webContents.send('floatbar:event', { kind: 'quota', sessionKey: boundKey, snapshot: quotas.has(boundKey) ? quotas.get(boundKey) : null });
       if (pendingAsk) {
         petController.setExpanded(true);
         w.webContents.send('floatbar:ask', pendingAsk);

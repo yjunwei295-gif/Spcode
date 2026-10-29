@@ -278,6 +278,26 @@ function broadcastToFloatBars(payload) {
   }
 }
 
+/** 余额按来源主窗缓存，切换绑定时恢复该窗口的账户数据；弱引用随主窗释放。 */
+const accountQuotaByWin = new WeakMap();
+
+/** 将来源主窗的最新余额发给指定会话；未收到数据时显式显示待同步。 */
+function pushAccountQuota(key) {
+  const owner = winFromKey(key);
+  const snapshot = owner && accountQuotaByWin.has(owner) ? accountQuotaByWin.get(owner) : null;
+  broadcastToFloatBars({ kind: 'quota', sessionKey: key, snapshot });
+}
+
+/** 接收主窗的展示快照并更新其全部会话，不跨窗口取数或再次请求账户接口。 */
+function noteAccountQuota(event, snapshot) {
+  const owner = getWin(event);
+  if (!owner) return;
+  accountQuotaByWin.set(owner, snapshot);
+  for (const key of sessionsByKey.keys()) {
+    if (winFromKey(key) === owner) pushAccountQuota(key);
+  }
+}
+
 /** 危险确认卡片和普通事件分开走，这里对每个小窗实例推一次 */
 function broadcastAskToFloatBars(payload) {
   if (!payload) return;
@@ -314,6 +334,7 @@ function pushStartReady(keyHint) {
   // options 一律给数组，缺省空数组，小窗自己决定要不要多摆几颗方案按钮
   const options = state && Array.isArray(state.options) ? state.options : [];
   broadcastToFloatBars({ kind: 'start-ready', sessionKey: key, canStart, options });
+  pushAccountQuota(key);
 }
 
 /** 小窗会话清单：窗口编号 + 渲染层报上来的标题 */
@@ -724,6 +745,7 @@ function releaseFloatBarSlot() {
 
 // 小窗新增的四个通道都在这里绑一次：语义都是新增，原有通道一个没动
 function registerFloatBarIpc() {
+  ipcMain.on('floatbar:account-quota', noteAccountQuota);
   // 小窗点「开始」：由 lib/float-bar.js 的 onStart 回调触发。
   // 注意：小窗内部已经自己监听 floatbar:start / floatbar:bind 两个通道，这里绝不能再绑一次，
   // 否则同一次点击会被处理两遍。原先的 ipcMain.handle/on 注册已按此删除。
@@ -1314,6 +1336,15 @@ ipcMain.handle('app:maxAgentRounds', (_e, n) => {
   s.maxAgentRounds = store.clampAgentRounds(n);
   store.save(s);
   return s.maxAgentRounds;
+});
+
+/** 保存用户选择的本地生图参数；共享校验失败时不写入设置。 */
+ipcMain.handle('app:localImageGeneration', function saveLocalImageGeneration(_event, raw) {
+  const options = require('./lib/image-gen-options').normalize(raw);
+  const settings = store.load();
+  settings.localImageGeneration = options;
+  store.save(settings);
+  return options;
 });
 
 // 用户点「写入方案」：把这条回复里的【方案】段写进本会话的方案文件

@@ -33,6 +33,8 @@ const DEFAULTS = {
   /** 全局能力默认：组合未挂时使用；组合优先覆盖。每项 { primary, fallbacks[] }，值为槽位形引用 */
   capabilityDefaults: {},
   modelsDir: '',
+  /** 本地生图显式参数；空对象沿用模型配方，设置面板与单次工具可覆盖。 */
+  localImageGeneration: {},
   proxy: '',
   commandSandbox: { enabled: true, timeoutSec: 60 },
   maxAgentRounds: 16,

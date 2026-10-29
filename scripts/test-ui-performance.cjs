@@ -200,6 +200,8 @@ function fullPageSetup() {
     listChildren: emptyList, loadSessions: emptyList, saveModels: async function saveModels() { return {}; },
     onChatEvent: function onChatEvent(callback) { window.emitTestChat = callback; },
     onWorkspaceChanged: noOp, onUiRefresh: noOp, onDownloadProgress: noOp, onIndexProgress: noOp,
+    // 余额同步是新增的主窗桥接口，完整页面夹具同步提供入口。
+    reportAccountQuota: noOp,
     floatBind: noOp, floatCanStart: noOp, logSummaryTrace: noOp,
     reportError: function reportError(stage, details) {
       if (stage === '界面脚本报错' || stage === '界面未处理的 Promise 拒绝') record.errors.push({ stage, details });

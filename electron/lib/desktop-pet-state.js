@@ -14,8 +14,8 @@
     if (WRITE.indexOf(name) >= 0) return 'writing';
     if (DESKTOP.indexOf(name) >= 0) return 'desktop';
     if (MEDIA.indexOf(name) >= 0) return 'generating';
-    if (name === 'run_command') return 'running';
-    return 'thinking';
+    // 未单独分类的工具统一显示执行提示，不把普通调用当成异常。
+    return 'running';
   }
   /** 为一个绑定会话保存独立轮次与并行调用，避免其他标签页污染动作。 */
   function Model(config) {
@@ -41,7 +41,7 @@
   };
   /** 获取指定轮次的状态；仅处理当前会话携带轮次编号的事件。 */
   Model.prototype.turn = function (id) {
-    if (!this.turns.has(id)) this.turns.set(id, { tools: new Map(), waiting: false, phase: 'thinking', detail: '', reasoning: '', failed: false });
+    if (!this.turns.has(id)) this.turns.set(id, { tools: new Map(), waiting: false, phase: 'thinking', detail: '', reasoning: '', dialogue: '' });
     return this.turns.get(id);
   };
   /** 消费开始、输出、工具、等待与终止事件；done 仅代表调用结束。 */
@@ -50,28 +50,33 @@
     if (ev.sessionKey !== this.key || !ev.turnId || ev.kind === 'idle') return;
     var id = ev.turnId;
     var t = this.turn(id);
-    if (ev.kind === 'user' || ev.kind === 'turn-start') { t.phase = 'thinking'; t.reasoning = ''; t.detail = ''; }
-    if (ev.kind === 'ai' || ev.kind === 'ai-delta') t.phase = 'speaking';
+    if (ev.kind === 'user' || ev.kind === 'turn-start') { t.phase = 'thinking'; t.reasoning = ''; t.dialogue = ''; t.detail = ''; }
+    // 气泡只展示对话和模型公开的思考文本；工具名、参数、命令输出不进入正文。
+    if (ev.kind === 'ai') { t.dialogue = String(ev.text || ''); t.detail = t.dialogue; t.phase = 'speaking'; }
+    if (ev.kind === 'ai-delta') { t.dialogue = (t.dialogue || '') + String(ev.text || ''); t.detail = t.dialogue; t.phase = 'speaking'; }
     // 推理增量拼全文；短提示只在尚无推理正文时占位，避免盖住思考全文。
     if (ev.kind === 'reason' && ev.text) { t.reasoning = (t.reasoning || '') + String(ev.text); t.detail = t.reasoning; t.phase = 'thinking'; }
     if (ev.kind === 'think' && ev.text) { t.phase = 'thinking'; if (!t.reasoning) t.detail = String(ev.text); }
-    if (ev.kind === 'status') { if (!t.reasoning) t.detail = ev.text; }
+    // 状态通知可能含完整命令；动作单独保留，正文只由思考和对话更新。
     if (ev.kind === 'tool' && ev.callId) {
       if (ev.status === 'running') {
-        t.tools.set(ev.callId, { state: activity(ev.name, ev.activity), detail: ev.text });
+        t.tools.set(ev.callId, { state: activity(ev.name, ev.activity) });
         t.phase = 'thinking';
       } else {
         t.tools.delete(ev.callId);
-        if (ev.outcome === 'error') { t.failed = true; t.detail = ev.text; }
+        // 单次工具失败可由后续调用修正；继续使用通用执行提示，整轮结论由 turn-end 决定。
+        if (ev.outcome === 'error') { t.phase = 'running'; if (!t.reasoning && !t.dialogue) t.detail = this.config.labels.running; }
       }
     }
     if (ev.kind === 'ask') { t.waiting = true; t.detail = ev.question; }
     if (ev.kind === 'answered') { t.waiting = false; t.phase = 'thinking'; }
-    if (ev.kind === 'error') { t.failed = true; t.detail = ev.text; }
+    // 显式轮次错误才进入错误状态；后续实际回复或思考可恢复正常阶段。
+    if (ev.kind === 'error') { t.phase = 'error'; t.detail = ev.text; }
     if (ev.kind === 'turn-end') {
       this.turns.delete(id);
       if (!replay) {
-        this.state = ev.outcome === 'stopped' ? 'stopped' : (ev.outcome === 'error' || t.failed ? 'error' : 'success');
+        // 主进程的实际结束原因区分停止、失败和成功，不累积已经恢复的工具错误。
+        this.state = ev.outcome === 'stopped' ? 'stopped' : (ev.outcome === 'error' ? 'error' : 'success');
         this.detail = this.config.labels[this.state];
         this.terminalUntil = now + this.config.motion.finishMs;
       }
@@ -88,7 +93,11 @@
     var waiting = false;
     for (var t of this.turns.values()) {
       if (t.waiting) { waiting = true; next = 'waiting'; detail = t.detail; break; }
-      for (var tool of t.tools.values()) { next = tool.state; detail = tool.detail; count++; }
+      for (var tool of t.tools.values()) {
+        next = tool.state;
+        detail = t.reasoning || t.dialogue || t.detail || this.config.labels[tool.state];
+        count++;
+      }
       // 无工具时：思考相位优先推推理全文，否则用已有 detail。
       if (!count) { next = t.phase; detail = (t.phase === 'thinking' && t.reasoning) ? t.reasoning : t.detail; }
     }

@@ -486,7 +486,9 @@ function allToolsSpec() {
           type: 'object',
           properties: {
             kind: { type: 'string', enum: ['image', 'video', '3d', 'doc'], description: '生成类型，生图填 image' },
-            prompt: { type: 'string', description: '完整的生成描述' }
+            prompt: { type: 'string', description: '完整的生成描述' },
+            imagePath: { type: 'string', description: '本地图生图参考图片路径：项目相对路径或已知的本机绝对路径；连续帧可传上一帧的输出路径' },
+            ...localImageOptions.SCHEMA
           },
           required: ['kind', 'prompt']
         }
@@ -1708,11 +1710,12 @@ async function execToolRaw(workspace, snap, name, args, onEvent, extra, signal, 
     const prompt = String(args.prompt || '').trim();
     if (!prompt) return 'prompt 不能为空，请写完整的生成描述。';
     onEvent({ type: 'tool', name, status: 'running', detail: prompt.slice(0, 120), text: `生成 ${prompt.slice(0, 60)}` });
-    const r = await generateRole({ vs: store.load(), role, prompt, workspace, extra, onEvent, signal, snap, lang });
+    const r = await generateRole({ vs: store.load(), role, prompt, workspace, extra, onEvent, signal, snap, lang, imageRequest: args });
     onEvent({ type: 'tool', name, status: 'done', detail: r.rel || '', text: r.ok ? `已生成 ${r.rel}` : `${r.roleName}失败` });
     if (!r.ok) return `【${r.roleName}失败】${r.detail}`;
     if (role === 'docGen') return `【${r.roleName}已完成】文件：${r.rel}\n\n${String(r.text || '').slice(0, 8000)}`;
-    return `【${r.roleName}已完成】文件在工作目录：${r.rel}。向用户报告这个路径，不要说还没生成。`;
+    return `【${r.roleName}已完成】文件在工作目录：${r.rel}。向用户报告这个路径，不要说还没生成。` +
+      (r.parameters ? '\n本次本地生图参数：' + JSON.stringify(r.parameters) : '');
   }
   if (name === 'run_command') {
     const s = store.load();
@@ -1972,10 +1975,11 @@ function writeGeneratedFile(workspace, extra, snap, rel, data, encoding) {
 }
 
 /**
- * 生图/生视频/生3D/生文档：组合优先，否则全局能力默认 + fallback。一次只做一种
- * @returns {Promise<{ ok: boolean, roleName: string, rel?: string, text?: string, detail?: string }>}
+ * 生图/生视频/生3D/生文档：按既有槽位候选生成，一次只做一种。
+ * imageRequest 为本地参考图与单次参数；单次参数覆盖保存设置，结果文件纳入当前快照。
+ * @returns {Promise<{ ok: boolean, roleName: string, rel?: string, text?: string, detail?: string, parameters?: object }>}
  */
-async function generateRole({ vs, role, prompt, workspace, extra, onEvent, signal, snap, lang }) {
+async function generateRole({ vs, role, prompt, workspace, extra, onEvent, signal, snap, lang, imageRequest = {} }) {
   const roleName = (assembly.ROLES.find((x) => x.id === role) || {}).name || role;
   const candidates = assembly.roleCandidates(vs, role);
   if (!candidates.length) {
@@ -1983,6 +1987,10 @@ async function generateRole({ vs, role, prompt, workspace, extra, onEvent, signa
     onEvent({ type: 'think', text: tip });
     return { ok: false, roleName, detail: tip };
   }
+  // 参考图按现有附件读取规则解析；绝不能忽略路径后退回文生图。
+  const imagePath = role === 'imageGen' && imageRequest.imagePath
+    ? resolveRead(workspace, extra || [], imageRequest.imagePath) : undefined;
+  const requestedOptions = role === 'imageGen' ? localImageOptions.normalize(imageRequest) : {};
   const errors = [];
   for (const cand of candidates) {
     const helperCfg = assembly.slotToModelCfg(cand.slot, vs);
@@ -2026,6 +2034,10 @@ async function generateRole({ vs, role, prompt, workspace, extra, onEvent, signa
         role,
         modelCfg: helperCfg,
         prompt,
+        imagePath,
+        // 全局本地参数只影响本地槽位，接口生图不接收这套引擎参数。
+        imageOptions: helperCfg.type === 'local'
+          ? localImageOptions.merge(vs.localImageGeneration, requestedOptions) : requestedOptions,
         signal,
         modelsDir: vs.modelsDir || store.defaultModelsDir(),
         onWait: (text) => onEvent({ type: 'status', text })
@@ -2038,7 +2050,7 @@ async function generateRole({ vs, role, prompt, workspace, extra, onEvent, signa
         asset.buf
       );
       onEvent({ type: 'think', text: `已生成文件 ${rel}` });
-      return { ok: true, roleName, rel };
+      return { ok: true, roleName, rel, parameters: asset.parameters };
     } catch (e) {
       if (e.name === 'AbortError') throw e;
       errors.push(`[${srcHint}·${helperLabel}] ${e.message}`);
@@ -2058,6 +2070,8 @@ async function generateRole({ vs, role, prompt, workspace, extra, onEvent, signa
 
 // generate_media 工具的 kind 对应的生成槽位
 const GEN_KIND_ROLE = { image: 'imageGen', video: 'videoGen', '3d': 'model3d', doc: 'docGen' };
+// 本地生图的工具协议、设置与引擎共用参数定义，避免入口接收后被中间层丢弃。
+const localImageOptions = require('./image-gen-options');
 
 /**
  * 只给不会调用工具的本地引擎（zbaing）用：按用户原话在开口前自动生成。
@@ -2226,6 +2240,10 @@ function buildSystemPrompt({
     : (enPrompt
       ? `\nTo generate images/videos/3D/docs, call generate_media yourself (kind + a full prompt you write from the conversation). It uses the generation model in the model combo. It does not need the user to say start, and must not be handed to the code worker or run through run_command / sd-cli. One call per image. After it returns, tell the user the file path. Never say you have no image tool.${genFailNote}\n`
       : `\n要生图/生视频/生3D/生文档时，你自己调用 generate_media：kind 填类型，prompt 写你按对话整理好的完整描述（主体、风格、构图、颜色）。它用「模型组合」里挂的生成模型，不需要用户说「开始」，禁止派给代码模块、禁止用 run_command 去跑 sd-cli。要几张就调用几次。返回后把文件路径告诉用户。禁止说自己没有生图工具。${genFailNote}\n`);
+  // 明确参考图与参数入口，防止模型只把附件描述写进 prompt 而漏传图像。
+  genNote += enPrompt
+    ? '\nFor local image-to-image, pass the actual attachment or previous output path as imagePath to generate_media. Pass width, height, steps, seed, strength, cfgScale, samplingMethod and negativePrompt when specified. preset="pixel" selects an editable pixel-animation preset. Do not invent attachment paths or claim frame consistency from a fixed seed alone. Omitted options use the saved local image settings.\n'
+    : '\n本地图生图时，generate_media 的 imagePath 必须填写真实附件或上一帧输出路径，不能只把参考图描述写进 prompt。可指定 width、height、steps、seed、strength、cfgScale、samplingMethod、negativePrompt；preset="pixel" 使用可覆盖参数的像素动画配置。未指定参数沿用设置中的本地生图参数。禁止编造图片路径，固定种子不能保证帧间角色一致。\n';
   // 代码视频先制作抓耳配乐并按内容选择卡点，再用缓动呈现可编辑动画；旁白可选，不消耗视频生成槽位。
   genNote += enPrompt
     ? '\nFor videos made with code, motion graphics, or animated explainers: first prepare music and plan shots for the content, then write an HTML/Canvas animation and call render_code_video with explicit dimensions, fps and duration. Unless the user specifies otherwise, use 1920x1080 at 60 fps; preserve any user-specified aspect ratio or output settings. Define window.renderFrame(time, frame, info), await dynamic assets, and derive every frame from time. All motion must use easing functions to avoid abrupt movement. Use the SpCode icon as the mascot. If the user has not supplied an audio track, you must generate background music yourself. Let music drive the visuals. Voice-over is optional; do not add narration by default. First create a catchy score with a memorable melodic motif, a clear rhythm, and sections that build and release energy instead of a monotonous loop or notification tones. Then select verified musical cues for key reveals, scene changes, text emphasis and the ending while preserving reading time. Speech alone or barely audible music does not satisfy the background-music requirement. If narration is used, make it an auxiliary layer with emotional variation, natural pauses and emphasis; it must not mask the music. Otherwise communicate through music and captions. Preserve separate music and final audio tracks, plus a narration track only when used. Audition the exported MP4 to assess whether the music is catchy, audible and unclipped, and inspect whether key actions hit the selected cues; an audio stream, gain setting or estimated BPM alone does not establish success. Use audioPath for an existing music/narration file. Inspect the returned preview PNGs before delivering the MP4. See docs/code-video.md in the SpCode source for the contract. generate_media is only for generation-model assets; it is not the code-video renderer.\n'
@@ -2398,6 +2416,8 @@ async function attachmentsToParts(attachments, { vision, signal, noVisionHint, s
     extraTexts.push(`附件「${parsed.name}」类型：${parsed.kind}`);
     if (parsed.text) extraTexts.push(`----- ${parsed.name} -----\n${parsed.text}`);
     if (parsed.dataUrl) {
+      // 工具需要原始文件路径才能把附件交给本地图生图，不能从视觉描述反推路径。
+      extraTexts.push('参考图片本机路径：' + att.path);
       if (vision) pushVision(parts, parsed.dataUrl);
       else {
         skippedImages.push(parsed.dataUrl);

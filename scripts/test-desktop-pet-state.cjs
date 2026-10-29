@@ -2,7 +2,7 @@
 'use strict';
 const assert=require('assert'),fs=require('fs'),path=require('path');
 const config=require('../electron/lib/desktop-pet-config.json');
-const {Model}=require('../electron/lib/desktop-pet-state');
+const {Model,activity}=require('../electron/lib/desktop-pet-state');
 const {execute}=require('../electron/lib/tool-activity');
 const results=[];
 function ok(name,value){assert.ok(value,name);results.push(name);console.log('PASS '+name);}
@@ -27,8 +27,17 @@ async function run(){
  ok('历史恢复不重新庆祝',m.state==='idle');
  event({kind:'turn-start'},3000);event({kind:'tool',callId:'bad',name:'run_command',status:'running'},3500);
  event({kind:'tool',callId:'bad',name:'run_command',status:'done',outcome:'error'},4000);
- event({kind:'turn-end',outcome:'success'},4001);
- ok('工具失败即使轮次正常返回也显示问题',m.state==='error');
+ ok('单次工具失败使用通用执行提示',m.state==='running'&&m.detail===config.labels.running);
+ event({kind:'tool',callId:'retry',name:'run_command',status:'running'},4500);
+ event({kind:'tool',callId:'retry',name:'run_command',status:'done',outcome:'success'},5000);
+ event({kind:'turn-end',outcome:'success'},5001);
+ ok('工具失败重试成功后不误报遇到问题',m.state==='success');
+ event({kind:'turn-start'},7500);
+ event({kind:'error',text:'真实轮次错误'},8000);
+ ok('显式真实错误进入问题状态并保留错误内容',m.state==='error'&&m.detail==='真实轮次错误');
+ event({kind:'turn-end',outcome:'error'},8500);
+ ok('真实失败的轮次仍显示遇到问题',m.state==='error'&&m.detail===config.labels.error);
+ ok('未单独分类的工具使用通用执行提示',activity('todo_write')==='running');
  const events=[];
  await execute('run_command',{activity:'test'},async function(progress){progress({type:'execution-result',outcome:'error'});return 'exit 1';},function(ev){events.push(ev);});
  ok('真实执行边界分配一致调用ID并保留失败结果',events.length===2&&events[0].callId===events[1].callId&&events[1].outcome==='error');

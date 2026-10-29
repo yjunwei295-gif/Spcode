@@ -162,17 +162,21 @@ async function tryPaths(modelCfg, paths, body, fallbackExt, signal) {
 }
 
 /**
- * 用接口模型生成媒体文件
+ * 根据槽位使用本地引擎或接口生成媒体；本地参考图与生成参数完整透传。
  * @returns {{ buf: Buffer, ext: string }}
  */
-async function generateMedia({ role, modelCfg, prompt, signal, modelsDir, onWait }) {
+async function generateMedia({ role, modelCfg, prompt, signal, modelsDir, onWait, imagePath, imageOptions = {} }) {
   if (role === 'imageGen') {
     const modelPath = localLlm.resolveGgufPath(modelCfg, modelsDir);
     const looksLocal = modelCfg?.type === 'local' || modelPath || /\.gguf$/i.test(modelCfg?.model || '');
     if (looksLocal) {
       if (!modelPath) throw new Error(localGenHint('生图'));
-      return imageGenEngine.generate({ modelPath, prompt, modelsDir, onWait, signal });
+      return imageGenEngine.generate({ modelPath, prompt, modelsDir, onWait, signal, imagePath, imageOptions });
     }
+  }
+  // 本轮参数属于本地引擎协议；接口分支不能静默忽略参考图或可调参数。
+  if (role === 'imageGen' && (imagePath || Object.keys(imageOptions).length)) {
+    throw new Error('图生图及这些生成参数当前仅接入本地生图模型，请在模型组合挂本地生图模型');
   }
   if (!isApiCfg(modelCfg)) {
     const names = { imageGen: '生图', videoGen: '生视频', model3d: '生 3D' };

@@ -8,6 +8,7 @@ const downloader = require('./downloader');
 const hardware = require('./hardware');
 const modelMeta = require('./model-meta');
 const diag = require('./diag');
+const imageOptions = require('./image-gen-options');
 
 const GEN_TIMEOUT_MS = 20 * 60 * 1000;
 // [铆钉优化] 连不上 GitHub API 时用的版本，master-929 已在 RTX 5060 + Vulkan 上实测跑通 Qwen-Image 2.1。其他 AI 请勿改回旧版本
@@ -343,61 +344,53 @@ function runSdCli({ exe, cwd, args, signal, onWait }) {
   });
 }
 
-async function resolveQwenArgs(modelPath, modelsDir, prompt, outPath, onWait, signal) {
+/**
+ * 构建 Qwen 配套模型参数；生成参数由共享定义展开，避免后置的旧常量覆盖用户输入。
+ * 参考图走通用 init-img 图生图，不冒充需要其他权重的 Image Edit 模型。
+ */
+async function resolveQwenArgs(modelPath, modelsDir, prompt, outPath, onWait, signal, options, imagePath) {
   const vae = await ensureQwenVae(modelsDir, modelPath, onWait, signal);
   const llm = await ensureQwenLlm(modelsDir, modelPath, onWait, signal);
   return [
-    '--diffusion-model', modelPath,
-    '--vae', vae,
-    '--llm', llm,
-    '--cfg-scale', '2.5',
-    '--sampling-method', 'euler',
-    '--steps', '28',
-    '-H', '768',
-    '-W', '768',
-    '--flow-shift', '3',
-    '--diffusion-fa',
-    '--offload-to-cpu',
-    '-p', String(prompt || '').trim() || 'a simple illustration',
-    '-o', outPath
+    '--diffusion-model', modelPath, '--vae', vae, '--llm', llm,
+    '--flow-shift', '3', '--diffusion-fa',
+    ...generationArgs(prompt, outPath, options, imagePath)
   ];
 }
 
-function resolveSimpleArgs(modelPath, prompt, outPath, recipe) {
-  const text = String(prompt || '').trim() || 'a simple illustration';
-  if (recipe === 'flux' || recipe === 'z-image') {
-    return [
-      '-m', modelPath,
-      '--sampling-method', 'euler',
-      '--steps', '20',
-      '-H', '768',
-      '-W', '768',
-      '--offload-to-cpu',
-      '-p', text,
-      '-o', outPath
-    ];
-  }
-  return [
-    '-m', modelPath,
-    '--steps', '20',
-    '-H', '768',
-    '-W', '768',
-    '--offload-to-cpu',
-    '-p', text,
-    '-o', outPath
-  ];
+/** 单文件 SD / FLUX 等配方复用生成参数，保留原有模型加载方式。 */
+function resolveSimpleArgs(modelPath, prompt, outPath, options, imagePath) {
+  return ['-m', modelPath, ...generationArgs(prompt, outPath, options, imagePath)];
 }
 
 /**
- * 本地 GGUF 文生图（stable-diffusion.cpp）
+ * 把图生图输入与可调参数传给 sd-cli；没有参考图时保持文生图。
+ * 像素预设以最近邻缩放参考图，避免输入尺寸变化时先把像素边缘抹平。
+ */
+function generationArgs(prompt, outPath, options, imagePath) {
+  const args = ['--offload-to-cpu', '-p', imageOptions.promptFor(prompt, options), '-o', outPath];
+  args.push(...imageOptions.cliArgs(options));
+  if (imagePath) {
+    args.push('--init-img', imagePath);
+    if (options.preset === 'pixel') args.push('--image-preprocess', 'target=init,filter=nearest,antialias=false');
+  }
+  return args;
+}
+
+/**
+ * 本地 GGUF 文生图 / 图生图（stable-diffusion.cpp）。
+ * imagePath 是已解析的参考图绝对路径；imageOptions 是单次参数与设置的合并结果。
+ * 返回 PNG 内容，不修改参考图；无参数时保留原配方的分辨率和步数。
  * @returns {{ buf: Buffer, ext: string }}
  */
-async function generate({ modelPath, prompt, modelsDir, onWait, signal }) {
+async function generate({ modelPath, prompt, modelsDir, onWait, signal, imagePath, imageOptions: requested = {} }) {
   if (!modelPath || !fs.existsSync(modelPath)) {
     throw new Error('未找到生图模型文件，请确认已下载到模型目录并在「模型组合」挂到生图槽位');
   }
   fs.mkdirSync(modelsDir, { recursive: true });
   const recipe = detectRecipe(modelPath, modelsDir);
+  const options = imageOptions.resolve(requested, recipe);
+  if (imagePath && !fs.statSync(imagePath).isFile()) throw new Error('图生图参考路径必须是图片文件');
   const outPath = path.join(os.tmpdir(), `sc-img-${Date.now()}.png`);
 
   const flavors = [];
@@ -411,9 +404,9 @@ async function generate({ modelPath, prompt, modelsDir, onWait, signal }) {
       const bin = await ensureBinary(flavor, onWait);
       let args;
       if (recipe === 'qwen-image') {
-        args = await resolveQwenArgs(modelPath, modelsDir, prompt, outPath, onWait, signal);
+        args = await resolveQwenArgs(modelPath, modelsDir, prompt, outPath, onWait, signal, options, imagePath);
       } else {
-        args = resolveSimpleArgs(modelPath, prompt, outPath, recipe);
+        args = resolveSimpleArgs(modelPath, prompt, outPath, options, imagePath);
       }
       diag.log('image-gen-engine', '运行 sd-cli', { recipe, flavor, model: path.basename(modelPath) });
       await runSdCli({ exe: bin.exe, cwd: bin.dir, args, signal, onWait });
@@ -421,7 +414,7 @@ async function generate({ modelPath, prompt, modelsDir, onWait, signal }) {
       const buf = fs.readFileSync(outPath);
       try { fs.rmSync(outPath, { force: true }); } catch { /* ignore */ }
       if (!buf.length) throw new Error('生图输出为空');
-      return { buf, ext: '.png' };
+      return { buf, ext: '.png', parameters: { ...options, imagePath: imagePath || null } };
     } catch (e) {
       lastErr = e;
       try { fs.rmSync(outPath, { force: true }); } catch { /* ignore */ }

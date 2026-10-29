@@ -1,9 +1,10 @@
 // 渲染层构建标记：用于诊断页面加载的是否为当前磁盘代码。
 // 每次改动渲染层资源（app.js / styles.css / index.html）都要 bump 这个值，
 // 否则旧页面缓存会继续跑磁盘上已经不存在的样式，排查“改了没生效”时会误判。
-window.__APP_BUILD = 'v20261024c';
+window.__APP_BUILD = 'v20261029-pet-dashboard';
 import { t, setLocale, applyDom, getLocale, isNewChatTitle } from './i18n.js';
 import { renderMarkdown } from './markdown.js';
+import { imageSettingsHtml, bindImageSettings, readImageSettings } from './image-generation-settings.js';
 
 const api = window.simple || window.sinpo;
 
@@ -238,12 +239,16 @@ function providerCacheKey(p) {
   return (hash >>> 0).toString(16);
 }
 
-function aggregateQuotaSnapshot() {
+/** 汇总账户展示数据；传入厂商 ID 时只统计该厂商，供当前大脑的桌宠余额使用。 */
+function aggregateQuotaSnapshot(providerId) {
   const totals = new Map();
   const details = [];
   const codexUsage = [];
+  // 桌宠只接收已格式化的账户展示数据，不传厂商配置或密钥。
+  const accounts = [];
   const providers = state.providers || [];
   for (const p of providers) {
+    if (providerId !== undefined && p.id !== providerId) continue;
     const cached = quotaMem.providers.get(p.id);
     const fromProvider = cached?.configKey === providerCacheKey(p) ? cached.balance : null;
     const balance = quotaCanShow(fromProvider) ? fromProvider : walletSnapshotOf(p);
@@ -253,10 +258,13 @@ function aggregateQuotaSnapshot() {
       // 不同厂商的 credits 不是同一单位，单独按厂商列出，不做无意义相加。
       if (currency !== 'CREDITS') totals.set(currency, (totals.get(currency) || 0) + Number(balance.remaining));
       details.push(`${p.name || p.id}: ${formatQuotaMoney(balance.remaining, currency)}${currency === 'CREDITS' ? ' Credits' : ''}`);
+      accounts.push({ name: p.name || p.id, value: formatQuotaMoney(balance.remaining, currency) + ' ' + currency, source: balance.source === 'manual' ? '手动记账' : '接口余额' });
     } else if (fromProvider?.available && fromProvider.kind === 'rate-limits' && fromProvider.text) {
       codexUsage.push(`${p.name || p.id}: ${fromProvider.text}`);
+      accounts.push({ name: p.name || p.id, value: fromProvider.text, source: '用量额度' });
     } else {
       details.push(`${p.name || p.id}: ${t('quotaUnavailable')}`);
+      accounts.push({ name: p.name || p.id, value: t('quotaUnavailable'), source: '未取得余额' });
     }
   }
   const sums = [];
@@ -271,11 +279,22 @@ function aggregateQuotaSnapshot() {
   const providerDetails = details.filter((line) => line !== summary && !codexUsage.includes(line));
   const text = [summary, ...providerDetails, ...codexUsage].filter(Boolean).join(' · ');
   if (!text) return null;
-  return { available: true, kind: 'aggregate', text, title: details.join('\n') };
+  return { available: true, kind: 'aggregate', text, title: details.join('\n'), totals: sums, accounts };
 }
 
+/** 只取当前大脑所属厂商的余额；本地或未选模型没有账户快照，不沿用其他厂商余额。 */
+function currentBrainQuotaSnapshot() {
+  const model = currentModel();
+  if (!model?.providerId) return null;
+  const snapshot = aggregateQuotaSnapshot(model.providerId);
+  if (snapshot) snapshot.title = modelLabel() + '\n' + snapshot.title;
+  return snapshot;
+}
+
+/** 主窗保持账户总览，桌宠单独同步当前大脑额度；扣费和手动记账均走本入口。 */
 function showAggregateQuota() {
   paintQuotaBar(aggregateQuotaSnapshot());
+  api.reportAccountQuota(currentBrainQuotaSnapshot());
 }
 
 function ingestProviderBalance(providerId, balance) {
@@ -3541,6 +3560,7 @@ function paintModelButton(activeName, activeRole) {
   syncCursorDirectBtn();
 }
 
+/** 重绘模型选择菜单，并同步当前大脑的显示名称与桌宠额度；标签恢复同样调用本入口。 */
 function renderModelMenu() {
   paintModelButton();
   const locals = (state.localFiles || []).map((f) => {
@@ -3564,6 +3584,8 @@ function renderModelMenu() {
   $('model-menu').innerHTML = `<div class="model-menu-scroll">${listBody}</div>`
     + `<div class="model-menu-foot"><div class="sep"></div><button data-act="settings">${t('manageModels')}</button></div>`;
   $('status-model').textContent = modelLabel();
+  // 模型选择与标签恢复共用此入口，立即同步当前大脑，避免显示上一模型余额。
+  api.reportAccountQuota(currentBrainQuotaSnapshot());
 }
 
 function persistSession() {
@@ -5473,6 +5495,7 @@ function openSettings() {
     <label>${t('networkProxy')}</label>
     <input id="m-proxy" placeholder="${t('networkProxyPh')}" value="${escapeHtml(state.proxy || '')}" />
     <p class="hint">${t('networkProxyHint')}</p>
+    ${imageSettingsHtml(state.localImageGeneration)}
     <h3 style="margin-top:16px">${t('commandSandbox')}</h3>
     <p class="hint">${t('commandSandboxHint')}</p>
     <label class="check-row"><input type="checkbox" id="m-sandbox-on" ${state.commandSandbox?.enabled !== false ? 'checked' : ''} /> ${t('commandSandboxEnable')}</label>
@@ -5574,6 +5597,7 @@ function openSettings() {
     </div>`);
   $('modal-card').classList.add('wide');
   $('modal-card').classList.add('settings-modal');
+  bindImageSettings($('modal-card'), state.localImageGeneration);
 
   api.indexStatus().then(paintIndexCard).catch(() => paintIndexCard(null));
   const idxSync = $('idx-sync');
@@ -6089,6 +6113,7 @@ function openSettings() {
     try {
       // $ 按 ID 查找，不接受带 # 的选择器。先读取完整表单，读取失败时不写入任何设置。
       const caps = readCapFromContainer(capBox, capDraft);
+      const imageGeneration = readImageSettings($('modal-card'));
       const lines = ($('m-sites')?.value || '').split(/\r?\n/);
       state.searchSites = await api.saveSearchSites(lines);
       state.proxy = ($('m-proxy')?.value || '').trim();
@@ -6097,6 +6122,7 @@ function openSettings() {
         enabled: !!$('m-sandbox-on')?.checked,
         timeoutSec: Number($('m-sandbox-timeout')?.value) || 60
       });
+      state.localImageGeneration = await api.saveLocalImageGeneration(imageGeneration);
       state.maxAgentRounds = await api.saveMaxAgentRounds($('m-agent-rounds')?.value);
       syncRoundsInput(activeSession());
       // 先保存模型清单，再保存引用这些模型 ID 的能力槽位，确保最终持久化的是刚选择的配置。
@@ -8075,6 +8101,7 @@ api.onIndexProgress(paintIndexCard);
     aliveBtn.setAttribute('aria-pressed', state.desktopAlive ? 'true' : 'false');
   }
   state.capabilityDefaults = s.capabilityDefaults || {};
+  state.localImageGeneration = s.localImageGeneration || {};
   state.assemblies = s.assemblies || {};
   state.assemblyKey = s.assemblyKey || '';
   state.localFiles = s.localFiles || [];
