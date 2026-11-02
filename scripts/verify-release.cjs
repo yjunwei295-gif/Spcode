@@ -111,7 +111,11 @@ async function main() {
   const petCode = '(function(){const x=document.getElementById("pet-glasses-offset-x"),y=document.getElementById("pet-glasses-offset-y");return {inspect:typeof window.desktopPetInspect,x:!!x,y:!!y,balance:!!document.getElementById("pet-balance"),lines:getComputedStyle(document.getElementById("pet-label")).webkitLineClamp};})()';
   const pet = await evaluate('(async function(){const e=' + electron + ';const w=e.BrowserWindow.getAllWindows().find(function(w){return w.webContents.getURL().includes("/float-bar.html");});return w.webContents.executeJavaScript(' + JSON.stringify(petCode) + ');})()');
   check(pet.inspect === 'function' && pet.x && pet.y && pet.balance && pet.lines === '3', '实际 EXE 桌宠具有 X/Y 控件、余额及三行正文布局');
-  fs.writeFileSync(path.join(output, 'results.json'), JSON.stringify({ version, files, checks, state, page, pet }, null, 2), 'utf8');
+  // 通过真实打包 preload 和主进程 IPC 开启再停止测试任务；长间隔确保不调用任何模型。
+  const longAliveCode = '(async function(){const api=window.simple;const tabId="release-verification";await api.longAliveBind({tabId,workspace:' + JSON.stringify(root) + '});const started=await api.longAliveStart({tabId,goal:"仅核对发布 IPC，不执行外部任务",intervalSeconds:86400,timeoutSeconds:60});const stopped=await api.longAliveStop();const status=await api.longAliveStatus();return {button:!!document.getElementById("btn-long-alive"),started:started.enabled,stopped:!stopped.enabled,active:status.task.active,memory:status.memory.rss>0};})()';
+  const longAlive = await evaluate('(async function(){const e=' + electron + ';const w=e.BrowserWindow.getAllWindows().find(function(w){return w.webContents.getURL().includes("/index.html");});return w.webContents.executeJavaScript(' + JSON.stringify(longAliveCode) + ');})()');
+  check(longAlive.button && longAlive.started && longAlive.stopped && !longAlive.active && longAlive.memory, '实际 EXE 长时入口、启停和内存状态 IPC 可用，未调用模型');
+  fs.writeFileSync(path.join(output, 'results.json'), JSON.stringify({ version, files, checks, state, page, pet, longAlive }, null, 2), 'utf8');
   console.log('RESULT ' + JSON.stringify({ output, checks: checks.length, files }));
   await evaluate('(function(){' + electron + '.app.quit();return true;})()');
   socket.close();

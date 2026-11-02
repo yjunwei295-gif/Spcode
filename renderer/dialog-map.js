@@ -45,6 +45,7 @@
 
   /**
    * opts: { title, rounds: [{ n, title, indexTitle, indexSummary, userText, asstText, skip }], onApply({ skipSet, removeSet }), onPreview }
+   * preserveRecords 用于长时归档：只筛选上下文，不显示删除入口；onOlder 按需加载更早一页。
    */
   function open(opts) {
     close();
@@ -76,6 +77,13 @@
     const filterBtn = el('button', { textContent: text('筛选', 'Filter') });
     filterBtn.style.cssText = btnCss;
     right.appendChild(filterBtn);
+    // 长时归档按页加载，关闭当前图后才读取更早一页，避免累计页面对象。
+    if (opts.onOlder) {
+      const older = el('button', { textContent: text('更早记录', 'Older records') });
+      older.style.cssText = btnCss;
+      older.onclick = function openOlder() { close(); opts.onOlder(); };
+      right.appendChild(older);
+    }
     const x = el('button', { textContent: '×' });
     x.style.cssText = 'border:0;background:none;font-size:20px;cursor:pointer;color:var(--muted);';
     x.onclick = close;
@@ -145,7 +153,7 @@
       del.style.cssText = btnCss;
       del.onclick = () => { hidePopover(); removeRounds([r.n]); };
       btns.appendChild(t);
-      btns.appendChild(del);
+      if (!opts.preserveRecords) btns.appendChild(del);
       popover.appendChild(h);
       popover.appendChild(sent);
       popover.appendChild(label);
@@ -176,7 +184,7 @@
       for (const n of removeSet) pendingRemove.delete(n);
       refreshAll();
       return true;
-    }, removeRounds, refreshTree);
+    }, removeRounds, refreshTree, opts.preserveRecords);
     body.appendChild(panel.node);
     filterBtn.onclick = () => {
       panel.node.style.display = panel.node.style.display === 'none' ? 'flex' : 'none';
@@ -185,12 +193,13 @@
   }
 
   // 筛选列表：勾选 = 塞给 AI；按住拖选；可多选后点「删除所选」。全选 / 清空只作用于当前筛选看得到的轮次
-  function buildFilterPanel(rounds, on, onChange, onApply, onRemove, onTree) {
+  function buildFilterPanel(rounds, on, onChange, onApply, onRemove, onTree, preserveRecords) {
     const node = el('div', { className: 'dialog-map-filter' });
     node.style.cssText = 'position:absolute;top:0;right:0;width:300px;height:100%;background:var(--panel-solid);border-left:1px solid var(--border);'
       + 'display:flex;flex-direction:column;z-index:3;box-shadow:var(--shadow);';
     const hint = el('div', { textContent: text('勾选的轮次塞给 AI，没勾的不发。按住左键拖过列表可连续勾选/取消。可多选后点「删除所选」同时删除对应聊天记录和上下文。取消勾选仅不发给 AI，聊天仍保留。点「应用」才保存；不点应用直接关掉就不改。', 'Checked rounds are sent to AI; unchecked rounds are omitted. Hold the left mouse button and drag across the list to check or uncheck multiple rounds. Choose “Delete selected” to delete the matching chat history and context. Unchecking only excludes a round from AI context and keeps the chat. Changes are saved only when you click “Apply”; closing without applying discards them.') });
     hint.style.cssText = 'padding:8px 10px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);line-height:1.5;';
+    if (preserveRecords) hint.textContent = text('勾选后点应用，决定后续自动轮次使用哪些上下文。原始归档不删除；每页 20 轮，最多选用 20 轮，长回复预览取末尾 6000 字。', 'Apply checked rounds to future automatic tasks. Archives are preserved; pages and selected context are limited to 20 rounds, with up to 6000 trailing characters per response.');
     node.appendChild(hint);
 
     const bar = el('div');
@@ -225,7 +234,7 @@
     apply.style.cssText = 'margin-left:auto;border:1px solid var(--border);background:var(--primary-bg);color:var(--primary-fg);border-radius:var(--sub-r);padding:3px 10px;cursor:pointer;font-size:12px;';
     bar.appendChild(selAll);
     bar.appendChild(clearAll);
-    bar.appendChild(delSel);
+    if (!preserveRecords) bar.appendChild(delSel);
     bar.appendChild(apply);
     node.appendChild(bar);
 
@@ -309,7 +318,7 @@
         lab.appendChild(rowText);
         lab.appendChild(tag);
         row.appendChild(lab);
-        row.appendChild(del);
+        if (!preserveRecords) row.appendChild(del);
         list.appendChild(row);
       }
       list.scrollTop = keep;

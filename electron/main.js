@@ -200,6 +200,19 @@ function sessionDir() {
   return path.join(app.getPath('userData'), 'sessions');
 }
 
+/** 长时存活复用既有会话入口；资源只属于绑定窗口，桌面任务全局串行。 */
+const longAliveHost = require('./lib/long-alive-host').registerLongAlive({
+  app, ipcMain, getWin, send: sendTo, abort: handleChatAbort,
+  activeTab: function activeTab(win) { return lastTabIdByWin.get(win); },
+  workspace: function workspace(win) { return workspaceByWin.get(win); },
+  busy: function busy() {
+    if (desktopHand.isBusy()) return true;
+    for (const turns of runningByWin.values()) if (turns.size) return true;
+    return false;
+  },
+  turnTab: function turnTab(turnId) { return turnOwner.get(turnId)?.tabId; }
+});
+
 function sendTo(win, channel, data) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, data);
 }
@@ -505,6 +518,7 @@ function createWindow() {
   workspaceByWin.set(win, '');
   win.on('closed', () => {
     diag.log('window', '窗口已关闭');
+    longAliveHost.release(win);
     if (screenWatchOwner && screenWatchOwner.win === win) stopScreenRequests();
     stopWorkspaceWatch(win);
     windows.delete(win);
@@ -527,7 +541,12 @@ function createWindow() {
   });
   win.on('unresponsive', () => diag.log('window', '窗口无响应'));
   win.on('responsive', () => diag.log('window', '窗口恢复响应'));
-  win.webContents.on('render-process-gone', (_e, details) => diag.log('crash', '渲染进程退出', details));
+  win.webContents.on('render-process-gone', function rendererGone(_e, details) {
+    longAliveHost.release(win);
+    diag.log('crash', '渲染进程退出', details);
+  });
+  // 真实页面重载前释放旧调度；恢复页面后由绑定入口重新加载配置。
+  win.webContents.on('did-start-loading', function releaseLongAlive() { longAliveHost.release(win); });
   win.webContents.on('preload-error', (_e, preloadPath, error) => {
     diag.log('crash', 'preload 出错', { preloadPath, message: error && error.message });
   });
@@ -668,6 +687,7 @@ process.on('exit', (code) => diag.log('app', '主进程退出', { code }));
 app.on('child-process-gone', (_e, details) => diag.log('crash', '子进程退出', details));
 app.on('before-quit', () => {
   diag.log('app', '收到退出请求 before-quit');
+  longAliveHost.dispose();
   downloader.cancelAll();
   try { visionEngine.stop(); } catch { /* 退出时忽略 */ }
 });
@@ -2550,6 +2570,7 @@ ipcMain.handle('sessions:rename', (_e, { id, title }) => {
 
 // 主窗按钮与悬浮栏「停止」共用这一份中断逻辑
 function handleChatAbort(win, turnId) {
+  longAliveHost.stopForAbort(win, turnId);
   const id = String(turnId || '');
   const asks = pendingAskMap(win);
   const aborts = abortMap(win);
@@ -2646,6 +2667,9 @@ ipcMain.handle('chat:promptPreview', (e, payload) => {
 
 ipcMain.handle('chat:send', async (e, payload) => {
   const win = getWin(e);
+  if (payload.longAliveRunId && !longAliveHost.authorize(win, payload.longAliveRunId, payload.turnId)) {
+    throw new Error('长时存活已停止，本轮未执行');
+  }
   const ws = String(payload?.workspace || workspaceByWin.get(win) || '');
   const s = store.load();
   const modelCfg = store.resolveModelCfg(payload.modelId || s.currentModelId, s);

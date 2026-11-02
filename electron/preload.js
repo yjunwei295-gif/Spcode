@@ -12,6 +12,27 @@ contextBridge.exposeInMainWorld('desktopPet', {
 
 const api = {
   getState: () => ipcRenderer.invoke('app:state'),
+  /** 长时存活的配置、执行确认和结束回执，全部按发送者窗口路由。 */
+  longAliveBind: function longAliveBind(payload) { return ipcRenderer.invoke('long-alive:bind', payload); },
+  longAliveStart: function longAliveStart(payload) { return ipcRenderer.invoke('long-alive:start', payload); },
+  longAliveStop: function longAliveStop() { return ipcRenderer.invoke('long-alive:stop'); },
+  longAliveAccept: function longAliveAccept(payload) { return ipcRenderer.invoke('long-alive:accept', payload); },
+  longAliveFinish: function longAliveFinish(payload) { return ipcRenderer.invoke('long-alive:finish', payload); },
+  longAliveStatus: function longAliveStatus() { return ipcRenderer.invoke('long-alive:status'); },
+  /** 归档按页读取，上下文导图的勾选立即用于后续自动轮次。 */
+  longAliveRecords: function longAliveRecords(before) { return ipcRenderer.invoke('long-alive:records', before); },
+  longAliveContext: function longAliveContext(rows) { return ipcRenderer.invoke('long-alive:context', rows); },
+  /** 每种事件仅注册一次；返回取消订阅函数，页面卸载时移除监听。 */
+  onLongAliveTask: function onLongAliveTask(callback) {
+    function receive(_event, payload) { callback(payload); }
+    ipcRenderer.on('long-alive:task', receive);
+    return function unsubscribe() { ipcRenderer.removeListener('long-alive:task', receive); };
+  },
+  onLongAliveState: function onLongAliveState(callback) {
+    function receive(_event, payload) { callback(payload); }
+    ipcRenderer.on('long-alive:state', receive);
+    return function unsubscribe() { ipcRenderer.removeListener('long-alive:state', receive); };
+  },
   /** 完成或跳过引导时持久化标记，避免依赖浏览器本地存储。 */
   completeOnboarding: function completeOnboarding() { return ipcRenderer.invoke('app:completeOnboarding'); },
   setTheme: (theme) => ipcRenderer.invoke('app:theme', theme),

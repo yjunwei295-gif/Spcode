@@ -13,6 +13,11 @@ function isApiCfg(modelCfg) {
   return !!(modelCfg && modelCfg.baseUrl && modelCfg.model);
 }
 
+/** 判断是否为 MXAPI 的 Nano 直接生图端点；该接口只接收 prompt，不走 OpenAI images/generations 路径。 */
+function isMxApiNano(modelCfg) {
+  return /(^|\/)api\/v2\/nano(?:\/?$)/i.test(String(modelCfg?.baseUrl || '').replace(/\/$/, ''));
+}
+
 function localGenHint(roleName) {
   if (roleName === '生图') {
     return '未找到可用的本地生图模型。请把 Qwen-Image / FLUX / SD 等 .gguf 下载到模型目录，并在「文件 → 模型组合」挂到生图槽位；首次运行会自动下载生图引擎与配套文件。';
@@ -24,7 +29,9 @@ function localGenHint(roleName) {
  * 向兼容接口 POST JSON，失败返回 { status, text }，成功返回解析后的对象
  */
 async function postJson(modelCfg, relPath, body, signal) {
-  const url = `${String(modelCfg.baseUrl).replace(/\/$/, '')}/${String(relPath).replace(/^\//, '')}`;
+  const baseUrl = String(modelCfg.baseUrl).replace(/\/$/, '');
+  const pathPart = String(relPath || '').replace(/^\//, '');
+  const url = pathPart ? `${baseUrl}/${pathPart}` : baseUrl;
   const headers = { 'Content-Type': 'application/json' };
   if (modelCfg.apiKey) headers.Authorization = `Bearer ${modelCfg.apiKey}`;
   const ctl = new AbortController();
@@ -45,6 +52,50 @@ async function postJson(modelCfg, relPath, body, signal) {
     let json = null;
     try { json = text ? JSON.parse(text) : {}; } catch { json = null; }
     return { ok: res.ok, status: res.status, url, text, json };
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
+}
+
+/** 查询 MXAPI Nano 异步任务；状态完成后下载结果图片，失败或超时直接报告原因。 */
+async function waitMxApiNano(modelCfg, taskId, signal) {
+  const baseUrl = String(modelCfg.baseUrl).replace(/\/$/, '');
+  const ctl = new AbortController();
+  const onAbort = () => ctl.abort();
+  if (signal) {
+    if (signal.aborted) ctl.abort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  const timer = setTimeout(() => ctl.abort(), 8 * 60 * 1000);
+  try {
+    const deadline = Date.now() + 8 * 60 * 1000;
+    while (Date.now() < deadline) {
+      const res = await httpFetch(`${baseUrl}/task?task_id=${encodeURIComponent(taskId)}`, {
+        method: 'GET',
+        headers: modelCfg.apiKey ? { Authorization: `Bearer ${modelCfg.apiKey}` } : {},
+        signal: ctl.signal
+      });
+      const text = await res.text();
+      let json = null;
+      try { json = text ? JSON.parse(text) : {}; } catch { json = null; }
+      if (!res.ok) throw new Error(errText({ status: res.status, text, json }));
+      const data = json?.data || {};
+      if (data.status === 'failed') throw new Error(data.error_msg || 'MXAPI Nano 生图任务失败');
+      if (data.status === 'completed') {
+        const result = data.result || {};
+        const fileUrl = firstString(
+          Array.isArray(result.images) ? result.images[0] : '',
+          Array.isArray(result.proxy_images) ? result.proxy_images[0] : '',
+          result.url,
+          result.image_url
+        );
+        if (!fileUrl) throw new Error('MXAPI Nano 已完成但没有返回图片地址');
+        return fromUrl(fileUrl, '.png', signal);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    throw new Error('MXAPI Nano 生图任务等待超时');
   } finally {
     clearTimeout(timer);
     if (signal) signal.removeEventListener('abort', onAbort);
@@ -184,6 +235,16 @@ async function generateMedia({ role, modelCfg, prompt, signal, modelsDir, onWait
   }
   const text = String(prompt || '').trim() || 'a simple scene';
   if (role === 'imageGen') {
+    if (isMxApiNano(modelCfg)) {
+      // MXAPI Nano 先返回 task_id，再轮询 /task 直到结果图片可下载。
+      const hit = await postJson(modelCfg, '', { prompt: text }, signal);
+      if (!hit.ok || !hit.json) throw new Error(errText(hit));
+      const taskId = hit.json?.data?.task_id;
+      if (taskId) return waitMxApiNano(modelCfg, taskId, signal);
+      const direct = await extractAsset(hit.json, '.png', signal);
+      if (direct?.buf?.length) return direct;
+      throw new Error('MXAPI Nano 没有返回任务 ID 或图片');
+    }
     const bodies = [
       {
         model: modelCfg.model,

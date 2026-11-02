@@ -36,6 +36,7 @@
    *   map: { nodes:[{ id, desc, status, file, reason }], edges },
    *   emptyText?: 非空时进入「只显示说明」的空态：不建 canvas / 图例 / 侧栏，body 只放一段居中说明,
    *   workspace, tabId,
+   *   readOnly?: 长期目标等只读图隐藏源码方案删除；heading/requirementLabel 调整对应标题，省略时保持方案图行为。
    *   onCleared?: 「清理导图」成功后的回调（弹窗已关闭时调用），由调用方刷新入口或清掉当前导图状态
    * }
    * 空态与正常模式共用同一个弹窗、标题、× 关闭、点遮罩关闭和 Esc 关闭，只有内容区不同。
@@ -56,7 +57,7 @@
       + 'border-radius:var(--sub-r-lg);display:flex;flex-direction:column;overflow:hidden;box-shadow:var(--shadow);';
     const head = el('div');
     head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 14px;border-bottom:1px solid var(--border);';
-    const title = el('span', { textContent: `方案导图 · ${opts.title || ''}` });
+    const title = el('span', { textContent: `${opts.heading || '方案导图'} · ${opts.title || ''}` });
     title.style.cssText = 'font-size:14px;font-weight:600;';
     const x = el('button', { textContent: '×' });
     x.style.cssText = 'border:0;background:none;font-size:20px;cursor:pointer;color:var(--muted);';
@@ -68,7 +69,8 @@
       const clearBtn = el('button', { textContent: '清理导图', title: '清空本标签页的方案正文、方案锁与导图数据' });
       clearBtn.style.cssText = btnCss;
       clearBtn.onclick = clearAll;
-      head.appendChild(clearBtn);
+      // 长期任务复用绘制和详情，禁止把只读目标图的操作路由到源码方案删除。
+      if (!opts.readOnly) head.appendChild(clearBtn);
       const legend = el('div');
       legend.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;font-size:11px;color:var(--muted);margin-left:auto;';
       for (const [name, color] of Object.entries(STATUS_COLOR)) {
@@ -129,7 +131,7 @@
       popover.appendChild(heading);
       for (const [label, value] of [
         ['状态', n.status], ['文件', n.file], ['方法', n.method],
-        ['改动要求', n.requirement], ['现状原文', n.before], ['目标内容', n.after],
+        [opts.requirementLabel || '改动要求', n.requirement], ['现状原文', n.before], ['目标内容', n.after],
         ['验证方式', n.verify], ['公共约束与说明', n.keep],
         ['核对说明', n.reason], ['验收结果', n.verdict]
       ]) {
@@ -207,7 +209,7 @@
           + 'line-height:1;font-size:14px;cursor:pointer;color:var(--muted);flex:none;padding:0;';
         del.onclick = (e) => { e.stopPropagation(); removeItem(n); };
         top.appendChild(t);
-        top.appendChild(del);
+        if (!opts.readOnly) top.appendChild(del);
         const s = el('div', { textContent: `${n.status || ''}${n.reason ? ' · ' + n.reason : ''}` });
         s.style.cssText = 'color:var(--muted);';
         row.appendChild(top);

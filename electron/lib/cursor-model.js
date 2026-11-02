@@ -14,6 +14,8 @@ const modelParameterPending = new Map();
 const MODEL_PARAMETER_CACHE_MS = 5 * 60 * 1000;
 // Cursor 按网络出口地区拒绝某些模型厂商；SDK 没有专门的错误码，只能认错误原文
 const REGION_BLOCK_RE = /not supported in your region|not available in your region|cursor\.com\/docs\/account\/regions/i;
+// 新用量池挂在 Pro 上。SDK 把免费账号的本地会话也判成 Cloud Agent，原文里没有单独错误码
+const PLAN_REQUIRED_RE = /plan_required|not available for free users|upgrade to Pro/i;
 // 套餐用量走 Cursor 后台的非公开接口（SDK 没有账号额度接口），改版后会失效，失效时显示额度未知
 const USAGE_URL = 'https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage';
 const USAGE_CACHE_MS = 30 * 1000;
@@ -109,17 +111,56 @@ function cursorStateDb() {
 }
 
 /** 只读取本机 Cursor 编辑器的登录令牌，只留在内存里，不落盘、不写日志 */
-function readEditorToken() {
+function readCursorState(key) {
   const file = cursorStateDb();
   if (!fs.existsSync(file)) return '';
   const { DatabaseSync } = require('node:sqlite');
   const db = new DatabaseSync(file, { readOnly: true });
   try {
-    const row = db.prepare("SELECT value FROM ItemTable WHERE key = 'cursorAuth/accessToken'").get();
+    const row = db.prepare('SELECT value FROM ItemTable WHERE key = ?').get(key);
     return row ? String(row.value || '').trim() : '';
   } finally {
     db.close();
   }
+}
+
+function readEditorToken() {
+  return readCursorState('cursorAuth/accessToken');
+}
+
+/** 编辑器里已登录的账号。新用量池在这个 Pro 账号上，不读令牌 */
+function editorAccountEmail() {
+  return readCursorState('cursorAuth/cachedEmail');
+}
+
+function isPlanRequired(message) {
+  return PLAN_REQUIRED_RE.test(String(message || ''));
+}
+
+function poolAccountError({ sdkEmail = '', editorEmail = '', hasApiKey = false, opened = false } = {}) {
+  const editor = editorEmail || editorAccountEmail();
+  const target = editor ? `「${editor}」` : 'Cursor 编辑器里已开通 Pro 的账号';
+  const text = hasApiKey
+    ? `Cursor 服务商里填的 Key 没有 Pro，用不上新的用量池。请换成 ${target} 的 Key。`
+    : `Cursor 直通登录的是${sdkEmail ? `「${sdkEmail}」` : '当前账号'}，这个账号没有 Pro，用不上新的用量池。${opened ? '浏览器已打开，' : ''}请改登 ${target}，登完后再发一次。`;
+  const err = new Error(text);
+  err.code = 'cursor_plan_required';
+  return err;
+}
+
+let reloginPromise = null;
+/** 退出当前 SDK 登录并打开浏览器。同一时间只进行一次，凭据仍只写在 SDK 自己的登录文件里 */
+function beginRelogin() {
+  if (reloginPromise) return reloginPromise;
+  const { Cursor } = sdk();
+  reloginPromise = (async () => {
+    try { await Cursor.auth.logout(); } catch { /* 本来就没登录 */ }
+    return Cursor.auth.login({
+      apiKeyName: 'SpCode',
+      openBrowser: (url) => require('electron').shell.openExternal(url)
+    });
+  })().finally(() => { reloginPromise = null; });
+  return reloginPromise;
 }
 
 /** 本计费周期剩余百分比，口径同 Cursor 设置页：已用 ÷ 套餐上限 */
@@ -191,8 +232,17 @@ function localOptions(cwd, extra) {
 // 没填 Key 时用 SDK 浏览器登录，凭据由 SDK 存在 ~/.cursor/sdk/auth.json
 async function ensureLogin(modelCfg) {
   if (apiKeyOf(modelCfg)) return;
+  if (reloginPromise) await reloginPromise;
   const { Cursor } = sdk();
   const st = await Cursor.auth.status();
+  const editorEmail = editorAccountEmail();
+  const sdkEmail = st.status === 'logged-in' ? String(st.email || '') : '';
+  // 直通账号和编辑器 Pro 不是同一个时，新用量池不在这个登录上
+  if (st.status === 'logged-in' && editorEmail && sdkEmail && sdkEmail.toLowerCase() !== editorEmail.toLowerCase()) {
+    require('./diag').log('cursor', '直通账号和编辑器 Pro 不是同一个，打开改登', { sdkEmail, editorEmail });
+    beginRelogin();
+    throw poolAccountError({ sdkEmail, editorEmail, opened: true });
+  }
   if (st.status === 'logged-in') return;
   await Cursor.auth.login({
     apiKeyName: 'SpCode',
@@ -417,6 +467,10 @@ async function complete({ modelCfg, messages, tools, onDelta, onReason, signal }
     if (!content && res.result) content = String(res.result);
     return { role: 'assistant', content, ...(reasoning ? { reasoning_content: reasoning } : {}) };
   } catch (e) {
+    if (isPlanRequired(e?.message) || e?.code === 'cursor_plan_required') {
+      if (!apiKeyOf(modelCfg)) beginRelogin();
+      throw e?.code === 'cursor_plan_required' ? e : poolAccountError({ hasApiKey: !!apiKeyOf(modelCfg), opened: !apiKeyOf(modelCfg) });
+    }
     throw regionError(modelCfg.model, e?.message) || e;
   } finally {
     clearTimeout(idleTimer);
@@ -472,5 +526,5 @@ function warmUp(modelCfg) {
 module.exports = {
   CURSOR_PROTOCOL, CURSOR_BASE_URL, complete, listModels, ensureLogin, flatten, warmUp,
   sdk, apiKeyOf, localOptions, sandboxDir, releaseAgent, highModelSelection,
-  regionError, runError, fetchUsageBalance
+  regionError, runError, fetchUsageBalance, isPlanRequired, poolAccountError, beginRelogin
 };

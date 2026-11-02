@@ -261,6 +261,12 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, syst
           closeSession(key);
           throw blocked;
         }
+        if (e.code === 'cursor_plan_required' || cursorModel.isPlanRequired(e.message)) {
+          const hasApiKey = !!cursorModel.apiKeyOf(modelCfg);
+          if (!hasApiKey) cursorModel.beginRelogin();
+          closeSession(key);
+          throw e.code === 'cursor_plan_required' ? e : cursorModel.poolAccountError({ hasApiKey, opened: !hasApiKey });
+        }
         if (transient(e.message) && networkRetries < 2) {
           networkRetries += 1;
           diag.log('cursor', 'Cursor 直通连接中断，同一会话重试', { attempt, message: e.message });

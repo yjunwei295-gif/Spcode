@@ -24,7 +24,8 @@ function loadProtocol(fetcher) {
     if (name === './http-fetch') return { httpFetch: fetcher };
     if (name === './wallet') return { parseTokenUsage };
     if (name === './tool-xml') return { looksLikeXmlTool, parseXmlToolCalls };
-    if (name === './cursor-model' || name === './codex-model') return {};
+    // 余额与 SSE 专项不启动 SDK；三种协议依赖均使用空替身。
+    if (name === './cursor-model' || name === './codex-model' || name === './claude-model') return {};
     throw new Error('未声明的依赖：' + name);
   }
   function parseTokenUsage() { return null; }

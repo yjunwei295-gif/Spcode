@@ -1515,6 +1515,7 @@ function applyTabContext(tab) {
   renderModelMenu();
   syncRoundsInput(tab);
   renderChips();
+  if (api.longAliveBind) bindLongAlive(tab);
 }
 
 async function applyTabWorkspace(tab) {
@@ -4049,12 +4050,16 @@ async function sendOne(tab, text, draft) {
     contextPaths: [...state.contextPaths],
     attachments: state.attachments.map((a) => ({ ...a }))
   };
+  // 自动轮次使用独立载荷，不消费手动草稿、附件、提示词覆盖或会话记忆。
+  const resident = draft.source === 'long-alive';
+  const background = resident || draft.source === 'screen';
   const atts = draft.attachments || [];
   const imageAtts = atts.filter((a) => a.preview);
   const otherAtts = atts.filter((a) => !a.preview);
   const userText = [text, ...(draft.contextPaths || []).map((p) => `@${p}`), ...otherAtts.map((a) => a.name)].filter(Boolean).join('\n');
   tab.messages.push({
     role: 'user',
+    longAlive: resident ? draft.runId : undefined,
     text: userText,
     // 仅跳过没有补充需求的专用开工操作，普通聊天里的“开始”保留为上下文。
     ctxSkip: userText.trim() === '/spcode-start' || (draft.action === 'start-work' && userText.trim() === '开始'),
@@ -4075,7 +4080,7 @@ async function sendOne(tab, text, draft) {
     if (r.asst) roundByMsg.set(r.asst, r);
   }
   // 带上轮次编号、不适用标记和索引：后台更早的轮次只发索引，不适用的整轮跳过
-  const history = tab.messages.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => {
+  const history = resident ? (draft.history || []) : tab.messages.filter((m) => !m.longAlive && (m.role === 'user' || m.role === 'assistant')).map((m) => {
     const r = roundByMsg.get(m);
     const landed = m.role === 'assistant' && Array.isArray(m.changes)
       ? m.changes.map((change) => `${change.action || '修改'} ${change.path || ''}`.trim()).filter(Boolean)
@@ -4090,12 +4095,13 @@ async function sendOne(tab, text, draft) {
       index: (r && r.asst && r.asst.dialogIndex) || undefined
     };
   });
-  history.pop();
-  const turnId = uid();
+  if (!resident) history.pop();
+  const turnId = draft.turnId || uid();
   const modelId = draft.modelId || tab.modelId || state.currentModelId;
   const skillIds = normalizeSkillIds(draft);
   const assistant = {
     role: 'assistant',
+    longAlive: resident ? draft.runId : undefined,
     text: '',
     changes: [],
     snapshotId: null,
@@ -4113,19 +4119,20 @@ async function sendOne(tab, text, draft) {
   // 预览面板里改过人设 / 规则正文 / 技能正文时，把覆盖值带上这一轮请求；
   // 没改过就是 null，payload 里连字段都不出现，行为与原来完全一致
   // 后台屏幕任务不消费用户为未发送消息准备的提示词覆盖。
-  const sysOverrides = draft.source === 'screen' ? null : (state.promptOverrides || null);
+  const sysOverrides = background ? null : (state.promptOverrides || null);
   const payload = {
     text,
     action: draft.action === 'start-work' ? 'start-work' : undefined,
     history,
-    contextRevision: tab.contextRevision || '',
+    contextRevision: resident ? draft.runId : (tab.contextRevision || ''),
     skillId: skillIds[0] || null,
     skillIds,
     contextPaths: [...(draft.contextPaths || [])],
     attachments: [...atts],
     modelId,
-    workingMemory: tab.workingMemory || emptyWorkingMemory(),
-    contextSummary: tab.contextSummary || '',
+    workingMemory: resident ? emptyWorkingMemory() : (tab.workingMemory || emptyWorkingMemory()),
+    contextSummary: resident ? '' : (tab.contextSummary || ''),
+    longAliveRunId: resident ? draft.runId : undefined,
     workspace: tab.workspace || state.workspace,
     extraFolders: [...extraFoldersOf(tab)],
     turnId,
@@ -4137,7 +4144,7 @@ async function sendOne(tab, text, draft) {
     tabId: String(tab.id || '')
   };
   // 自动接单和手动输入拥有不同的载荷；后台任务不得清空尚未提交的附件与引用。
-  if (draft.source !== 'screen') {
+  if (!background) {
     tab.context = {
       skillId: skillIds[0] || null,
       skillIds,
@@ -4146,7 +4153,7 @@ async function sendOne(tab, text, draft) {
     };
   }
   if (isActiveTab(tab)) {
-    if (draft.source !== 'screen') {
+    if (!background) {
       state.contextPaths = [];
       state.attachments = [];
     }
@@ -4166,10 +4173,11 @@ async function sendOne(tab, text, draft) {
   // 主窗真的开工了，主动把小窗切到本会话（active=true 才会抢绑定）
   if (api.floatBind) api.floatBind(String(tab.id || ''), String(tab.title || ''), true);
   let aborted = false;
+  let residentError = '';
   try {
     // 请求发出后立刻清空：预览面板的覆盖值只影响这一轮，下一轮仍按磁盘上的规则、人设、技能拼
     const sending = api.chatSend(payload);
-    if (draft.source !== 'screen') state.promptOverrides = null;
+    if (!background) state.promptOverrides = null;
     const result = await sending;
     if (isStopError(null, tab)) {
       if (isActiveTab(tab)) {
@@ -4177,7 +4185,7 @@ async function sendOne(tab, text, draft) {
         stopTypewriter();
       }
       finalizeStoppedTurn(assistant);
-      if (draft.source !== 'screen') restoreStoppedDraft(tab, assistant);
+      if (!background) restoreStoppedDraft(tab, assistant);
       aborted = true;
     } else {
       logSummaryTrace('收到总结最终结果', tab, assistant, { finalTextLength: String(result.text || '').length });
@@ -4191,9 +4199,11 @@ async function sendOne(tab, text, draft) {
       assistant.askPending = false;
       assistant.ask = null;
       revealRest(assistant);
-      if (result.workingMemory) tab.workingMemory = result.workingMemory;
-      if (result.contextSummary != null) tab.contextSummary = result.contextSummary;
-      fillDialogIndex(tab, assistant, modelId);
+      if (!resident) {
+        if (result.workingMemory) tab.workingMemory = result.workingMemory;
+        if (result.contextSummary != null) tab.contextSummary = result.contextSummary;
+        fillDialogIndex(tab, assistant, modelId);
+      }
     }
   } catch (e) {
     if (isStopError(e, tab)) {
@@ -4202,9 +4212,10 @@ async function sendOne(tab, text, draft) {
         stopTypewriter();
       }
       finalizeStoppedTurn(assistant);
-      if (draft.source !== 'screen') restoreStoppedDraft(tab, assistant);
+      if (!background) restoreStoppedDraft(tab, assistant);
       aborted = true;
     } else {
+      residentError = String(e.message || e);
       markTurnFailed(assistant, e);
       finishTypewriter(assistant);
     }
@@ -4233,6 +4244,14 @@ async function sendOne(tab, text, draft) {
         state.milestones = state.workspace ? (await api.listMilestones()) : [];
       } catch { /* 忽略 */ }
       renderSidebar();
+    }
+    if (resident) {
+      // 完整结果落盘后才允许下一次心跳；失败保留在界面，不悄悄重试。
+      await api.longAliveFinish({
+        runId: draft.runId, text: assistant.text,
+        outcome: aborted ? 'stopped' : (residentError ? 'error' : 'success'),
+        error: residentError, messages: slimMessagesForSave(tab.messages.filter(isLongAliveMessage))
+      });
     }
     persistTab(tab);
   }
@@ -4605,6 +4624,233 @@ function stripContextSummary(text) {
     return (text.slice(0, idx) + tail.slice(nextHeading)).trimStart();
   }
   return text;
+}
+
+/** 判断自动轮次的消息；历史已在独立日志落盘，只保留最近一轮的界面对象。 */
+function isLongAliveMessage(message) { return !!message.longAlive; }
+
+/** 将当前任务状态覆盖到会话按钮和面板；不注册计时器，也不追加心跳消息。 */
+function showLongAliveState(task) {
+  if (!task) return;
+  for (const tab of state.tabs) {
+    if (tab.id === task.sessionId) tab.longAlive = task;
+  }
+  const tab = activeSession();
+  const current = tab && tab.longAlive;
+  const button = $('btn-long-alive');
+  if (button) {
+    button.classList.toggle('on', !!(current && current.enabled));
+    button.setAttribute('aria-pressed', String(!!(current && current.enabled)));
+    button.title = current && current.error ? current.error : '设置长期目标、心跳间隔和停止控制';
+  }
+  const status = $('long-alive-status');
+  if (status && status.dataset.tab === task.sessionId) {
+    status.textContent = longAliveStatusText(task);
+    $('long-alive-start').disabled = task.active;
+    $('long-alive-checkpoint').textContent = task.checkpoint;
+  }
+  const goalMap = $('plan-map-modal');
+  if (goalMap && goalMap.dataset.longAliveSession === task.sessionId) window.PlanMap.update(longAliveGoalMap(task));
+}
+
+/** 显示真实调度状态和下一次检查时间；等待空闲不会积压新任务。 */
+function longAliveStatusText(task) {
+  const names = { waiting: '等待检查', running: '执行中', stopping: '正在停止', paused: '已暂停' };
+  let text = (names[task.status] || task.status) + ' · 已完成 ' + task.completed + ' 轮';
+  if (task.nextAt) text += ' · 下次检查 ' + new Date(task.nextAt).toLocaleTimeString();
+  if (task.error) text += '\n' + task.error;
+  return text;
+}
+
+/** 恢复本会话调度；绑定失败在按钮显示，不冒充已经恢复。 */
+async function bindLongAlive(tab) {
+  if (!tab || !tab.workspace) return;
+  try {
+    const task = await api.longAliveBind({ tabId: tab.id, workspace: tab.workspace });
+    showLongAliveState(task);
+  } catch (error) {
+    const button = $('btn-long-alive');
+    if (button) button.title = error.message;
+    api.reportError('长时存活绑定失败', error.message);
+  }
+}
+
+/**
+ * 接收一轮长期任务并复用正常模型、工具、提问及停止链路。
+ * 仅空闲的目标会话接单；旧自动消息已存日志，移出界面以限制历史和 DOM 的增长。
+ */
+async function receiveLongAliveTask(task) {
+  let tab = null;
+  for (const candidate of state.tabs) if (candidate.id === task.sessionId) tab = candidate;
+  const turnId = uid();
+  if (!tab || !isActiveTab(tab) || tab.workspace !== task.workspace || tab.sending || tab.draining ||
+      tabQueue(tab).length || tab.refillFromIndex != null || !currentModel()) {
+    await api.longAliveFinish({ runId: task.runId, outcome: 'stopped', text: '', error: '目标会话不空闲或模型未配置，任务已暂停' });
+    return;
+  }
+  const accepted = await api.longAliveAccept({ runId: task.runId, turnId });
+  if (!accepted) return;
+  // 接收回执异步返回期间可能发生手动发送或切换会话，必须再核对当前状态。
+  if (!isActiveTab(tab) || tab.sending || tab.draining || tabQueue(tab).length) {
+    await api.longAliveFinish({ runId: task.runId, outcome: 'stopped', text: '', error: '会话状态已变化，任务已暂停' });
+    return;
+  }
+  const kept = [];
+  for (const message of tab.messages) if (!isLongAliveMessage(message)) kept.push(message);
+  tab.messages = kept;
+  const ids = normalizeSkillIds({ skillIds: tab.pickedSkillIds });
+  const checkpoint = task.omitCheckpoint ? '' : task.checkpointTruncated
+    ? '上轮进度仅保留末尾，完整记录请核对日志；不确定是否成功的操作不得直接重做。\n' + task.checkpoint
+    : task.checkpoint;
+  const text = '【长时存活·定时检查】\n当前时间：' + new Date().toISOString() +
+    '\n长期目标与授权范围：\n' + task.goal +
+    '\n上轮进度：\n' + (checkpoint || (task.omitCheckpoint ? '最近进度已在上下文导图中排除' : '尚无执行记录')) +
+    '\n检查目标当前进展，执行本次到期且属于授权范围的工作；没有到期工作可以直接结束。' +
+    '\n外部操作结果不确定时先核对，禁止直接重复发布或回复。结束时简明记录已完成、未完成与下次检查事项。';
+  const history = [];
+  for (const record of task.context || []) {
+    history.push({ role: 'user', content: record.userText, round: record.n });
+    history.push({ role: 'assistant', content: record.asstText, round: record.n,
+      index: { title: '长时存活 R' + record.n, summary: record.asstText.slice(0, 100) } });
+  }
+  tabQueue(tab).push({ text, history, source: 'long-alive', runId: task.runId, turnId,
+    modelId: tab.modelId || state.currentModelId, skillId: ids[0] || null,
+    skillIds: ids, contextPaths: [], attachments: [] });
+  renderQueue();
+  try {
+    await processQueue(tab);
+  } catch (error) {
+    await api.longAliveFinish({ runId: task.runId, outcome: 'error', text: '', error: error.message });
+    showLongAliveFailure(error);
+  }
+}
+
+/** 主进程投递回调的异步错误必须呈现在界面，不形成未处理的 Promise。 */
+function onLongAliveTask(task) { receiveLongAliveTask(task).catch(showLongAliveFailure); }
+/** 将持久化或执行失败保留为明确提示，禁止静默继续调度。 */
+function showLongAliveFailure(error) {
+  api.reportError('长时存活失败', String(error.message || error));
+  const status = $('long-alive-status');
+  if (status) status.textContent = '长时存活失败：' + String(error.message || error);
+  const button = $('btn-long-alive');
+  if (button) button.title = String(error.message || error);
+}
+
+/** 将任务快照转换为现有方案导图节点；原始目标完整保留在节点详情。 */
+function longAliveGoalMap(task) {
+  const nodes = [
+    { id: '需求', path: '需求', desc: '长期目标', requirement: task.goal },
+    { id: '长期目标', path: '长期目标', no: 1, title: '长期目标与授权范围', desc: task.goal,
+      requirement: task.goal, status: task.enabled ? '进行中' : '待核对' },
+    { id: '执行进度', path: '执行进度', no: 2, title: '最近执行进度', desc: longAliveStatusText(task),
+      requirement: task.checkpoint, reason: task.error, status: task.error ? '退回' : '待核对' },
+    { id: '心跳', path: '心跳', no: 3, title: '心跳调度', desc: longAliveStatusText(task),
+      requirement: '检查间隔 ' + task.intervalSeconds + ' 秒；单轮超时 ' + task.timeoutSeconds + ' 秒',
+      status: task.active ? '进行中' : '待核对' }
+  ];
+  return { nodes, edges: [{ from: '需求', to: '长期目标' },
+    { from: '长期目标', to: '执行进度' }, { from: '长期目标', to: '心跳' }] };
+}
+
+/** 使用现有方案导图展示长期目标，状态变化刷新当前图，不触发源码方案删除入口。 */
+function openLongAliveGoalMap() {
+  const tab = activeSession();
+  if (!tab || !tab.longAlive) return;
+  window.PlanMap.open({ title: tab.title, heading: '任务目标导图', requirementLabel: '目标与记录',
+    readOnly: true, map: longAliveGoalMap(tab.longAlive) });
+  $('plan-map-modal').dataset.longAliveSession = tab.id;
+}
+
+/** 按页复用现有上下文导图；勾选应用会改变后续请求，归档原文始终保留。 */
+async function openLongAliveContextMap(before) {
+  try {
+    const tab = activeSession();
+    const bound = tab && tab.longAlive;
+    if (!bound) return;
+    const page = await api.longAliveRecords(before);
+    if (activeSession() !== tab) return;
+    const selected = bound.context;
+    const selectedIds = new Set();
+    for (const record of selected || []) selectedIds.add(record.n);
+    const rounds = [];
+    for (const record of page.rows) {
+      rounds.push({ ...record, indexTitle: '长时存活 R' + record.n + ' · ' + record.outcome,
+        skip: !(selectedIds.has(record.n) || (record.n === bound.checkpointRound && !bound.omitCheckpoint)) });
+    }
+    /** 页内筛选与已选的其它页合并，主进程限制最多保留固定数量的上下文轮次。 */
+    async function applyContext(payload) {
+      if (activeSession() !== tab) throw new Error('会话已切换，请重新打开上下文导图');
+      if (payload.removeSet.size) throw new Error('归档记录只允许筛选，不删除原文');
+      const pageIds = new Set();
+      for (const row of page.rows) pageIds.add(row.n);
+      const kept = [];
+      for (const row of selected || []) if (!pageIds.has(row.n)) kept.push(row);
+      for (const row of page.rows) if (!payload.skipSet.has(row.n)) kept.push(row);
+      showLongAliveState(await api.longAliveContext(kept));
+      return true;
+    }
+    window.DialogMap.open({ title: '长时存活 · ' + tab.title, rounds, preserveRecords: true,
+      onApply: applyContext,
+      onOlder: page.before ? function older() { openLongAliveContextMap(page.before); } : null });
+  } catch (error) { showLongAliveFailure(error); }
+}
+
+/** 打开最新一页上下文，不把点击事件对象当作页码。 */
+function openLatestLongAliveContext() { openLongAliveContextMap(); }
+
+/** 打开本会话控制面板；只有点击开启才保存目标并发起定时任务。 */
+async function openLongAlive() {
+  const tab = activeSession();
+  if (!tab || !tab.workspace || !currentModel()) { alert('请先打开项目并选择模型'); return; }
+  try {
+    await persistTab(tab, true);
+    const task = await api.longAliveBind({ tabId: tab.id, workspace: tab.workspace });
+    if (task.sessionId !== tab.id) { alert('上一会话仍在停止，请稍后再打开'); return; }
+    const observed = await api.longAliveStatus();
+    showLongAliveState(task);
+    const mem = observed.memory;
+    const mb = 1048576;
+    openModal('<h3>长时存活（第一版）</h3>' +
+      '<p class="hint">仅在 SpCode 运行、电脑未休眠且目标会话空闲时检查。切换会话会暂停原任务；关闭窗口会停止。桌面操作还需开启 AGI。</p>' +
+      '<label>长期目标与允许执行的范围</label><textarea id="long-alive-goal" rows="5"></textarea>' +
+      '<label>检查间隔（秒）</label><input id="long-alive-interval" type="number" min="1" max="86400">' +
+      '<label>单轮超时（秒）</label><input id="long-alive-timeout" type="number" min="1" max="86400">' +
+      '<pre class="hint" id="long-alive-status"></pre>' +
+      '<p class="hint">主进程 RSS ' + Math.round(mem.rss / mb) + ' MB · 堆 ' + Math.round(mem.heapUsed / mb) +
+      ' MB · 外部内存 ' + Math.round(mem.external / mb) + ' MB · Electron 进程 ' + mem.processes.length + ' 个。点击刷新重新采样。</p>' +
+      '<p class="hint">自动轮次界面仅保留最近一轮，完整结果和消息记录保存在用户数据目录 long-alive 的 JSONL 日志中。普通对话不删除。</p>' +
+      '<div class="modal-actions"><button id="long-alive-goals">任务目标导图</button><button id="long-alive-context">上下文记录导图</button></div>' +
+      '<details><summary>最近进度</summary><pre id="long-alive-checkpoint"></pre></details>' +
+      '<div class="modal-actions"><button id="long-alive-refresh">刷新状态</button><button id="long-alive-stop">停止</button>' +
+      '<button class="primary" id="long-alive-start">保存并开启</button><button id="long-alive-close">关闭面板</button></div>');
+    $('long-alive-goal').value = task.goal;
+    $('long-alive-interval').value = task.intervalSeconds;
+    $('long-alive-timeout').value = task.timeoutSeconds;
+    $('long-alive-status').dataset.tab = tab.id;
+    $('long-alive-status').textContent = longAliveStatusText(task);
+    $('long-alive-checkpoint').textContent = task.checkpoint;
+    $('long-alive-start').disabled = task.active;
+    /** 开启只使用面板中明确填写的目标和参数；写入失败保持面板供修正。 */
+    async function startLongAlive() {
+      try {
+        if (activeSession() !== tab) throw new Error('请在目标会话重新打开面板');
+        const next = await api.longAliveStart({ tabId: tab.id, goal: $('long-alive-goal').value,
+          intervalSeconds: Number($('long-alive-interval').value), timeoutSeconds: Number($('long-alive-timeout').value) });
+        showLongAliveState(next);
+      } catch (error) { showLongAliveFailure(error); }
+    }
+    /** 停止包含当前自动轮次，不关闭用户的其它手动任务。 */
+    async function stopLongAlive() {
+      try { showLongAliveState(await api.longAliveStop()); }
+      catch (error) { showLongAliveFailure(error); }
+    }
+    $('long-alive-goals').onclick = openLongAliveGoalMap;
+    $('long-alive-context').onclick = openLatestLongAliveContext;
+    $('long-alive-start').onclick = startLongAlive;
+    $('long-alive-stop').onclick = stopLongAlive;
+    $('long-alive-refresh').onclick = openLongAlive;
+    $('long-alive-close').onclick = closeModal;
+  } catch (error) { showLongAliveFailure(error); alert(error.message); }
 }
 
 async function openContextPreview(turnId) {
@@ -7984,6 +8230,14 @@ function bind() {
 
 api.onChatEvent(onChatEvent);
 // 后台接单使用独立入口；主窗草稿和悬浮栏手动发送保持各自现有流程。
+if (api.onLongAliveTask) {
+  const unsubscribeTask = api.onLongAliveTask(onLongAliveTask);
+  const unsubscribeState = api.onLongAliveState(showLongAliveState);
+  /** 页面卸载后移除两条监听；调度和模型取消由主进程生命周期负责。 */
+  function releaseLongAliveListeners() { unsubscribeTask(); unsubscribeState(); }
+  window.addEventListener('beforeunload', releaseLongAliveListeners, { once: true });
+}
+$('btn-long-alive').addEventListener('click', openLongAlive);
 if (api.onScreenRequest) api.onScreenRequest(receiveScreenRequest);
 if (api.onScreenRequestStatus) api.onScreenRequestStatus(showScreenRequestStatus);
 // 悬浮栏里发的提示（主窗空闲时）落到这里：填进输入区后复用现有 send() 流程，不另起一套发送逻辑

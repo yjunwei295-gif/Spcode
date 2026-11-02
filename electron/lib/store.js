@@ -58,6 +58,10 @@ const PROVIDER_PRESETS = [
   { id: 'anthropic', name: 'Anthropic', protocol: 'anthropic', baseUrl: 'https://api.anthropic.com' },
   { id: 'gemini', name: 'Google Gemini', protocol: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta' },
   { id: 'bai', name: 'B.AI', protocol: 'openai', baseUrl: 'https://api.b.ai/v1' },
+  // MXAPI 聚合平台的 OpenAI 兼容入口：生图走 /v1/images/generations，模型名填 nano-banana / nano-banana-pro / gpt-image-2 等
+  { id: 'mxapi', name: 'MXAPI 生图', protocol: 'openai', baseUrl: 'https://open.mxapi.org/v1' },
+  // MXAPI 原生 Nano 异步端点：提交只收 prompt，先拿到 task_id，再轮询 /task 取图
+  { id: 'mxapi-nano', name: 'MXAPI Nano 异步生图', protocol: 'openai', baseUrl: 'https://open.mxapi.org/api/v2/nano' },
   // Cursor 走 SDK，不需要真实地址；Key 可空，空时测试连接会打开浏览器登录 Cursor
   { id: 'cursor', name: 'Cursor', protocol: 'cursor', baseUrl: 'cursor://sdk' },
   // Codex SDK 复用本机 Codex CLI 登录；也可在 API Key 中填写 OpenAI API Key
