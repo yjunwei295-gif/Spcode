@@ -63,7 +63,11 @@ async function open({workspace,manifest,owner,theme}){
   function denyPermission(_contents,_permission,callback){callback(false);}
   isolated.setPermissionRequestHandler(denyPermission);
   const view=new WebContentsView({webPreferences:{session:isolated,nodeIntegration:false,contextIsolation:true,sandbox:true,backgroundThrottling:false}});
-  /** 可见作品的网页链接交给系统浏览器，其余新窗继续保持原有拒绝策略。 */
+  /**
+   * 将可见作品的外部链接交给系统默认程序，并拒绝创建作品内置新窗。
+   * @param {{url:string}} details Electron 的新窗请求；details.url 用于判断协议并作为系统打开的原始地址。
+   * @returns {{action:'deny'}} 始终返回 deny；外部链接分流后与其他新窗请求均不创建内置窗口。
+   */
   function denyWindow(details){require('./external-links').openExternalPopup(details);return {action:'deny'};}
   view.webContents.setWindowOpenHandler(denyWindow);
   // 首帧提交后再设置透明背景，避免空白的透明子视图在显示前停止绘制。

@@ -7832,7 +7832,12 @@ function bind() {
     side.classList.toggle('hidden', !state.sidebar);
     if (!state.sidebar) focusComposer();
   };
-  /** 文件树普通点击按文件类型打开，Ctrl 点击仍只添加上下文引用。 */
+  /**
+   * 处理文件树点击，展开或折叠目录、移除附加目录，并按文件类型打开文件。
+   * @param {MouseEvent} e 文件树冒泡的点击事件；target 定位节点，ctrlKey 为 true 时文件只添加上下文引用。
+   * @returns {Promise<void>} 处理完成后兑现，无返回值；未捕获的文件启动或预览异常使 Promise 拒绝，DOM 事件派发不会等待此 Promise。
+   * 非节点点击不操作；目录读取失败沿用现有空列表处理，文件启动失败不回退到详情。
+   */
   $('tree-body').onclick = async function onTreeClick(e) {
     const rm = e.target.closest('[data-rm-folder]');
     if (rm) {
