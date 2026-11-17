@@ -1,6 +1,8 @@
 /* 桌宠呈现层：播放皮肤、透明像素命中与拖动，复用原小窗聊天和确认。 */
 (function () {
   'use strict';
+  var dialoguePage=new URLSearchParams(window.location.search).get('dialogue')==='1';
+  document.body.classList.toggle('pet-dialogue',dialoguePage);
   var bridge=window.desktopPet;
   var chat=window.floatBar;
   var canvas=document.getElementById('pet-canvas');
@@ -41,6 +43,10 @@
   var preview=document.getElementById('pet-preview');
   var errorEl=document.getElementById('pet-error');
   var current=null,model=null,skin=null,image=null,queue=[],drag=null,lastHit=null;
+  // 鼠标采样沿用动画循环；最多一个在途请求，主线程繁忙时不堆积 IPC。
+  var cursorPending=false,lastCursorSample=0;
+  // 初始化 IPC 尚未返回时保留最后一份界面推送，避免首次菜单与设置通知丢失。
+  var pendingView=null;
   var animationStart=0,lastState='',landingUntil=0,lastPaint=0,previewState='',generation=0;
   // 空闲保持站姿，所有呈现动作均来自工作状态或用户手动预览。
   var presentedState='idle';
@@ -55,8 +61,12 @@
   function showError(error) { errorEl.textContent=String(error.message||error);menu.hidden=false; }
   /** 界面配置跟随主进程，大小变化不会重建消息区或输入框。 */
   function view(data) {
-    if(!current)return; // 初始化响应之后会应用主进程当前形态。
+    if(!current){pendingView=data;return;}
+    var skinChanged=skin&&skin.id!==data.settings.skin;
     current.expanded=data.expanded;current.settings=data.settings;
+    previewState=data.preview;preview.value=previewState;
+    if(skinChanged)loadSkin().catch(showError);
+    if(dialoguePage&&data.menu) { menu.hidden=false;paintMenu(); }
     document.body.classList.toggle('pet-expanded',data.expanded);
     document.body.classList.toggle('pet-collapsed',!data.expanded);
     document.body.classList.toggle('pet-reduced-motion',data.settings.reducedMotion);
@@ -128,10 +138,8 @@
   /** 设置成功后更新外观；失败显示原因并保留输入内容。 */
   async function settings(patch) {
     errorEl.textContent='';
-    var oldSkin=current.settings.skin;
     current=await bridge.call('settings',patch);
     view(current);paintMenu();
-    if(oldSkin!==current.settings.skin)await loadSkin();
   }
   /** 事件先通过绑定与轮次过滤，再驱动动作，历史回灌不会重放庆祝。 */
   function event(ev) {
@@ -168,6 +176,10 @@
   function tick(now) {
     requestAnimationFrame(tick);
     if(!current||!image)return;
+    if(!document.hidden&&!drag&&!cursorPending&&now-lastCursorSample>=current.config.motion.hitTestIntervalMs){
+      lastCursorSample=now;
+      sampleCursorHit().catch(showError);
+    }
     model.select(now,false);
     var state=previewState||model.state;
     paintActivity(state);
@@ -210,8 +222,10 @@
     }else glasses.dataset.state='';
     // 气泡仅使用已筛选的思考与对话，全文可在展开面板阅读；工具只改变动作。
     var shown=previewState?('预览 · '+current.config.labels[state]):(model.detail&&String(model.detail).trim()?String(model.detail):current.config.labels[state]);
-    label.textContent=label.hidden?'':shown;
-    // 外侧正文按配置保留三行阅读并省略溢出；点击查看完整对话，脚下余额同时保留。
+    // 保留完整文本并滚到末尾，让流式内容的最新三行始终可见。
+    var nextText=label.hidden?'':shown;
+    if(label.textContent!==nextText){label.textContent=nextText;label.scrollTop=label.scrollHeight;}
+    // 点击独立对话窗口可阅读全文，气泡和脚下余额同时保留。
     label.title=label.hidden?'':'点击展开完整对话';
     canvas.setAttribute('aria-label',shown||current.config.labels[state]);
   }
@@ -226,6 +240,22 @@
     var x=Math.floor((e.clientX-b.left)*canvas.width/b.width),y=Math.floor((e.clientY-b.top)*canvas.height/b.height);
     return ctx.getImageData(x,y,1,1).data[3]>=current.config.motion.alphaThreshold;
   }
+  /**
+   * 限频读取鼠标位置并复用当前帧 Alpha 命中，穿透时也能重新进入角色。
+   * 每次等待上次采样及命中提交完成；无全局钩子，应用繁忙只延迟桌宠自身响应。
+   */
+  async function sampleCursorHit() {
+    cursorPending=true;
+    try {
+      var point=await bridge.call('cursor');
+      if(!point||drag)return;
+      point.target=document.elementFromPoint(point.clientX,point.clientY);
+      var inside=hit(point);
+      if(inside!==lastHit){lastHit=inside;await bridge.call('hit',inside);}
+    } finally {
+      cursorPending=false;
+    }
+  }
   /** 只在命中状态变化时通知主进程，避免每帧 IPC。 */
   function pointerMove(e) {
     if(!current)return;
@@ -238,7 +268,7 @@
     var inside=hit(e);
     if(inside!==lastHit){lastHit=inside;bridge.call('hit',inside).catch(showError);}
   }
-  /** 拖动仅从实际角色像素开始，短点击则展开原聊天。 */
+  /** 拖动仅从实际角色像素开始，角色点击不控制独立输入框。 */
   function pointerDown(e) {
     if(e.button!==0||e.target!==canvas||!hit(e))return;
     e.preventDefault();drag={x:e.screenX,y:e.screenY,moved:false};
@@ -252,21 +282,21 @@
     await bridge.call('drag',{phase:'end'});
     if(canvas.hasPointerCapture(e.pointerId))canvas.releasePointerCapture(e.pointerId);
     if(moved)landingUntil=performance.now()+current.config.motion.landingMs;
-    else await bridge.call('expand',!current.expanded);
   }
   /** 右键只打开换肤菜单，不改变会话绑定。 */
   async function openMenu(e) {
     if(e){e.preventDefault();if(!hit(e))return;}
-    await bridge.call('expand',true);menu.hidden=false;paintMenu();
+    if(!dialoguePage){await bridge.call('menu');return;}
+    menu.hidden=false;paintMenu();
   }
   /** 初始化过程中暂存推送，避免新页面漏掉刚开始的一轮。 */
   async function init() {
     current=await bridge.call('init');model=new window.DesktopPetState.Model(current.config);
-    view(current);paintMenu();await loadSkin();
+    view(pendingView||current);pendingView=null;paintMenu();await loadSkin();
     for(var i=0;i<queue.length;i++)event(queue[i]);
     queue=[];
     chat.bind('');
-    requestAnimationFrame(tick);
+    if(!dialoguePage)requestAnimationFrame(tick);
   }
   chat.onEvent(event);chat.onAsk(ask);bridge.onView(view);
   /** Ctrl 滚轮直接调整显示大小，脚底锚点和当前任务保持不变。 */
@@ -277,14 +307,19 @@
     var value=Math.max(current.config.layout.minScale,Math.min(current.config.layout.maxScale,Math.round((current.settings.scale+step)*100)/100));
     settings({scale:value}).catch(showError);
   },{passive:false});
-  document.addEventListener('pointermove',pointerMove);
+  if(!dialoguePage){
+    document.addEventListener('pointermove',pointerMove);
+    // 穿透时不订阅全局转发事件，由限频坐标采样恢复命中；正常命中仍走原生 pointermove。
+  }
   canvas.addEventListener('pointerdown',pointerDown);
   document.addEventListener('pointerup',function(e){pointerUp(e).catch(showError);});
   document.addEventListener('pointercancel',function(e){pointerUp(e).catch(showError);});
-  document.addEventListener('contextmenu',function(e){openMenu(e).catch(showError);});
-  document.addEventListener('mouseleave',function(){if(!drag){lastHit=false;bridge.call('hit',false).catch(showError);}});
-  label.addEventListener('click',function(){bridge.call('expand',!current.expanded).catch(showError);});
-  document.getElementById('pet-menu-close').addEventListener('click',function(){menu.hidden=true;previewState='';preview.value='';});
+  if(!dialoguePage){
+    document.addEventListener('contextmenu',function(e){openMenu(e).catch(showError);});
+    document.addEventListener('mouseleave',function(){if(!drag){lastHit=false;bridge.call('hit',false).catch(showError);}});
+  }
+  // 最新文字只负责展示，输入框显隐由自身收起按钮与全局快捷键控制。
+  document.getElementById('pet-menu-close').addEventListener('click',function(){menu.hidden=true;preview.value='';changePreview();});
   document.getElementById('pet-settings-open').addEventListener('click',function(){openMenu().catch(showError);});
   skinSelect.addEventListener('change',function(){settings({skin:skinSelect.value}).catch(showError);});
   document.getElementById('pet-scale').addEventListener('input',function(e){settings({scale:Number(e.target.value)}).catch(showError);});
@@ -299,7 +334,9 @@
   /** 拖动上下滑条实时保存图集像素偏移；不修改眼部锚点、角色图集或工作状态。 */
   function changeGlassesPosition(e) { settings({glassesOffsetY:Number(e.target.value)}).catch(showError); }
   document.getElementById('pet-glasses-offset-y').addEventListener('input',changeGlassesPosition);
-  preview.addEventListener('change',function(){previewState=preview.value;animationStart=performance.now();});
+  /** 菜单位于独立窗口，预览状态经宿主同步后由角色页播放。 */
+  function changePreview() { bridge.call('preview',preview.value).catch(showError); }
+  preview.addEventListener('change',changePreview);
   document.getElementById('pet-import').addEventListener('click',async function(){try{var result=await bridge.call('import');if(!result.cancelled){current=result;paintMenu();}}catch(error){showError(error);}});
   document.getElementById('pet-hide').addEventListener('click',function(){chat.hide();});
   // 供自动化核对实际页面状态与当前帧，不提供修改真实 AI 状态的接口。

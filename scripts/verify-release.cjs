@@ -1,6 +1,7 @@
 /**
  * 验证打包产物与当前源码一致，并启动真实 EXE 检查版本、IPC 与桌宠页面。
- * 用法：node scripts/verify-release.cjs；用户数据和结果仅写 generated 的独立测试目录。
+ * 用法：node scripts/verify-release.cjs [发布目录]；省略目录时检查 dist/win-unpacked。
+ * 用户数据和结果仅写 generated 的独立测试目录，指定目录用于核对隔离构建，不覆盖已有发布产物。
  * 调试端口由系统分配且仅监听本机；测试结束仅关闭本脚本创建的进程。
  */
 'use strict';
@@ -8,13 +9,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
-const asar = require('@electron/asar');
 const root = path.resolve(__dirname, '..');
 const version = require('../package.json').version;
 const output = fs.mkdtempSync(path.join(root, 'generated', 'release-' + version + '-'));
 const userData = path.join(output, 'user-data');
-const archive = path.join(root, 'dist', 'win-unpacked', 'resources', 'app.asar');
-const exe = path.join(root, 'dist', 'win-unpacked', 'SimpleCode.exe');
+// 发布版使用可监听的真实程序目录；源码核对和 EXE 启动必须指向同一份构建。
+const releaseRoot = process.argv[2] ? path.resolve(root, process.argv[2]) : path.join(root, 'dist', 'win-unpacked');
+const applicationRoot = path.join(releaseRoot, 'resources', 'app');
+const exe = path.join(releaseRoot, 'SimpleCode.exe');
 const checks = [];
 let child, socket, timer;
 let nextId = 0;
@@ -27,21 +29,34 @@ function check(value, name) {
   console.log('PASS ' + name);
 }
 
-/** 核对所有纳入本次应用发布的源码，而非只抽样检查版本字符串。 */
-function verifyArchive() {
+/**
+ * 核对真实发布目录的完整源码和运行元数据。
+ * 按当前构建配置排除明确不发布的文件；目录布局与文件字节不符时直接失败，不读取旧 ASAR 冒充新发布包。
+ * @returns {number} 已完成逐字节核对的程序文件数量。
+ */
+function verifyApplicationFiles() {
+  const source = require('../package.json');
+  check(source.build.asar === false && fs.statSync(applicationRoot).isDirectory()
+    && !fs.existsSync(path.join(path.dirname(applicationRoot), 'app.asar')), '发布版使用真实程序目录且不存在优先加载的旧 ASAR');
+  const excluded = new Set();
+  for (const pattern of source.build.files) {
+    if (pattern.startsWith('!')) excluded.add(pattern.slice(1));
+  }
   const git = spawnSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '--', 'electron', 'renderer'], { cwd: root, encoding: 'utf8' });
   assert.equal(git.status, 0, git.stderr);
-  const files = git.stdout.trim().split(/\r?\n/);
+  const files = git.stdout.trim().split(/\r?\n/).filter(included);
   for (const file of files) {
-    assert.ok(fs.readFileSync(path.join(root, file)).equals(asar.extractFile(archive, file.split('/').join(path.sep))), '包内源码一致：' + file);
+    assert.ok(fs.readFileSync(path.join(root, file)).equals(fs.readFileSync(path.join(applicationRoot, file))), '包内源码一致：' + file);
   }
-  check(true, files.length + ' 个应用源码及资源文件与 ASAR 逐字节一致');
+  check(true, files.length + ' 个应用源码及资源文件与发布目录逐字节一致');
   // electron-builder 会去掉开发配置并重排 package.json，按运行所需字段核对元数据。
-  const packed = JSON.parse(asar.extractFile(archive, 'package.json'));
-  const source = require('../package.json');
+  const packed = JSON.parse(fs.readFileSync(path.join(applicationRoot, 'package.json'), 'utf8'));
   for (const key of ['name', 'productName', 'version', 'main', 'dependencies']) assert.deepEqual(packed[key], source[key], '运行元数据一致：' + key);
-  check(packed.version === version, 'ASAR 版本及运行依赖元数据正确：' + version);
+  check(packed.version === version, '发布目录版本及运行依赖元数据正确：' + version);
   return files.length;
+
+  /** 只排除当前构建配置明确点名的文件，保持其余程序源码完整核对。 */
+  function included(file) { return !excluded.has(file); }
 }
 
 /** 等待测试进程给出系统分配的调试地址，保留启动错误供诊断。 */
@@ -84,7 +99,7 @@ function wait(ms) { return new Promise(function delayed(resolve) { setTimeout(re
 
 /** 核对真实安装目录 EXE 的主进程、preload、账户 IPC 和新增桌宠控件。 */
 async function main() {
-  const files = verifyArchive();
+  const files = verifyApplicationFiles();
   fs.mkdirSync(userData);
   fs.writeFileSync(path.join(userData, 'settings.json'), JSON.stringify({ onboardingCompleted: true, modelsDir: path.join(output, 'models') }), 'utf8');
   timer = setTimeout(function timedOut() { console.error('FAIL EXE 核对超时'); if (socket) socket.close(); if (child) child.kill(); process.exit(1); }, 40000);
@@ -110,7 +125,7 @@ async function main() {
   check(page.save === 'function' && page.quota === 'function' && page.body > 0 && page.options !== undefined, '实际主界面及新增 preload IPC 可用');
   const petCode = '(function(){const x=document.getElementById("pet-glasses-offset-x"),y=document.getElementById("pet-glasses-offset-y");return {inspect:typeof window.desktopPetInspect,x:!!x,y:!!y,balance:!!document.getElementById("pet-balance"),lines:getComputedStyle(document.getElementById("pet-label")).webkitLineClamp};})()';
   const pet = await evaluate('(async function(){const e=' + electron + ';const w=e.BrowserWindow.getAllWindows().find(function(w){return w.webContents.getURL().includes("/float-bar.html");});return w.webContents.executeJavaScript(' + JSON.stringify(petCode) + ');})()');
-  check(pet.inspect === 'function' && pet.x && pet.y && pet.balance && pet.lines === '3', '实际 EXE 桌宠具有 X/Y 控件、余额及三行正文布局');
+  check(pet.inspect === 'function' && pet.x && pet.y && pet.balance && pet.lines === '3', '实际 EXE 桌宠具有 X/Y 控件、余额及三行正文布局：' + JSON.stringify(pet));
   // 通过真实打包 preload 和主进程 IPC 开启再停止测试任务；长间隔确保不调用任何模型。
   const longAliveCode = '(async function(){const api=window.simple;const tabId="release-verification";await api.longAliveBind({tabId,workspace:' + JSON.stringify(root) + '});const started=await api.longAliveStart({tabId,goal:"仅核对发布 IPC，不执行外部任务",intervalSeconds:86400,timeoutSeconds:60});const stopped=await api.longAliveStop();const status=await api.longAliveStatus();return {button:!!document.getElementById("btn-long-alive"),started:started.enabled,stopped:!stopped.enabled,active:status.task.active,memory:status.memory.rss>0};})()';
   const longAlive = await evaluate('(async function(){const e=' + electron + ';const w=e.BrowserWindow.getAllWindows().find(function(w){return w.webContents.getURL().includes("/index.html");});return w.webContents.executeJavaScript(' + JSON.stringify(longAliveCode) + ');})()');

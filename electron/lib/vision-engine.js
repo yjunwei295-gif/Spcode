@@ -322,7 +322,20 @@ async function ensureServer(opts) {
   return bootPromise;
 }
 
-async function chatVision({ base, model, dataUrl, signal, onWait, lang }) {
+/**
+ * 向本地视觉服务发送单图或带来源标签的多图，比较提示仅作用于当前请求。
+ * @param {object} options 本次识别请求参数，不修改服务或模型配置
+ * @param {string} options.base 已启动本地服务的地址
+ * @param {string} options.model 模型名称；请求会使用服务实际公布的模型标识
+ * @param {string} [options.dataUrl] 单图数据地址；未传 images 时发送此图
+ * @param {Array<object>} [options.images] 多图内容块，按原顺序携带来源标签 text 和实际像素 image_url；传入时替代 dataUrl
+ * @param {string} [options.prompt] 本次比较问题；未提供时使用 lang 对应的单图识别提示
+ * @param {AbortSignal} [options.signal] 本轮取消信号，取消后中断请求
+ * @param {function} [options.onWait] 接收识别进度提示的回调
+ * @param {string} [options.lang] 默认识别提示的语言
+ * @returns {Promise<string>} 去除首尾空白的识别正文；只有思考文本时使用该文本，空回包、接口失败或取消则拒绝
+ */
+async function chatVision({ base, model, dataUrl, images, prompt, signal, onWait, lang }) {
   const url = `${base.replace(/\/$/, '')}/v1/chat/completions`;
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), CHAT_TIMEOUT_MS);
@@ -354,10 +367,8 @@ async function chatVision({ base, model, dataUrl, signal, onWait, lang }) {
         messages: [
           {
             role: 'user',
-            content: [
-              { type: 'text', text: replyLang.visionAsk(lang || replyLang.fromLocale('zh')) },
-              { type: 'image_url', image_url: { url: dataUrl } }
-            ]
+            content: [{ type: 'text', text: prompt || replyLang.visionAsk(lang || replyLang.fromLocale('zh')) }]
+              .concat(images || [{ type: 'image_url', image_url: { url: dataUrl } }])
           }
         ]
       }),
@@ -395,12 +406,28 @@ async function chatVision({ base, model, dataUrl, signal, onWait, lang }) {
   }
 }
 
-async function describe({ modelPath, mmproj, model, dataUrl, signal, onWait, lang }) {
+/**
+ * 按已配置模型启动本地视觉引擎，再原样传递单图或多图及本次比较提示。
+ * @param {object} options 本次引擎启动及识别参数；不更换用户配置的模型
+ * @param {string} options.modelPath 本地 GGUF 模型路径
+ * @param {string} options.mmproj 与模型配套的视觉投影文件路径
+ * @param {string} [options.model] 请求模型名称；未提供时使用 modelPath 的文件名
+ * @param {string} [options.dataUrl] 单图数据地址，未传 images 时使用
+ * @param {Array<object>} [options.images] 带来源标签 text 与实际像素 image_url 的多图内容块；传入时替代 dataUrl
+ * @param {string} [options.prompt] 仅用于本次请求的比较问题，未提供时沿用单图识别提示
+ * @param {AbortSignal} [options.signal] 取消引擎启动或当前识别请求
+ * @param {function} [options.onWait] 接收引擎准备及识别状态的回调
+ * @param {string} [options.lang] 默认识别提示语言，未提供时使用中文
+ * @returns {Promise<string>} 视觉服务返回的非空识别文本；引擎启动、识别失败或取消时直接拒绝
+ */
+async function describe({ modelPath, mmproj, model, dataUrl, images, prompt, signal, onWait, lang }) {
   const srv = await ensureServer({ modelPath, mmproj, signal, onWait });
   return chatVision({
     base: srv.base,
     model: model || path.basename(modelPath),
     dataUrl,
+    images,
+    prompt,
     signal,
     onWait,
     lang: lang || replyLang.fromLocale('zh')

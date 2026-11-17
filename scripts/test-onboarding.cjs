@@ -92,7 +92,7 @@ async function testDecisions() {
   const context = { localStorage: { getItem: function getItem() { return null; }, setItem: function setItem() {} },
     api: { completeOnboarding: async function completeOnboarding() {} } };
   vm.createContext(context);
-  vm.runInContext(extract(renderer, 'function capValOf(ref)') + extract(renderer, 'async function completeOnboarding()')
+  vm.runInContext(extract(renderer, 'function capValOf(ref)') + extract(renderer, 'function codePoolRefs(pack)') + extract(renderer, 'async function completeOnboarding()')
     + extract(renderer, 'async function restoreOnboardingCompletion(settings)'), context);
   const partial = settings(true);
   delete partial.capabilityDefaults.planning;

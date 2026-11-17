@@ -62,6 +62,7 @@
     "landingMs": 420,
     "dragThreshold": 5,
     "alphaThreshold": 24,
+    "hitTestIntervalMs": 50,
     "blendMs": 160
   },
   "sizes": [

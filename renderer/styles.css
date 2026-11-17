@@ -901,6 +901,14 @@ input, textarea, select, [contenteditable="true"] {
 }
 .file-card-files { display: none; margin-top: 8px; }
 .file-card.open .file-card-files { display: flex; flex-direction: column; gap: 4px; }
+/* 对话生成媒体直接预览；沿用主题颜色，完整显示角色与画幅，不裁切内容。 */
+.chat-media-gallery { display: grid; gap: 12px; max-width: min(100%, 640px); margin: 12px 0; }
+.chat-media-card { margin: 0; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); overflow: hidden; }
+.chat-media-card img, .chat-media-card video { display: block; width: 100%; max-height: 480px; object-fit: contain; background: var(--bg); border-radius: 6px; }
+.chat-media-card img { cursor: zoom-in; }
+.chat-media-card figcaption { padding: 7px 2px 0; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.chat-media-error { margin: 8px 2px 2px; font-size: 12px; color: var(--text); }
+.preview-video { display: block; width: 100%; max-height: 100%; object-fit: contain; }
 .file-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .file-link {
   border: 0;
@@ -985,6 +993,11 @@ input, textarea, select, [contenteditable="true"] {
 #btn-preview-close { border: 0; background: none; font-size: 16px; padding: 2px 6px; }
 .preview-body { flex: 1; overflow: auto; user-select: text; }
 .preview-body img { max-width: 100%; display: block; }
+/* 二进制文件的信息预览沿用侧栏布局，长文件名和路径允许换行。 */
+.file-info-preview { padding: 16px; overflow-wrap: anywhere; }
+.file-info-preview dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px 16px; margin: 16px 0; }
+.file-info-preview dt { color: var(--muted); }
+.file-info-preview dd { margin: 0; }
 .preview-doc-img {
   max-width: calc(100% - 20px);
   margin: 8px 10px;
@@ -1612,6 +1625,9 @@ html[data-theme="dark"] .send { background: #eee; color: #111; }
   border: 1px solid var(--border); background: var(--hover); color: var(--text);
   border-radius: 8px; padding: 5px 10px; margin-left: 6px; cursor: pointer; font-size: 12px;
 }
+/* 代码模型池逐项勾选，候选地位平等；复选框不继承文本输入框的整行宽度。 */
+.code-pool-option { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+.code-pool-option input[type="checkbox"] { width: auto; margin: 0; flex: none; }
 .modal-card .model-row button:first-child { margin-left: 0; }
 .modal-card .model-row button:hover { border-color: var(--accent); color: var(--accent); }
 .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
@@ -2294,7 +2310,7 @@ button:not(:disabled):not(.send):active,
    背景是生成的 PCB 走线（铜色走线 / 焊盘 / 过孔 / 芯片），主色信号绿。
    只作用于浅色（白色阻焊板）；深色是下方的「黑金幻彩」。其他 AI 请勿删除或叠加别的主题。
    ================================================================ */
-html:not([data-theme="dark"]) {
+html:not([data-theme="dark"]):not([data-theme="cel"]) {
   --bg: #f1f3f2;
   --panel: #f8faf9;
   --panel-solid: #ffffff;
@@ -2318,24 +2334,24 @@ html:not([data-theme="dark"]) {
   --r: 6px;
 }
 
-html:not([data-theme="dark"]) body { background: var(--bg); }
-html:not([data-theme="dark"]) #app { position: relative; z-index: 1; }
-html:not([data-theme="dark"]) .chat-main,
-html:not([data-theme="dark"]) .chat-stage,
-html:not([data-theme="dark"]) .messages,
-html:not([data-theme="dark"]) .view { background: transparent; }
-html:not([data-theme="dark"]) ::selection { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) body { background: var(--bg); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) #app { position: relative; z-index: 1; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .chat-main,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .chat-stage,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .messages,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .view { background: transparent; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) ::selection { background: color-mix(in srgb, var(--accent) 24%, transparent); }
 
 /* ---------- PCB 背景 ---------- */
-html:not([data-theme="dark"]) .bg-pcb { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
-html:not([data-theme="dark"]) .bg-pcb svg { display: block; width: 100%; height: 100%; }
-html:not([data-theme="dark"]) .bg-pcb .pcb-tr { fill: none; stroke: var(--trace); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
-html:not([data-theme="dark"]) .bg-pcb .pcb-pad { fill: var(--bg); stroke: var(--pad); stroke-width: 1.3; }
-html:not([data-theme="dark"]) .bg-pcb .pcb-via { fill: none; stroke: var(--pad); stroke-width: 2; }
-html:not([data-theme="dark"]) .bg-pcb .pcb-ic { fill: var(--ic-fill); stroke: var(--trace-strong); stroke-width: 1.2; }
-html:not([data-theme="dark"]) .bg-pcb .pcb-ic-dot { fill: var(--pad); }
-html:not([data-theme="dark"]) .bg-pcb .pcb-pin { stroke: var(--pad); stroke-width: 2; }
-html:not([data-theme="dark"]) .bg-pcb .pcb-sig {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb svg { display: block; width: 100%; height: 100%; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb .pcb-tr { fill: none; stroke: var(--trace); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb .pcb-pad { fill: var(--bg); stroke: var(--pad); stroke-width: 1.3; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb .pcb-via { fill: none; stroke: var(--pad); stroke-width: 2; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb .pcb-ic { fill: var(--ic-fill); stroke: var(--trace-strong); stroke-width: 1.2; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb .pcb-ic-dot { fill: var(--pad); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb .pcb-pin { stroke: var(--pad); stroke-width: 2; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb .pcb-sig {
   fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round;
   stroke-dasharray: 22 1600; stroke-dashoffset: 1622;
   filter: drop-shadow(0 0 3px var(--accent));
@@ -2343,85 +2359,85 @@ html:not([data-theme="dark"]) .bg-pcb .pcb-sig {
 }
 @keyframes pcb-run { from { stroke-dashoffset: 1622; } to { stroke-dashoffset: 0; } }
 /* 欢迎页：中间内容区压暗走线 */
-html:not([data-theme="dark"]) .bg-pcb {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb {
   -webkit-mask-image: radial-gradient(ellipse 38% 46% at 50% 50%, rgba(0, 0, 0, 0.18), #000 85%);
   mask-image: radial-gradient(ellipse 38% 46% at 50% 50%, rgba(0, 0, 0, 0.18), #000 85%);
 }
 /* 对话页：只留四周静态走线，中间完全让给消息 */
-html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb {
+html:not([data-theme="dark"]):not([data-theme="cel"]) body:has(#view-chat:not(.hidden)) .bg-pcb {
   opacity: 0.7;
   -webkit-mask-image: radial-gradient(ellipse 60% 72% at 58% 48%, transparent 58%, #000 100%);
   mask-image: radial-gradient(ellipse 60% 72% at 58% 48%, transparent 58%, #000 100%);
 }
-html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sigs { display: none; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sigs { display: none; }
 
 /* ---------- 顶栏 / 标签栏 / 状态栏 ---------- */
-html:not([data-theme="dark"]) .titlebar { z-index: 60; background: var(--titlebar); border-bottom: 1px solid var(--border); }
-html:not([data-theme="dark"]) .chat-head { position: relative; z-index: 40; background: var(--bg); border-bottom: 1px solid var(--border); }
-html:not([data-theme="dark"]) .tab { border-radius: 4px; font-size: 12.5px; }
-html:not([data-theme="dark"]) .tab.active {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .titlebar { z-index: 60; background: var(--titlebar); border-bottom: 1px solid var(--border); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .chat-head { position: relative; z-index: 40; background: var(--bg); border-bottom: 1px solid var(--border); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .tab { border-radius: 4px; font-size: 12.5px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .tab.active {
   background: var(--panel-solid);
   box-shadow: inset 0 0 0 1px var(--border-strong), inset 0 -2px 0 var(--accent);
 }
-html:not([data-theme="dark"]) .tab.active::before {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .tab.active::before {
   content: ""; flex: none; width: 6px; height: 6px; border-radius: 1px;
   background: var(--accent); box-shadow: 0 0 6px var(--accent);
 }
-html:not([data-theme="dark"]) .statusbar { background: var(--status); border-top: 1px solid var(--border); font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.02em; }
-html:not([data-theme="dark"]) .menu-drop,
-html:not([data-theme="dark"]) .ctx-menu,
-html:not([data-theme="dark"]) .slash-menu,
-html:not([data-theme="dark"]) #model-menu {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .statusbar { background: var(--status); border-top: 1px solid var(--border); font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.02em; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .menu-drop,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .ctx-menu,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .slash-menu,
+html:not([data-theme="dark"]):not([data-theme="cel"]) #model-menu {
   background: var(--panel-solid); border: 1px solid var(--border-strong);
   border-radius: var(--r); box-shadow: var(--shadow);
 }
-html:not([data-theme="dark"]) .modal-card { background: var(--panel-solid); border: 1px solid var(--border-strong); border-radius: 8px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .modal-card { background: var(--panel-solid); border: 1px solid var(--border-strong); border-radius: 8px; }
 
 /* ---------- 侧栏 ---------- */
-html:not([data-theme="dark"]) .file-tree,
-html:not([data-theme="dark"]) .sidebar { background: var(--panel); border-right: 1px solid var(--border); }
-html:not([data-theme="dark"]) .clip-panel { background: transparent; border-top: 1px solid var(--border); }
-html:not([data-theme="dark"]) .file-tree-head,
-html:not([data-theme="dark"]) .clip-head {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .file-tree,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .sidebar { background: var(--panel); border-right: 1px solid var(--border); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .clip-panel { background: transparent; border-top: 1px solid var(--border); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .file-tree-head,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .clip-head {
   font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase;
 }
-html:not([data-theme="dark"]) .tree-row { border-radius: 3px; }
-html:not([data-theme="dark"]) .tree-row.on { box-shadow: inset 2px 0 0 var(--accent); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .tree-row { border-radius: 3px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .tree-row.on { box-shadow: inset 2px 0 0 var(--accent); }
 
 /* ---------- 消息 ---------- */
-html:not([data-theme="dark"]) .msg .role { font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em; }
-html:not([data-theme="dark"]) .msg .bubble {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg .role { font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg .bubble {
   background: var(--panel-solid); border: 1px solid var(--border);
   border-radius: var(--r); box-shadow: none;
 }
-html:not([data-theme="dark"]) .msg .bubble:hover { border-color: var(--border-strong); box-shadow: none; }
-html:not([data-theme="dark"]) .msg.user .bubble {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg .bubble:hover { border-color: var(--border-strong); box-shadow: none; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg.user .bubble {
   background: color-mix(in srgb, var(--accent) 6%, var(--panel-solid));
   border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
   box-shadow: inset 2px 0 0 var(--accent);
 }
-html:not([data-theme="dark"]) .msg-model {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg-model {
   font-family: var(--mono); font-size: 10.5px; border-radius: 3px;
   background: transparent; border: 1px solid var(--border);
 }
-html:not([data-theme="dark"]) .msg-model.on { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
-html:not([data-theme="dark"]) .think-block[open] { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r); }
-html:not([data-theme="dark"]) .think-block.live {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg-model.on { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .think-block[open] { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .think-block.live {
   border-radius: var(--r);
   background:
     linear-gradient(var(--panel-solid), var(--panel-solid)) padding-box,
     var(--aurora) border-box;
   background-size: 100% 100%, 300% 100%;
 }
-html:not([data-theme="dark"]) .think-block summary { font-family: var(--mono); font-size: 11.5px; }
-html:not([data-theme="dark"]) .think-steps { font-family: var(--mono); font-size: 11.5px; border-left: 1px dashed var(--border-strong); }
-html:not([data-theme="dark"]) .file-card { background: var(--panel-solid); border: 1px solid var(--border); border-radius: var(--r); }
-html:not([data-theme="dark"]) .msg .bubble.md code,
-html:not([data-theme="dark"]) .msg .bubble.md pre { border-radius: 4px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .think-block summary { font-family: var(--mono); font-size: 11.5px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .think-steps { font-family: var(--mono); font-size: 11.5px; border-left: 1px dashed var(--border-strong); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .file-card { background: var(--panel-solid); border: 1px solid var(--border); border-radius: var(--r); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg .bubble.md code,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg .bubble.md pre { border-radius: 4px; }
 
 /* ---------- 输入框：四角定位标 ---------- */
-html:not([data-theme="dark"]) .composer,
-html:not([data-theme="dark"]) .composer:focus-within {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .composer,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .composer:focus-within {
   --cb: var(--border-strong);
   background:
     linear-gradient(var(--cb), var(--cb)) top left / 12px 2px no-repeat,
@@ -2439,21 +2455,21 @@ html:not([data-theme="dark"]) .composer:focus-within {
   animation: none;
   backdrop-filter: none; -webkit-backdrop-filter: none;
 }
-html:not([data-theme="dark"]) .composer:hover { border-color: var(--border-strong); }
-html:not([data-theme="dark"]) .composer:focus-within {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .composer:hover { border-color: var(--border-strong); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .composer:focus-within {
   --cb: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent), var(--shadow);
 }
-html:not([data-theme="dark"]) .chip { border-radius: 3px; font-family: var(--mono); font-size: 11px; }
-html:not([data-theme="dark"]) .pill,
-html:not([data-theme="dark"]) .rounds-wrap {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .chip { border-radius: 3px; font-family: var(--mono); font-size: 11px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .pill,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .rounds-wrap {
   border-radius: 4px; border: 1px solid var(--border-strong); background: var(--panel-solid);
 }
-html:not([data-theme="dark"]) .pill { font-size: 12px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .pill { font-size: 12px; }
 
 /* 发送 / 停止：实心信号绿方块，停止为红色呼吸 */
-html:not([data-theme="dark"]) .send {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .send {
   background: var(--accent) !important;
   color: var(--accent-fg) !important;
   border-radius: 4px;
@@ -2461,36 +2477,36 @@ html:not([data-theme="dark"]) .send {
   box-shadow: 0 0 0 1px var(--accent), 0 0 14px color-mix(in srgb, var(--accent) 30%, transparent);
   font-family: var(--mono); letter-spacing: 0.04em;
 }
-html:not([data-theme="dark"]) .send:not(:disabled):hover { filter: brightness(1.08); transform: translateY(-1px); }
-html:not([data-theme="dark"]) .send.is-stop {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .send:not(:disabled):hover { filter: brightness(1.08); transform: translateY(-1px); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .send.is-stop {
   background: #e5484d !important; color: #fff !important;
   box-shadow: 0 0 0 1px #e5484d;
   animation: fx-breathe-red 1.6s ease-in-out infinite;
 }
-html:not([data-theme="dark"]) .send.fx-press { animation: fx-press-wave 0.45s var(--ease-out); }
-html:not([data-theme="dark"]) .send.is-stop.fx-press { animation: fx-press-wave 0.45s var(--ease-out), fx-breathe-red 1.6s ease-in-out infinite; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .send.fx-press { animation: fx-press-wave 0.45s var(--ease-out); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .send.is-stop.fx-press { animation: fx-press-wave 0.45s var(--ease-out), fx-breathe-red 1.6s ease-in-out infinite; }
 
 /* 按钮悬停：保持强反馈，但光晕收紧，更干练 */
-html:not([data-theme="dark"]) button:not(:disabled):not(.send):hover,
-html:not([data-theme="dark"]) .tab:not(.active):hover,
-html:not([data-theme="dark"]) .msg-model:hover {
+html:not([data-theme="dark"]):not([data-theme="cel"]) button:not(:disabled):not(.send):hover,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .tab:not(.active):hover,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg-model:hover {
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent), 0 0 12px color-mix(in srgb, var(--accent) 16%, transparent);
 }
-html:not([data-theme="dark"]) .tab.busy::after { border-radius: 0; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .tab.busy::after { border-radius: 0; }
 
 /* ---------- 欢迎页 ---------- */
-html:not([data-theme="dark"]) .welcome-inner { width: min(760px, 88%); }
-html:not([data-theme="dark"]) .welcome .logo {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .welcome-inner { width: min(760px, 88%); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .welcome .logo {
   font-family: var(--mono); font-size: 54px; line-height: 1; font-weight: 800;
   letter-spacing: 18px; padding-left: 18px; margin: 0 0 14px; color: var(--text);
 }
-html:not([data-theme="dark"]) .logo-sub {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .logo-sub {
   text-align: center; font-family: var(--mono); font-size: 11px; letter-spacing: 6px; padding-left: 6px;
   color: var(--accent); margin-bottom: 40px;
 }
-html:not([data-theme="dark"]) .logo-sub::before { content: "// "; color: var(--muted); }
-html:not([data-theme="dark"]) .hero-actions { gap: 18px; }
-html:not([data-theme="dark"]) .hero-card {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .logo-sub::before { content: "// "; color: var(--muted); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .hero-actions { gap: 18px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .hero-card {
   --cb: var(--border-strong);
   position: relative;
   padding: 24px 16px 20px; gap: 14px;
@@ -2504,8 +2520,8 @@ html:not([data-theme="dark"]) .hero-card {
   box-shadow: var(--shadow);
   font-size: 13.5px; font-weight: 600; color: var(--text);
 }
-html:not([data-theme="dark"]) .hero-card:hover,
-html:not([data-theme="dark"]) button.hero-card:not(:disabled):hover {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .hero-card:hover,
+html:not([data-theme="dark"]):not([data-theme="cel"]) button.hero-card:not(:disabled):hover {
   --cb: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
   transform: translateY(-2px);
@@ -2518,56 +2534,56 @@ html:not([data-theme="dark"]) button.hero-card:not(:disabled):hover {
     radial-gradient(160px circle at var(--mx, 50%) var(--my, 50%), color-mix(in srgb, var(--accent) 10%, transparent), transparent 70%),
     var(--panel-solid);
 }
-html:not([data-theme="dark"]) .hero-ico {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .hero-ico {
   width: 48px; height: 48px; border-radius: 4px;
   display: grid; place-items: center; font-size: 0;
   color: var(--accent); background: var(--bg);
   border: 1px solid var(--border-strong);
   transition: box-shadow 0.2s ease, border-color 0.2s ease;
 }
-html:not([data-theme="dark"]) .hero-ico svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-html:not([data-theme="dark"]) .hero-card:hover .hero-ico {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .hero-ico svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .hero-card:hover .hero-ico {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent), 0 0 14px color-mix(in srgb, var(--accent) 22%, transparent);
 }
-html:not([data-theme="dark"]) .recent-card {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-card {
   margin-top: 26px; padding: 12px 10px 8px;
   border: 1px solid var(--border); border-radius: 4px;
   background: var(--panel-solid); box-shadow: var(--shadow);
 }
-html:not([data-theme="dark"]) .recent-card .recent-head {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-card .recent-head {
   margin: 0 0 6px; padding: 0 8px 8px; border-bottom: 1px dashed var(--border);
   font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase;
 }
-html:not([data-theme="dark"]) .recent-card .recent-list { max-height: 190px; overflow-y: auto; }
-html:not([data-theme="dark"]) .recent-item { align-items: center; padding: 8px; border-radius: 3px; font-size: 13px; }
-html:not([data-theme="dark"]) .recent-item > span:first-child {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-card .recent-list { max-height: 190px; overflow-y: auto; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-item { align-items: center; padding: 8px; border-radius: 3px; font-size: 13px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-item > span:first-child {
   display: flex; align-items: center; gap: 10px; font-weight: 500; flex: none; max-width: 40%;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-html:not([data-theme="dark"]) .recent-item > span:first-child::before {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-item > span:first-child::before {
   content: ""; flex: none; width: 6px; height: 6px; border-radius: 1px; background: var(--border-strong);
   transition: background-color 0.15s ease, box-shadow 0.15s ease;
 }
-html:not([data-theme="dark"]) .recent-item:hover > span:first-child::before { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
-html:not([data-theme="dark"]) .recent-item .path {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-item:hover > span:first-child::before { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-item .path {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right;
   font-family: var(--mono); font-size: 11px;
 }
-html:not([data-theme="dark"]) .welcome-foot {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .welcome-foot {
   bottom: 28px; font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.04em;
   border-radius: 4px; border: 1px solid var(--border-strong); background: var(--panel-solid);
 }
 @media (max-height: 700px) {
-  html:not([data-theme="dark"]) .welcome .logo { font-size: 44px; }
-  html:not([data-theme="dark"]) .logo-sub { margin-bottom: 26px; }
-  html:not([data-theme="dark"]) .hero-card { padding: 16px 14px 14px; }
-  html:not([data-theme="dark"]) .recent-card { margin-top: 18px; }
-  html:not([data-theme="dark"]) .recent-card .recent-list { max-height: 150px; }
+  html:not([data-theme="dark"]):not([data-theme="cel"]) .welcome .logo { font-size: 44px; }
+  html:not([data-theme="dark"]):not([data-theme="cel"]) .logo-sub { margin-bottom: 26px; }
+  html:not([data-theme="dark"]):not([data-theme="cel"]) .hero-card { padding: 16px 14px 14px; }
+  html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-card { margin-top: 18px; }
+  html:not([data-theme="dark"]):not([data-theme="cel"]) .recent-card .recent-list { max-height: 150px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  html:not([data-theme="dark"]) .bg-pcb .pcb-sig { animation: none; display: none; }
+  html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb .pcb-sig { animation: none; display: none; }
 }
 
 
@@ -2767,7 +2783,7 @@ html[data-theme="dark"] .welcome-foot {
    深色走黑金（圆润、金边、金属金主按钮）。用 #modal-card 提高优先级，
    压过 vision-settings.js 运行时注入的旧灰蓝配色。其他 AI 请勿删除。
    ================================================================ */
-html:not([data-theme="dark"]) {
+html:not([data-theme="dark"]):not([data-theme="cel"]) {
   --sub-surface: #f7f9f8;
   --sub-border: var(--border);
   --sub-border-strong: var(--border-strong);
@@ -2803,7 +2819,7 @@ html[data-theme="dark"] {
 
 /* 遮罩 + 弹窗外壳 */
 /* 独立导图窗口也使用主题的控件与语义色。 */
-html:not([data-theme="dark"]) { --success: #25844b; --warning: #996400; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) { --success: #25844b; --warning: #996400; }
 html[data-theme="dark"] { --success: #73c997; --warning: #edbc65; }
 .map-modal { color: var(--text); }
 .map-modal input[type="checkbox"] { accent-color: var(--accent); }
@@ -2837,7 +2853,7 @@ html[data-theme="dark"] { --success: #73c997; --warning: #edbc65; }
 .chain-map-detail-empty, .chain-map-empty { color: var(--muted); font-size: 12px; }
 .modal.is-open { background: var(--overlay); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); }
 #modal-card { color: var(--text); border-radius: var(--sub-r-lg); box-shadow: var(--shadow); }
-html:not([data-theme="dark"]) #modal-card { background: var(--panel-solid); border: 1px solid var(--border-strong); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card { background: var(--panel-solid); border: 1px solid var(--border-strong); }
 #modal-card.vs-card, #modal-card .vs-body, #modal-card .vs-head, #modal-card .vs-actions { background: transparent; }
 #modal-card .vs-head, #modal-card .vs-actions { border-color: var(--sub-border); }
 #modal-card h3, #modal-card .vs-title, #modal-card .vs-h3 {
@@ -2849,9 +2865,9 @@ html:not([data-theme="dark"]) #modal-card { background: var(--panel-solid); bord
 }
 #modal-card .hint, #modal-card .vs-sub, #modal-card .vs-sec-hint, #modal-card .vs-field-hint, #modal-card .vs-model-sub { color: var(--muted); }
 #modal-card label, #modal-card .vs-field-label, #modal-card .vs-sec-title { color: var(--text); }
-html:not([data-theme="dark"]) #modal-card label,
-html:not([data-theme="dark"]) #modal-card .vs-field-label,
-html:not([data-theme="dark"]) #modal-card .vs-sec-title { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card label,
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card .vs-field-label,
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card .vs-sec-title { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; }
 
 /* 输入框 / 下拉 / 文本域 */
 #modal-card input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
@@ -2898,9 +2914,9 @@ html:not([data-theme="dark"]) #modal-card .vs-sec-title { font-family: var(--mon
   color: var(--accent);
 }
 #modal-card .hist-del:hover, #modal-card .vs-slot-del:hover, .download-row-cancel:hover { color: var(--danger); border-color: var(--danger); }
-html:not([data-theme="dark"]) .msg-fork, html:not([data-theme="dark"]) .msg-refill,
-html:not([data-theme="dark"]) .msg-zb-retry, html:not([data-theme="dark"]) .msg-zb-correct,
-html:not([data-theme="dark"]) .file-card button { font-family: var(--mono); font-size: 11px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg-fork, html:not([data-theme="dark"]):not([data-theme="cel"]) .msg-refill,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .msg-zb-retry, html:not([data-theme="dark"]):not([data-theme="cel"]) .msg-zb-correct,
+html:not([data-theme="dark"]):not([data-theme="cel"]) .file-card button { font-family: var(--mono); font-size: 11px; }
 
 /* 主按钮：浅色信号绿、深色金属金 */
 #modal-card .modal-actions .primary,
@@ -2945,12 +2961,12 @@ html:not([data-theme="dark"]) .file-card button { font-family: var(--mono); font
 #modal-card .vs-badge, .dl-src-chip {
   border-radius: var(--sub-r); background: var(--hover); color: var(--muted);
 }
-html:not([data-theme="dark"]) #modal-card .vs-badge, html:not([data-theme="dark"]) .dl-src-chip { font-family: var(--mono); font-size: 10.5px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card .vs-badge, html:not([data-theme="dark"]):not([data-theme="cel"]) .dl-src-chip { font-family: var(--mono); font-size: 10.5px; }
 #modal-card .vs-badge.on { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
 #modal-card .vs-track { background: var(--track-off); }
 #modal-card .vs-switch input:checked + .vs-track { background: var(--primary-bg); }
-html:not([data-theme="dark"]) #modal-card .vs-track,
-html:not([data-theme="dark"]) #modal-card .vs-track::after { border-radius: 3px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card .vs-track,
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card .vs-track::after { border-radius: 3px; }
 #modal-card .vs-bar, .dl-bar { background: var(--sub-border); border-radius: var(--sub-r); }
 #modal-card .vs-bar i, .dl-bar i { background: var(--primary-bg); box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 40%, transparent); }
 .link { color: var(--accent); }
@@ -2961,13 +2977,13 @@ html[data-theme="dark"] .download-drawer,
 html[data-theme="dark"] .download-drawer-tab,
 html[data-theme="dark"] .download-drawer-sheet { background: rgba(10, 10, 14, 0.92); }
 .download-drawer-tab:hover { color: var(--accent); }
-html:not([data-theme="dark"]) .download-drawer-label { font-family: var(--mono); letter-spacing: 0.12em; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .download-drawer-label { font-family: var(--mono); letter-spacing: 0.12em; }
 
 /* 滚动条跟随主题（压过注入的灰色） */
 html body *::-webkit-scrollbar-thumb { background-color: color-mix(in srgb, var(--muted) 35%, transparent); }
 html body *::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--accent) 60%, transparent); }
 html body *::-webkit-scrollbar-track { background: transparent; }
-html:not([data-theme="dark"]) body *::-webkit-scrollbar-thumb { border-radius: 2px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) body *::-webkit-scrollbar-thumb { border-radius: 2px; }
 
 /* ================================================================
    [铆钉优化] 对话页背景流动感（弱化版）：
@@ -2975,8 +2991,8 @@ html:not([data-theme="dark"]) body *::-webkit-scrollbar-thumb { border-radius: 2
    深色：一道极淡的幻彩光带缓慢横移 + 金粉轻微闪烁。只用 transform / opacity 动画。
    其他 AI 请勿删除。
    ================================================================ */
-html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sigs { display: inline; opacity: 0.5; }
-html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sig {
+html:not([data-theme="dark"]):not([data-theme="cel"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sigs { display: inline; opacity: 0.5; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sig {
   stroke-width: 1.6;
   filter: none;
   animation-duration: calc(var(--sd, 4s) * 2.4);
@@ -3126,7 +3142,7 @@ html[data-theme="dark"] body:has(#view-welcome:not(.hidden)) .bg-waves {
    [铆钉优化] 浅色电路板加强：走线更清楚，对话页也有信号流动；
    浅色下所有边框统一成小圆角（4px），子界面同样适用。其他 AI 请勿删除或调回大圆角。
    ================================================================ */
-html:not([data-theme="dark"]) {
+html:not([data-theme="dark"]):not([data-theme="cel"]) {
   --trace: rgba(28, 72, 56, 0.2);
   --trace-strong: rgba(28, 72, 56, 0.32);
   --pad: rgba(176, 124, 50, 0.78);
@@ -3135,7 +3151,7 @@ html:not([data-theme="dark"]) {
   --sub-r-lg: 4px;
 }
 /* 信号脉冲：按走线长度归一（pathLength=100），一段亮光持续沿线跑 */
-html:not([data-theme="dark"]) .bg-pcb .pcb-sig {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb .pcb-sig {
   stroke-dasharray: 9 91;
   stroke-dashoffset: 100;
   stroke-width: 2.2;
@@ -3143,36 +3159,36 @@ html:not([data-theme="dark"]) .bg-pcb .pcb-sig {
 }
 @keyframes pcb-run-n { from { stroke-dashoffset: 100; } to { stroke-dashoffset: 0; } }
 /* 欢迎页：中间只轻压 */
-html:not([data-theme="dark"]) .bg-pcb {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .bg-pcb {
   -webkit-mask-image: radial-gradient(ellipse 36% 44% at 50% 50%, rgba(0, 0, 0, 0.35), #000 80%);
   mask-image: radial-gradient(ellipse 36% 44% at 50% 50%, rgba(0, 0, 0, 0.35), #000 80%);
 }
 /* 对话页：四周清楚、中间淡淡可见，信号保留但稍慢稍淡 */
-html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb {
+html:not([data-theme="dark"]):not([data-theme="cel"]) body:has(#view-chat:not(.hidden)) .bg-pcb {
   opacity: 1;
   -webkit-mask-image: radial-gradient(ellipse 52% 62% at 58% 48%, rgba(0, 0, 0, 0.22) 30%, #000 100%);
   mask-image: radial-gradient(ellipse 52% 62% at 58% 48%, rgba(0, 0, 0, 0.22) 30%, #000 100%);
 }
-html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sigs { display: inline; opacity: 0.75; }
-html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sig {
+html:not([data-theme="dark"]):not([data-theme="cel"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sigs { display: inline; opacity: 0.75; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sig {
   stroke-width: 1.8;
   filter: drop-shadow(0 0 2px var(--accent));
   animation: pcb-run-n calc(var(--sd, 3s) * 1.5) linear var(--sl, 0s) infinite;
 }
 
 /* 浅色统一小圆角：主界面控件 + 子界面里所有块和按钮（圆点、开关滑块除外） */
-html:not([data-theme="dark"]) #app :is(button, input, select, textarea, .pill, .rounds-wrap, .chip, .file-card, .ask-card, .ask-opt, .side-item, .think-block, .msg .bubble, .composer, .menu-drop, .ctx-menu, .slash-menu, #model-menu, .lang-switch, .download-drawer-sheet, .download-row, .recent-card, .hero-card, .hero-ico, .welcome-foot, .msg-thumb, .clip-thumb):not(.vs-track):not([class*="dot"]):not([class*="spin"]) {
+html:not([data-theme="dark"]):not([data-theme="cel"]) #app :is(button, input, select, textarea, .pill, .rounds-wrap, .chip, .file-card, .ask-card, .ask-opt, .side-item, .think-block, .msg .bubble, .composer, .menu-drop, .ctx-menu, .slash-menu, #model-menu, .lang-switch, .download-drawer-sheet, .download-row, .recent-card, .hero-card, .hero-ico, .welcome-foot, .msg-thumb, .clip-thumb):not(.vs-track):not([class*="dot"]):not([class*="spin"]) {
   border-radius: 4px;
 }
-html:not([data-theme="dark"]) #modal-card,
-html:not([data-theme="dark"]) #modal-card *:not(.vs-track):not([class*="dot"]):not([class*="spin"]):not([class*="avatar"]) {
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card,
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card *:not(.vs-track):not([class*="dot"]):not([class*="spin"]):not([class*="avatar"]) {
   border-radius: 4px;
 }
-html:not([data-theme="dark"]) #modal-card :is(button, input, select, textarea, .vs-badge, .chip) { border-radius: 3px; }
-html:not([data-theme="dark"]) #modal-card .vs-track,
-html:not([data-theme="dark"]) #modal-card .vs-track::after { border-radius: 2px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card :is(button, input, select, textarea, .vs-badge, .chip) { border-radius: 3px; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card .vs-track,
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card .vs-track::after { border-radius: 2px; }
 /* 子界面分区卡片：细边 + 左上角绿色定位标，和主界面卡片一致 */
-html:not([data-theme="dark"]) #modal-card :is(.vs-slot, .vs-model-row, .vs-tip, .dl-item, .settings-card, .kv-card) {
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card :is(.vs-slot, .vs-model-row, .vs-tip, .dl-item, .settings-card, .kv-card) {
   border: 1px solid var(--border);
   background:
     linear-gradient(var(--border-strong), var(--border-strong)) top left / 8px 2px no-repeat,
@@ -3180,7 +3196,7 @@ html:not([data-theme="dark"]) #modal-card :is(.vs-slot, .vs-model-row, .vs-tip, 
     var(--sub-surface);
 }
 /* 子界面底部「完成」栏跟随主题底色 */
-html:not([data-theme="dark"]) #modal-card .settings-done-bar { background: var(--panel-solid); border-top: 1px solid var(--border); }
+html:not([data-theme="dark"]):not([data-theme="cel"]) #modal-card .settings-done-bar { background: var(--panel-solid); border-top: 1px solid var(--border); }
 
 /* [铆钉优化] 子界面里散落的普通按钮（下载模型、选择目录、获取模型…）统一成主题次按钮，两种主题通用。其他 AI 请勿删除 */
 #modal-card button:not(.primary):not(.link):not(.vs-close):not(.vs-switch):not([class*="tab"]):not(.hist-open):not(.skill-enable) {
@@ -3199,8 +3215,8 @@ html[data-theme="dark"] #modal-card button:not(.primary):not(.link):not(.vs-clos
    [铆钉优化] 浅色对话区玻璃遮罩：对话区后面垫一块磨砂玻璃，电路板调淡后隔着玻璃透出来。
    玻璃用伪元素实现，不包住内容，避免 backdrop-filter 影响里面的弹层定位。其他 AI 请勿删除
    ================================================================ */
-html:not([data-theme="dark"]) .chat-main { position: relative; isolation: isolate; }
-html:not([data-theme="dark"]) .chat-main::before {
+html:not([data-theme="dark"]):not([data-theme="cel"]) .chat-main { position: relative; isolation: isolate; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) .chat-main::before {
   content: "";
   position: absolute; inset: 0; z-index: -1;
   pointer-events: none;
@@ -3214,12 +3230,12 @@ html:not([data-theme="dark"]) .chat-main::before {
   box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.6);
 }
 /* 电路板调淡：隔着玻璃看到走线和流动的信号 */
-html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb {
+html:not([data-theme="dark"]):not([data-theme="cel"]) body:has(#view-chat:not(.hidden)) .bg-pcb {
   opacity: 0.85;
   -webkit-mask-image: none;
   mask-image: none;
 }
-html:not([data-theme="dark"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sigs { opacity: 0.8; }
+html:not([data-theme="dark"]):not([data-theme="cel"]) body:has(#view-chat:not(.hidden)) .bg-pcb .pcb-sigs { opacity: 0.8; }
 
 /* [铆钉优化] 「开始」确认按钮：复述方案后给确定开工入口，两套主题各自配色；其他 AI 请勿删除 */
 .start-go-row { display: flex; flex-direction: column; align-items: stretch; flex-wrap: wrap; gap: 10px; margin: 8px 0 2px; }
@@ -3518,3 +3534,310 @@ html[data-theme="dark"] .start-go-submit:disabled {
 @media (prefers-reduced-motion: reduce) {
   .todo-in_progress.todo-running .todo-mark { animation: none; }
 }
+
+
+/* 锐线赛璐璐：独立的浅底主题，以墨线、平涂色块和无模糊投影表现层次。
+   所有规则只在 cel 下生效；电路板与黑金幻彩保留各自原有外观。 */
+html[data-theme="cel"] {
+  color-scheme: light;
+  --bg: #e8ebf0;
+  --panel: #f8f9fc;
+  --panel-solid: #ffffff;
+  --card: #ffffff;
+  --field: #ffffff;
+  --text: #171923;
+  --muted: #596273;
+  --border: #171923;
+  --border-strong: #171923;
+  --hover: #ffe4e7;
+  --accent: #d92340;
+  --accent-fg: #ffffff;
+  --danger: #b81931;
+  --composer: #ffffff;
+  --titlebar: #171923;
+  --status: #171923;
+  --cel-highlight: #ff3855;
+  --cel-tint: #ffe4e7;
+  --cel-ink: #171923;
+  --cel-paper: #ffffff;
+  --shadow: 5px 5px 0 var(--cel-ink);
+  --primary-bg: var(--accent);
+  --primary-shadow: 3px 3px 0 var(--border);
+  --aurora: linear-gradient(var(--accent), var(--accent));
+  --glow: transparent;
+  --glow-strong: var(--accent);
+  --r: 3px;
+  --r-lg: 5px;
+  --font: "Segoe UI", "Microsoft YaHei", sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+}
+html[data-theme="cel"] body { background: var(--bg); font-family: var(--font); }
+html[data-theme="cel"] .bg-pcb,
+html[data-theme="cel"] .bg-waves { display: none; }
+html[data-theme="cel"] ::selection { background: var(--cel-highlight); color: var(--text); }
+
+/* 主框架用实线分区；只调整视觉，不改变侧栏与输入区的布局尺寸。 */
+html[data-theme="cel"] .titlebar { z-index: 60; background: var(--titlebar); border-bottom: 2px solid var(--border); }
+html[data-theme="cel"] .chat-head { background: var(--panel); border-bottom: 2px solid var(--border); }
+html[data-theme="cel"] .statusbar { background: var(--status); border-top: 2px solid var(--border); font-family: var(--mono); }
+html[data-theme="cel"] .file-tree,
+html[data-theme="cel"] .sidebar { background: var(--panel); border-right: 2px solid var(--border); }
+html[data-theme="cel"] .tab { border-radius: var(--r); }
+html[data-theme="cel"] .tab.active { background: var(--cel-highlight); color: var(--text); box-shadow: inset 0 0 0 2px var(--border); }
+html[data-theme="cel"] .tree-row.on { background: var(--cel-tint); box-shadow: inset 3px 0 0 var(--accent); }
+
+/* 卡片、菜单和对话气泡共享硬边投影，取消基础样式中的渐变光晕。 */
+html[data-theme="cel"] .hero-card,
+html[data-theme="cel"] .recent-card,
+html[data-theme="cel"] .menu-drop,
+html[data-theme="cel"] .ctx-menu,
+html[data-theme="cel"] .slash-menu,
+html[data-theme="cel"] .modal-card,
+html[data-theme="cel"] .file-card,
+html[data-theme="cel"] .todo-card,
+html[data-theme="cel"] .msg .bubble {
+  background: var(--panel-solid);
+  border: 2px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+}
+html[data-theme="cel"] .msg .bubble:hover { border-color: var(--border); box-shadow: var(--shadow); }
+html[data-theme="cel"] .msg.user .bubble { background: var(--cel-tint); }
+html[data-theme="cel"] .msg .role { font-family: var(--mono); }
+html[data-theme="cel"] .welcome .logo { font-weight: 900; letter-spacing: 10px; text-shadow: 3px 3px 0 var(--cel-highlight); }
+html[data-theme="cel"] .logo-sub { color: var(--accent); text-align: center; font-family: var(--mono); margin-bottom: 28px; }
+html[data-theme="cel"] .hero-ico { color: var(--accent); }
+html[data-theme="cel"] .hero-ico svg { width: 28px; height: 28px; fill: none; stroke: currentColor; stroke-width: 2; }
+html[data-theme="cel"] button.hero-card:not(:disabled):hover { background: var(--cel-highlight); box-shadow: var(--shadow); transform: translateY(-2px); }
+html[data-theme="cel"] .recent-card { padding: 14px; margin-top: 26px; }
+
+/* 输入框保持纯色底，焦点由主题强调色实线表达，避免流光覆盖赛璐璐描边。 */
+html[data-theme="cel"] .composer,
+html[data-theme="cel"] .composer:hover,
+html[data-theme="cel"] .composer:focus-within {
+  background: var(--composer);
+  border: 2px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  animation: none;
+}
+html[data-theme="cel"] .composer:focus-within { border-color: var(--accent); }
+html[data-theme="cel"] .modal-card input,
+html[data-theme="cel"] .modal-card select,
+html[data-theme="cel"] .modal-card textarea {
+  background: var(--field); color: var(--text); border-color: var(--border); border-radius: var(--r);
+}
+html[data-theme="cel"] .pill,
+html[data-theme="cel"] .rounds-wrap,
+html[data-theme="cel"] .chip,
+html[data-theme="cel"] .msg-model { border-radius: var(--r); }
+html[data-theme="cel"] button:not(:disabled):hover,
+html[data-theme="cel"] .tab:hover,
+html[data-theme="cel"] .msg-model:hover { background-image: none; }
+html[data-theme="cel"] button:focus-visible,
+html[data-theme="cel"] .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; box-shadow: none; }
+html[data-theme="cel"] button.primary,
+html[data-theme="cel"] .send {
+  background: var(--primary-bg) !important;
+  color: var(--accent-fg) !important;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  box-shadow: var(--primary-shadow);
+  animation: none;
+}
+html[data-theme="cel"] .send:not(:disabled):hover { box-shadow: var(--primary-shadow); transform: translateY(-1px); }
+html[data-theme="cel"] .send.is-stop { background: var(--danger) !important; animation: none; }
+html[data-theme="cel"] .think-block.live {
+  background: var(--panel); border: 2px solid var(--accent) !important; border-radius: var(--r); animation: none;
+}
+html[data-theme="cel"] .think-block.live::before { display: none; }
+
+/* 斜切黑白构图与朱红硬高光加强速度感；装饰不截获点击、不进入聊天阅读区。 */
+html[data-theme="cel"] { --r: 0px; --r-lg: 2px; }
+html[data-theme="cel"] .titlebar,
+html[data-theme="cel"] .statusbar { color: var(--cel-paper); }
+html[data-theme="cel"] .titlebar { border-bottom: 3px solid var(--accent); }
+html[data-theme="cel"] .titlebar button,
+html[data-theme="cel"] .titlebar .quota-text { color: var(--cel-paper); }
+html[data-theme="cel"] .titlebar .menu-drop,
+html[data-theme="cel"] .titlebar .menu-drop button { color: var(--text); }
+html[data-theme="cel"] .titlebar .menu-btn:hover,
+html[data-theme="cel"] .titlebar .menu.open .menu-btn { background: var(--accent); }
+html[data-theme="cel"] .statusbar { border-top: 3px solid var(--accent); font-weight: 600; }
+html[data-theme="cel"] .welcome { isolation: isolate; overflow: hidden; }
+html[data-theme="cel"] .welcome::before {
+  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: var(--cel-ink); clip-path: polygon(0 0, 31% 0, 0 61%);
+}
+html[data-theme="cel"] .welcome::after {
+  content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+  background: var(--cel-highlight); clip-path: polygon(100% 49%, 100% 100%, 78% 100%);
+}
+html[data-theme="cel"] .welcome-inner { width: min(790px, 86%); }
+html[data-theme="cel"] .welcome .logo {
+  font-size: clamp(38px, 5vw, 66px); font-weight: 900; font-style: italic;
+  letter-spacing: -2px; line-height: 1.08; margin-bottom: 14px;
+  text-shadow: 3px 3px 0 var(--cel-paper), 6px 6px 0 var(--cel-highlight);
+}
+html[data-theme="cel"] .logo-sub {
+  display: table; margin: 0 auto 32px; padding: 5px 16px;
+  color: var(--cel-paper); background: var(--cel-ink);
+  font-size: 11px; font-weight: 700; letter-spacing: 3px; transform: skewX(-12deg);
+}
+html[data-theme="cel"] .hero-actions { gap: 20px; }
+html[data-theme="cel"] .hero-card {
+  position: relative; border-width: 2px; border-radius: 0; min-height: 146px;
+  padding: 28px 14px 22px; font-size: 15px; font-weight: 800;
+  transform: skewX(-4deg); box-shadow: 6px 6px 0 var(--cel-ink);
+}
+html[data-theme="cel"] .hero-card > * { transform: skewX(4deg); }
+html[data-theme="cel"] .hero-card::after {
+  content: ""; position: absolute; top: 0; right: 0; width: 22px; height: 22px;
+  background: var(--cel-ink); clip-path: polygon(0 0, 100% 0, 100% 100%); pointer-events: none;
+}
+html[data-theme="cel"] .hero-ico {
+  display: grid; place-items: center; width: 46px; height: 42px;
+  background: var(--cel-ink); color: var(--cel-paper); border-left: 4px solid var(--cel-highlight);
+}
+html[data-theme="cel"] button.hero-card:not(:disabled):hover {
+  background: var(--cel-ink); color: var(--cel-paper);
+  box-shadow: 6px 6px 0 var(--cel-highlight); transform: skewX(-4deg) translateY(-3px);
+}
+html[data-theme="cel"] .hero-card:hover .hero-ico { background: var(--accent); border-left-color: var(--cel-paper); }
+html[data-theme="cel"] .recent-card { border-left-width: 6px; box-shadow: 5px 5px 0 var(--cel-ink); }
+html[data-theme="cel"] .recent-head { font-family: var(--mono); font-weight: 800; letter-spacing: 1px; }
+html[data-theme="cel"] .tab.active { background: var(--cel-ink); color: var(--cel-paper); box-shadow: inset 0 -3px 0 var(--cel-highlight); }
+html[data-theme="cel"] .msg.user .bubble { background: var(--cel-tint); border-left: 5px solid var(--accent); }
+html[data-theme="cel"] .composer { border-top: 4px solid var(--cel-ink); }
+html[data-theme="cel"] .composer:focus-within { border-top-color: var(--accent); }
+html[data-theme="cel"] button.primary,
+html[data-theme="cel"] .send { font-weight: 800; letter-spacing: 0.06em; }
+html[data-theme="cel"] .welcome-foot { background: var(--cel-paper); color: var(--text); border: 1px solid var(--cel-ink); }
+@media (max-height: 700px) {
+  html[data-theme="cel"] .hero-card { min-height: 116px; padding: 16px 12px; }
+  html[data-theme="cel"] .logo-sub { margin-bottom: 20px; }
+}
+
+/* 狂野构图：各块独立错位和切角，阅读正文保持水平；只在欢迎页放大撕裂色块。 */
+html[data-theme="cel"] .welcome::before {
+  clip-path: polygon(0 0, 48% 0, 29% 14%, 35% 15%, 12% 35%, 18% 33%, 0 58%);
+}
+html[data-theme="cel"] .welcome::after {
+  clip-path: polygon(100% 29%, 100% 100%, 55% 100%, 77% 82%, 70% 84%, 91% 63%, 85% 64%);
+}
+html[data-theme="cel"] .welcome .logo {
+  text-align: left; margin-left: 9%; transform: rotate(-4deg) skewX(-6deg);
+  letter-spacing: -3px; text-shadow: -2px 2px 0 var(--cel-paper), 7px 5px 0 var(--cel-highlight);
+}
+html[data-theme="cel"] .logo-sub {
+  margin: 8px 6% 35px auto; transform: rotate(2deg) skewX(-14deg); border-right: 8px solid var(--cel-highlight);
+}
+html[data-theme="cel"] .hero-actions { grid-template-columns: 1.16fr 0.94fr 1fr; gap: 24px; padding: 8px 6px 22px; }
+html[data-theme="cel"] .hero-card {
+  --cel-tilt: -3deg; --cel-shift: 6px; --cel-skew: -5deg;
+  transform: translateY(var(--cel-shift)) rotate(var(--cel-tilt)) skewX(var(--cel-skew));
+  border-radius: 0; box-shadow: 7px 8px 0 var(--cel-ink);
+}
+html[data-theme="cel"] .hero-card:nth-child(2) {
+  --cel-tilt: 2deg; --cel-shift: -9px; --cel-skew: -2deg;
+  background: var(--cel-ink); color: var(--cel-paper); border-color: var(--cel-ink);
+  box-shadow: 6px 7px 0 var(--cel-highlight);
+}
+html[data-theme="cel"] .hero-card:nth-child(3) { --cel-tilt: -1deg; --cel-shift: 17px; --cel-skew: -6deg; }
+html[data-theme="cel"] .hero-card:nth-child(2) .hero-ico { background: var(--accent); }
+html[data-theme="cel"] .hero-card:nth-child(2)::after { background: var(--cel-highlight); width: 34px; height: 18px; }
+html[data-theme="cel"] .hero-card:nth-child(3)::after { top: auto; bottom: 0; transform: rotate(90deg); }
+html[data-theme="cel"] button.hero-card:not(:disabled):hover {
+  transform: translateY(calc(var(--cel-shift) - 4px)) rotate(var(--cel-tilt)) skewX(var(--cel-skew));
+  box-shadow: 9px 10px 0 var(--cel-highlight);
+}
+html[data-theme="cel"] .recent-card { margin-left: 3%; margin-right: 9%; border-top: 3px solid var(--cel-ink); }
+html[data-theme="cel"] .recent-card .recent-head {
+  display: inline-block; background: var(--cel-ink); color: var(--cel-paper);
+  padding: 4px 13px; transform: translate(-22px, -21px) rotate(-3deg); border-right: 7px solid var(--cel-highlight);
+}
+html[data-theme="cel"] .menu-drop { border-radius: 0 9px 0 0; box-shadow: 6px 5px 0 var(--cel-ink); }
+html[data-theme="cel"] .chat-head { border-bottom: 3px solid var(--cel-ink); }
+html[data-theme="cel"] .tab.active { transform: skewX(-7deg); border-radius: 0; }
+html[data-theme="cel"] .msg .role { font-weight: 800; color: var(--accent); letter-spacing: 0.09em; }
+html[data-theme="cel"] .msg .bubble { border-radius: 0 14px 0 3px; box-shadow: -4px 5px 0 var(--cel-ink); }
+html[data-theme="cel"] .msg .bubble:hover { box-shadow: -4px 5px 0 var(--cel-ink); }
+html[data-theme="cel"] .msg.user .bubble { border-radius: 12px 0 3px 0; box-shadow: 5px 5px 0 var(--accent); }
+html[data-theme="cel"] .msg.user .bubble:hover { box-shadow: 5px 5px 0 var(--accent); }
+html[data-theme="cel"] .composer,
+html[data-theme="cel"] .composer:hover,
+html[data-theme="cel"] .composer:focus-within { border-radius: 0 18px 0 0; box-shadow: 7px 6px 0 var(--cel-ink); }
+html[data-theme="cel"] .send { transform: skewX(-8deg); border-right-width: 5px; }
+html[data-theme="cel"] .send:not(:disabled):hover { transform: skewX(-8deg) translateY(-2px); }
+@media (max-width: 900px), (max-height: 700px) {
+  html[data-theme="cel"] .hero-actions { gap: 14px; padding-bottom: 12px; }
+  html[data-theme="cel"] .hero-card { --cel-shift: 0px; }
+  html[data-theme="cel"] .hero-card:nth-child(2) { --cel-shift: -5px; }
+  html[data-theme="cel"] .hero-card:nth-child(3) { --cel-shift: 8px; }
+  html[data-theme="cel"] .recent-card { margin-left: 2%; margin-right: 5%; }
+}
+
+/* 对话工作区按阅读层、输入层、操作层分区；锐线集中在重心，避免每个控件都套粗框。 */
+html[data-theme="cel"] #view-chat {
+  --border: #c7cdd7;
+  --border-strong: #8b95a7;
+  --cel-toolbar-text: #eef1f7;
+  --cel-toolbar-muted: #b0bacb;
+  --cel-toolbar-line: #41485b;
+}
+html[data-theme="cel"] #view-chat .chat-head { background: var(--cel-paper); border-bottom: 1px solid var(--border); }
+html[data-theme="cel"] #view-chat .tab.active { border-radius: 0; box-shadow: inset 0 -3px 0 var(--cel-highlight); }
+html[data-theme="cel"] #view-chat .tab-tools button { min-width: 30px; white-space: nowrap; }
+html[data-theme="cel"] #view-chat .file-tree,
+html[data-theme="cel"] #view-chat .sidebar { border-right: 1px solid var(--border); background: var(--panel); }
+html[data-theme="cel"] #view-chat .file-tree-head { border-left: 4px solid var(--accent); border-bottom: 1px solid var(--border); }
+html[data-theme="cel"] #view-chat .messages { padding-top: 22px; }
+html[data-theme="cel"] #view-chat .msg .role { color: var(--muted); letter-spacing: 0.02em; font-size: 11px; }
+html[data-theme="cel"] #view-chat .msg .bubble,
+html[data-theme="cel"] #view-chat .msg .bubble:hover {
+  border: 0; border-left: 3px solid var(--cel-ink); border-radius: 0 8px 8px 0;
+  background: var(--cel-paper); box-shadow: none; padding: 15px 18px;
+}
+html[data-theme="cel"] #view-chat .msg.user .bubble,
+html[data-theme="cel"] #view-chat .msg.user .bubble:hover {
+  background: var(--cel-tint); border-left-color: var(--accent); margin-left: 22px;
+}
+html[data-theme="cel"] #view-chat .file-card,
+html[data-theme="cel"] #view-chat .todo-card { border: 1px solid var(--border); border-radius: 2px; box-shadow: none; }
+html[data-theme="cel"] #view-chat .think-block { border: 0; border-left: 2px solid var(--border-strong); border-radius: 0; background: transparent; }
+html[data-theme="cel"] #view-chat .composer,
+html[data-theme="cel"] #view-chat .composer:hover,
+html[data-theme="cel"] #view-chat .composer:focus-within {
+  border: 1px solid var(--border); border-top: 3px solid var(--cel-ink);
+  border-radius: 0; background: var(--cel-paper); box-shadow: 4px 4px 0 var(--cel-ink);
+}
+html[data-theme="cel"] #view-chat .composer:focus-within { border-top-color: var(--accent); }
+html[data-theme="cel"] #view-chat #input { min-height: 76px; padding: 8px 4px; }
+html[data-theme="cel"] #view-chat .composer-bar {
+  background: var(--cel-ink); color: var(--cel-toolbar-text);
+  margin: 6px -12px -8px; padding: 10px 12px 12px; row-gap: 10px;
+}
+html[data-theme="cel"] #view-chat .model-roster-wrap { border-bottom: 1px solid var(--cel-toolbar-line); padding-bottom: 9px; }
+html[data-theme="cel"] #view-chat #btn-model {
+  border: 0; padding: 0; gap: 7px 14px; color: var(--cel-toolbar-text); background: transparent; box-shadow: none;
+}
+html[data-theme="cel"] #view-chat #btn-model .model-role-tag { color: var(--cel-toolbar-muted); background: transparent; border-radius: 0; padding: 0 3px; font-size: 10px; }
+html[data-theme="cel"] #view-chat #btn-model .model-roster-chip.on { border-radius: 1px; background: var(--accent); }
+html[data-theme="cel"] #view-chat #btn-model .model-roster-chip.on .model-role-tag { color: var(--accent-fg); }
+html[data-theme="cel"] #view-chat .composer-bar .pill,
+html[data-theme="cel"] #view-chat .composer-bar .rounds-wrap {
+  background: transparent; color: var(--cel-toolbar-text); border-color: var(--cel-toolbar-line);
+  border-radius: 2px; box-shadow: none;
+}
+html[data-theme="cel"] #view-chat .composer-bar .pill:not(:disabled):hover { border-color: var(--cel-toolbar-muted); background: var(--cel-toolbar-line); }
+html[data-theme="cel"] #view-chat .composer-bar .pill.on,
+html[data-theme="cel"] #view-chat .composer-bar .pill.on:disabled {
+  color: var(--accent-fg); background: var(--accent); border-color: var(--accent); opacity: 1;
+}
+html[data-theme="cel"] #view-chat .rounds-wrap input { color: var(--cel-toolbar-text); }
+html[data-theme="cel"] #view-chat .composer-bar .right > .pill.ghost:not(.on) { border-color: transparent; color: var(--cel-toolbar-muted); }
+html[data-theme="cel"] #view-chat .composer-bar .menu-drop { color: var(--text); border: 1px solid var(--cel-ink); }
+html[data-theme="cel"] #view-chat .send { border-color: var(--accent); box-shadow: 3px 3px 0 var(--cel-paper); }
+html[data-theme="cel"] #view-chat .send:not(:disabled):hover { box-shadow: 3px 3px 0 var(--cel-paper); }
+
+

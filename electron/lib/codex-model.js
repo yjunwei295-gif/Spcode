@@ -80,35 +80,63 @@ function codexBinaryPath() {
   return path.join(path.dirname(nativePackage), 'vendor', target[1], 'bin', target[2]);
 }
 
+/**
+ * 启动本机 Codex app-server 并完成一次 RPC；保留启动、权限、协议及超时错误。
+ * @param {string} method RPC 方法名
+ * @param {object} params RPC 参数
+ * @returns {Promise<object>} 服务端原始结果；异常直接交给调用方，不伪装成空目录
+ */
 function readAppServerRpc(method, params) {
   let binary;
-  try { binary = codexBinaryPath(); } catch { return Promise.resolve(null); }
-  if (!binary || !fs.existsSync(binary)) return Promise.resolve(null);
+  try { binary = codexBinaryPath(); }
+  catch (error) { return Promise.reject(new Error('Codex 原生程序定位失败：' + error.message, { cause: error })); }
+  if (!binary || !fs.existsSync(binary)) return Promise.reject(new Error('Codex 原生程序不存在：' + binary));
 
-  return new Promise((resolve) => {
+  return new Promise(function start(resolve, reject) {
     let child;
     try {
       child = spawn(binary, ['app-server', '--stdio'], {
-        env: codexEnv(),
-        stdio: ['pipe', 'pipe', 'ignore'],
-        windowsHide: true
+        env: codexEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true
       });
-    } catch { resolve(null); return; }
-
+    } catch (error) { reject(error); return; }
     let settled = false;
-    let timer;
+    let stderr = '';
     const pending = new Map();
-    const finish = (value) => {
+    const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+
+    /** 清理当前 RPC 的进程和等待者，只交付一次真实结果或错误。 */
+    function finish(value, error) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      for (const waiter of pending.values()) waiter.reject(new Error('Codex app-server request ended'));
+      lines.close();
+      for (const waiter of pending.values()) waiter.reject(error || new Error('Codex app-server request ended'));
       pending.clear();
-      try { child.kill(); } catch { /* 已退出 */ }
-      resolve(value);
-    };
-    const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-    lines.on('line', (line) => {
+      child.kill();
+      if (error) reject(error);
+      else resolve(value);
+    }
+    /** stderr 仅用于故障定位，不包含模型配置或认证参数。 */
+    function diagnostic(data) { stderr += data.toString(); }
+    /** 启动拒绝时保留 EACCES 等错误码，让 Mac 执行权限问题可定位。 */
+    function failed(error) {
+      const detail = new Error('Codex app-server 启动或通信失败：' + (error.code || '') + ' ' + error.message, { cause: error });
+      detail.code = error.code;
+      finish(null, detail);
+    }
+    /** 退出码、信号和 CLI 自己的 stderr 比泛化的登录提示更准确。 */
+    function exited(code, signal) {
+      finish(null, new Error('Codex app-server 提前退出：code=' + code + ' signal=' + signal + (stderr ? '\n' + stderr.trim() : '')));
+    }
+    /** 既有 12 秒边界继续生效，超时必须明确报错。 */
+    function timedOut() { finish(null, new Error('Codex app-server 请求超时：' + method + (stderr ? '\n' + stderr.trim() : ''))); }
+    const timer = setTimeout(timedOut, 12000);
+    child.stderr.on('data', diagnostic);
+    child.once('error', failed);
+    child.stdin.once('error', failed);
+    child.once('exit', exited);
+    /** 按 RPC 编号交付响应；通知与非 JSON 进度行不属于请求结果。 */
+    function received(line) {
       let message;
       try { message = JSON.parse(line); } catch { return; }
       const waiter = pending.get(message.id);
@@ -116,35 +144,33 @@ function readAppServerRpc(method, params) {
       pending.delete(message.id);
       if (message.error) waiter.reject(new Error(message.error.message || 'Codex app-server request failed'));
       else waiter.resolve(message.result || {});
-    });
-    const request = (id, method, params) => new Promise((resolveRequest, rejectRequest) => {
-      pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
-      try {
-        child.stdin.write(`${JSON.stringify({ method, id, ...(params === undefined ? {} : { params }) })}\n`);
-      } catch (e) {
-        pending.delete(id);
-        rejectRequest(e);
+    }
+    lines.on('line', received);
+    /** 写入一条 RPC 请求并登记对应的 Promise。 */
+    function request(id, requestMethod, requestParams) {
+      function send(resolveRequest, rejectRequest) {
+        pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
+        try {
+          child.stdin.write(JSON.stringify({ method: requestMethod, id, params: requestParams }) + '\n');
+        } catch (error) {
+          pending.delete(id);
+          rejectRequest(error);
+        }
       }
-    });
-    const notify = (method, params) => {
-      child.stdin.write(`${JSON.stringify({ method, params })}\n`);
-    };
-
-    timer = setTimeout(() => finish(null), 12000);
-    child.once('error', () => finish(null));
-    child.once('exit', () => finish(null));
-    (async () => {
+      return new Promise(send);
+    }
+    /** 先握手再请求模型或额度，顺序与 Codex app-server 协议一致。 */
+    async function handshake() {
       try {
         await request(1, 'initialize', {
           clientInfo: { name: 'spcode', title: 'SpCode', version: '1.0.0' },
           capabilities: { experimentalApi: true }
         });
-        notify('initialized', {});
+        child.stdin.write(JSON.stringify({ method: 'initialized', params: {} }) + '\n');
         finish(await request(2, method, params));
-      } catch {
-        finish(null);
-      }
-    })();
+      } catch (error) { finish(null, error); }
+    }
+    handshake();
   });
 }
 
@@ -184,7 +210,11 @@ async function fetchModelCatalog() {
         name: String(item.displayName || item.model || item.id || '').trim(),
         description: String(item.description || '').trim(),
         isDefault: !!item.isDefault,
-        hidden: !!item.hidden
+        hidden: !!item.hidden,
+        // 保留服务端声明的推理档位，供设置界面展示，不能靠模型名字猜能力。
+        reasoningOptions: (item.supportedReasoningEfforts || []).map(function reasoningOption(option) {
+          return { value: option.reasoningEffort, label: option.reasoningEffort, description: option.description || '' };
+        })
       }))
       .filter((item) => item.id);
     modelListCacheAt = Date.now();
@@ -198,6 +228,17 @@ function remainingPercent(window) {
   const used = Number(window?.usedPercent);
   if (!Number.isFinite(used)) return null;
   return Math.max(0, Math.min(100, Math.round(100 - used)));
+}
+
+/**
+ * 判断 Codex 工作模式的五小时窗口是否已由服务端确认耗尽。
+ * @param {object} data account/rateLimits/read 返回的原始额度数据。
+ * @returns {boolean} 仅五小时窗口明确达到 100% 时为 true，不把周额度当作工作额度。
+ */
+function fiveHourQuotaExhausted(data) {
+  const limits = data?.rateLimitsByLimitId?.codex || data?.rateLimits;
+  const primary = limits?.primary;
+  return Number(primary?.windowDurationMins) === 300 && Number(primary?.usedPercent) >= 100;
 }
 
 function formatRateLimits(data) {
@@ -233,8 +274,11 @@ async function listModels(modelCfg) {
       input: null,
       output: null,
       isDefault: item.isDefault,
-      hidden: item.hidden
+      hidden: item.hidden,
+      reasoningOptions: item.reasoningOptions
     };
+    // default 是 CLI 的模型别名，档位必须跟随服务端标记的默认模型。
+    if (item.isDefault) catalog[DEFAULT_MODEL].reasoningOptions = item.reasoningOptions;
   }
   return {
     ok: true,
@@ -267,7 +311,7 @@ async function testConnection(modelCfg) {
   fs.mkdirSync(cwd, { recursive: true });
   const thread = codex.startThread({
     model: modelCfg?.model && !['ping', 'default'].includes(String(modelCfg.model)) ? String(modelCfg.model) : undefined,
-    modelReasoningEffort: 'high',
+    modelReasoningEffort: modelCfg?.reasoningEffort || undefined,
     workingDirectory: cwd,
     skipGitRepoCheck: true,
     sandboxMode: 'read-only',
@@ -293,7 +337,7 @@ async function complete({ modelCfg, messages, onDelta, onReason, signal }) {
   fs.mkdirSync(cwd, { recursive: true });
   const thread = codex.startThread({
     model: modelCfg?.model && modelCfg.model !== 'default' ? String(modelCfg.model) : undefined,
-    modelReasoningEffort: 'high',
+    modelReasoningEffort: modelCfg?.reasoningEffort || undefined,
     workingDirectory: cwd,
     skipGitRepoCheck: true,
     sandboxMode: 'read-only',
@@ -312,4 +356,4 @@ async function complete({ modelCfg, messages, onDelta, onReason, signal }) {
   }
 }
 
-module.exports = { CODEX_PROTOCOL, CODEX_BASE_URL, DEFAULT_MODEL, listModels, fetchRateLimitBalance, testConnection, complete };
+module.exports = { CODEX_PROTOCOL, CODEX_BASE_URL, DEFAULT_MODEL, listModels, fetchRateLimitBalance, readRateLimitsFromAppServer, fiveHourQuotaExhausted, testConnection, complete };

@@ -300,7 +300,8 @@ async function ensureBinary(flavor, onWait) {
   return marker;
 }
 
-function runSdCli({ exe, cwd, args, signal, onWait }) {
+/** 启动本地引擎，持续排空两条输出管道，并把真实采样步数交给生图画布。 */
+function runSdCli({ exe, cwd, args, signal, onWait, onProgress }) {
   return new Promise((resolve, reject) => {
     onWait?.('本地生图模型推理中（首次较慢）…');
     let stderr = '';
@@ -314,20 +315,30 @@ function runSdCli({ exe, cwd, args, signal, onWait }) {
       try { child.kill(); } catch { /* ignore */ }
       reject(new Error('本地生图超时，可换更小模型或降低分辨率'));
     }, GEN_TIMEOUT_MS);
-    child.stderr.on('data', (d) => { stderr = (stderr + d.toString('utf8')).slice(-4000); });
-    // [铆钉优化] sd-cli 的进度条写在 stdout，不读的话管道缓冲写满后进程会卡死直到超时。其他 AI 请勿删掉 stdout 的读取
+    const { createSdProgressReader } = require('./image-generation-progress');
     let lastStep = '';
-    child.stdout.on('data', (d) => {
-      const text = d.toString('utf8');
-      stderr = (stderr + text).slice(-4000);
-      const hits = [...text.matchAll(/\|\s*(\d+)\/(\d+)\s*-\s*([\d.]+)(s\/it|it\/s)/g)];
-      const hit = hits[hits.length - 1];
-      if (!hit) return;
-      const step = `${hit[1]}/${hit[2]}`;
-      if (step === lastStep) return;
-      lastStep = step;
-      onWait?.(`本地生图中：第 ${hit[1]}/${hit[2]} 步（${hit[3]}${hit[4]}）`);
-    });
+    /** 两条日志管道独立拼块，共享去重，避免同一步重复刷新画布。 */
+    function reportStep(progress) {
+      const key = progress.step + '/' + progress.total;
+      if (key === lastStep) return;
+      lastStep = key;
+      onWait?.(progress.text);
+      onProgress?.(progress);
+    }
+    const stdoutProgress = createSdProgressReader(reportStep);
+    const stderrProgress = createSdProgressReader(reportStep);
+    /** 持续读取 stdout，防止进程因管道写满而阻塞。 */
+    function readStdout(data) {
+      stderr = (stderr + data.toString('utf8')).slice(-4000);
+      stdoutProgress(data);
+    }
+    /** 同时读取 stderr，兼容引擎把采样进度写到错误流的实际行为。 */
+    function readStderr(data) {
+      stderr = (stderr + data.toString('utf8')).slice(-4000);
+      stderrProgress(data);
+    }
+    child.stdout.on('data', readStdout);
+    child.stderr.on('data', readStderr);
     child.on('error', (err) => {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', onAbort);
@@ -383,7 +394,7 @@ function generationArgs(prompt, outPath, options, imagePath) {
  * 返回 PNG 内容，不修改参考图；无参数时保留原配方的分辨率和步数。
  * @returns {{ buf: Buffer, ext: string }}
  */
-async function generate({ modelPath, prompt, modelsDir, onWait, signal, imagePath, imageOptions: requested = {} }) {
+async function generate({ modelPath, prompt, modelsDir, onWait, onProgress, signal, imagePath, imageOptions: requested = {} }) {
   if (!modelPath || !fs.existsSync(modelPath)) {
     throw new Error('未找到生图模型文件，请确认已下载到模型目录并在「模型组合」挂到生图槽位');
   }
@@ -409,7 +420,9 @@ async function generate({ modelPath, prompt, modelsDir, onWait, signal, imagePat
         args = resolveSimpleArgs(modelPath, prompt, outPath, options, imagePath);
       }
       diag.log('image-gen-engine', '运行 sd-cli', { recipe, flavor, model: path.basename(modelPath) });
-      await runSdCli({ exe: bin.exe, cwd: bin.dir, args, signal, onWait });
+      onProgress?.({ percent: null, phase: 'loading', text: '正在加载本地生图模型' });
+      await runSdCli({ exe: bin.exe, cwd: bin.dir, args, signal, onWait, onProgress });
+      onProgress?.({ phase: 'saving', text: '采样完成，正在读取图片' });
       if (!fs.existsSync(outPath)) throw new Error('生图完成但未找到输出文件');
       const buf = fs.readFileSync(outPath);
       try { fs.rmSync(outPath, { force: true }); } catch { /* ignore */ }

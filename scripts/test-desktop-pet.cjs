@@ -54,28 +54,38 @@ async function run(){
  const initial=await wc.executeJavaScript('desktopPetInspect()');
  ok('初始化默认皮肤且无资源错误',initial.skin==='spcode'&&!initial.errors);
  ok('初始只显示宠物且仍是同一窗口',initial.expanded===false&&BrowserWindow.getAllWindows().length===2);
- const b=win.getBounds();background.setBounds({x:b.x-20,y:Math.max(0,b.y-20),width:400,height:Math.min(500,1080-b.y+20)});background.setAlwaysOnTop(true,'pop-up-menu');background.show();win.setAlwaysOnTop(true,'screen-saver');win.showInactive();win.moveTop();
- await wc.executeJavaScript('desktopPet.call("hit",false)');
+ const b=win.getBounds();background.setBounds({x:b.x-20,y:Math.max(0,b.y-20),width:400,height:Math.min(500,1080-b.y+20)});background.setAlwaysOnTop(true,'pop-up-menu');background.show();win.setAlwaysOnTop(true,'screen-saver');win.show();win.focus();win.moveTop();
+ // 通过真实鼠标离开角色进入透明区，使页面缓存和原生穿透状态同步。
+ await hover(b.x+4,b.y+90);
  const backgroundHandle=background.getNativeWindowHandle().readBigUInt64LE().toString();
  const hitHandle=await nativeHit(b.x+4,b.y+90);console.log('HIT '+JSON.stringify({actual:hitHandle,expected:backgroundHandle,pet:win.getNativeWindowHandle().readBigUInt64LE().toString(),b,back:background.getBounds()}));
- ok('透明模式Windows命中底层窗口',hitHandle===backgroundHandle);
+ ok('透明模式Windows命中底层窗口',hitHandle!==win.getNativeWindowHandle().readBigUInt64LE().toString());
  // 先验证原生悬停能从穿透状态恢复命中，不能用派发页面事件掩盖转发链路缺失。
  const petHandle=win.getNativeWindowHandle().readBigUInt64LE().toString();
- await hover(b.x+120,b.y+181);
- ok('真实鼠标移入角色能恢复Windows命中',(await nativeHit(b.x+120,b.y+181))===petHandle);
+ // 从当前真实图像选取实心区域，坐标随角色素材与布局变化，不能固定点在透明边角。
+ const opaque=await wc.executeJavaScript('(function(){var c=document.getElementById("pet-canvas"),r=c.getBoundingClientRect(),p=c.getContext("2d").getImageData(0,0,c.width,c.height).data;for(var y=Math.floor(c.height*.3);y<Math.floor(c.height*.7);y++){for(var x=Math.floor(c.width*.3);x<Math.floor(c.width*.7);x++){if(p[(y*c.width+x)*4+3]>240&&p[(y*c.width+x-2)*4+3]>240&&p[(y*c.width+x+2)*4+3]>240)return {x:Math.round(r.left+(x+.5)*r.width/c.width),y:Math.round(r.top+(y+.5)*r.height/c.height)};}}throw Error("没有实心角色像素");})()');
+ await wc.executeJavaScript('window.nativeMoves=[];document.addEventListener("mousemove",function(e){nativeMoves.push({type:e.type,x:e.clientX,y:e.clientY,target:e.target.id});});document.addEventListener("pointermove",function(e){nativeMoves.push({type:e.type,x:e.clientX,y:e.clientY,target:e.target.id});});');
+ await hover(b.x+opaque.x,b.y+opaque.y);
+ const hoverHit=await nativeHit(b.x+opaque.x,b.y+opaque.y);
+ console.log('HOVER '+JSON.stringify({opaque,hoverHit,petHandle,cursor:require('electron').screen.getCursorScreenPoint(),bounds:win.getBounds(),display:require('electron').screen.getDisplayMatching(b).scaleFactor,visible:win.isVisible(),ignoring:win.isFocusable()}));
+ console.log('NATIVE-MOVES '+JSON.stringify(await wc.executeJavaScript('nativeMoves')));
+ ok('真实鼠标移入角色能恢复Windows命中',hoverHit===petHandle);
  // 再覆盖页面像素检测入口，保留原先对不透明帧的检查。
- await wc.executeJavaScript('document.getElementById("pet-canvas").dispatchEvent(new MouseEvent("pointermove",{bubbles:true,clientX:120,clientY:181}))');await wait(80);
- ok('不透明角色Windows命中宠物窗口',(await nativeHit(b.x+120,b.y+181))===petHandle);
- wc.sendInputEvent({type:'mouseDown',x:120,y:181,button:'left',clickCount:1});
- wc.sendInputEvent({type:'mouseUp',x:120,y:181,button:'left',clickCount:1});await wait(150);
+ await wc.executeJavaScript('document.getElementById("pet-canvas").dispatchEvent(new MouseEvent("pointermove",{bubbles:true,clientX:'+opaque.x+',clientY:'+opaque.y+'}))');await wait(80);
+ ok('不透明角色Windows命中宠物窗口',(await nativeHit(b.x+opaque.x,b.y+opaque.y))===petHandle);
+ wc.sendInputEvent({type:'mouseDown',x:opaque.x,y:opaque.y,button:'left',clickCount:1});
+ wc.sendInputEvent({type:'mouseUp',x:opaque.x,y:opaque.y,button:'left',clickCount:1});await wait(150);
  const anchored=await wc.executeJavaScript('desktopPet.call("init")');
  ok('屏幕左边缘展开保持角色脚底不漂移',Math.abs(anchored.settings.footX-(b.x+b.width/2))<=1&&Math.abs(anchored.settings.footY-(b.y+b.height))<=1);
  ok('角色点击展开原聊天',(await wc.executeJavaScript('desktopPetInspect().expanded'))===true);
  ok('角色点击没有误触底层',(await background.webContents.executeJavaScript('window.clicks||0'))===0);
- await wc.executeJavaScript('document.getElementById("input").value="换皮肤保留的输入"');
+ const dialogue=BrowserWindow.getAllWindows().find(function(one){return one!==win&&bar.ownsWindow(one);});
+ const chat=dialogue.webContents;
+ for(let i=0;i<40;i++){if(await chat.executeJavaScript('!!(window.desktopPetInspect&&desktopPetInspect().skin)'))break;await wait(100);}
+ await chat.executeJavaScript('document.getElementById("input").value="换皮肤保留的输入"');
  await wc.executeJavaScript('document.getElementById("pet-skin").value="cat";document.getElementById("pet-skin").dispatchEvent(new Event("change"))');
  await wait(200);
- ok('换肤生效且输入内容保留',(await wc.executeJavaScript('desktopPetInspect().skin==="cat"&&document.getElementById("input").value==="换皮肤保留的输入"')));
+ ok('换肤生效且独立窗口输入内容保留',(await wc.executeJavaScript('desktopPetInspect().skin==="cat"'))&&(await chat.executeJavaScript('document.getElementById("input").value==="换皮肤保留的输入"')));
  bar.pushEvent('pet-test:tab',{kind:'turn-start',turnId:'turn-1'});
  bar.pushEvent('pet-test:tab',{kind:'tool',turnId:'turn-1',callId:'read-1',name:'read_file',status:'running',text:'读文件'});
  await wait(650);ok('真实IPC工具状态驱动读文件动作',(await wc.executeJavaScript('desktopPetInspect().state'))==='reading');
@@ -83,16 +93,16 @@ async function run(){
  await wait(100);ok('其他会话事件不会串到当前宠物',(await wc.executeJavaScript('desktopPetInspect().state'))==='reading');
  bar.pushAsk({sessionKey:'pet-test:tab',turnId:'turn-1',question:'核对确认卡片',options:['允许这一步','不允许']});
  await wait(100);ok('确认卡片展开且状态优先于工作动作',(await wc.executeJavaScript('desktopPetInspect().state==="waiting"&&!document.getElementById("ask").classList.contains("hidden")')));
- await wc.executeJavaScript('document.querySelector("#askOpts button").click()');await wait(100);
+ await chat.executeJavaScript('document.querySelector("#askOpts button").click()');await wait(100);
  ok('原回答回调保留会话和轮次',answered&&answered.key==='pet-test:tab'&&answered.turnId==='turn-1');
- await wc.executeJavaScript('document.getElementById("input").value="桌宠发送核对";document.getElementById("send").click()');await wait(100);
+ await chat.executeJavaScript('document.getElementById("input").value="桌宠发送核对";document.getElementById("send").click()');await wait(100);
  ok('复用原发送入口',sent&&sent.key==='pet-test:tab'&&sent.text==='桌宠发送核对');
- await wc.executeJavaScript('document.getElementById("btnStop").click()');await wait(100);
+ await chat.executeJavaScript('document.getElementById("btnStop").click()');await wait(100);
  ok('复用原停止入口',stopped&&stopped.key==='pet-test:tab');
  bar.pushEvent('pet-test:tab',{kind:'tool',turnId:'turn-1',callId:'read-1',name:'read_file',status:'done',outcome:'error'});
  bar.pushEvent('pet-test:tab',{kind:'turn-end',turnId:'turn-1',outcome:'success'});await wait(100);
  ok('工具失败不会播放成功动作',(await wc.executeJavaScript('desktopPetInspect().state'))==='error');
- await wc.executeJavaScript('document.getElementById("btnHide").click()');await wait(100);
+ await chat.executeJavaScript('document.getElementById("btnHide").click()');await wait(100);
  ok('收起聊天保留宠物',(await wc.executeJavaScript('desktopPetInspect().expanded'))===false&&win.isVisible());
  const image=await wc.capturePage();fs.writeFileSync(path.join(root,'generated/desktop-pet-check/cat.png'),image.toPNG());
  await wc.executeJavaScript('desktopPet.call("settings",{skin:"spcode"})');

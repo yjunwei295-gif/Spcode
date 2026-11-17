@@ -95,11 +95,12 @@
       if (t.waiting) { waiting = true; next = 'waiting'; detail = t.detail; break; }
       for (var tool of t.tools.values()) {
         next = tool.state;
-        detail = t.reasoning || t.dialogue || t.detail || this.config.labels[tool.state];
+        // 最新到达的正文或思考写入 detail，工具动作不能重新盖回早先的思考。
+        detail = t.detail || this.config.labels[tool.state];
         count++;
       }
-      // 无工具时：思考相位优先推推理全文，否则用已有 detail。
-      if (!count) { next = t.phase; detail = (t.phase === 'thinking' && t.reasoning) ? t.reasoning : t.detail; }
+      // 工具结束后继续显示最后到达的文字，不按动作类型回放旧思考。
+      if (!count) { next = t.phase; detail = t.detail; }
     }
     if (!this.turns.size && now < this.terminalUntil) return;
     if (count > 1) detail += ' · 共 ' + count + ' 项执行中';

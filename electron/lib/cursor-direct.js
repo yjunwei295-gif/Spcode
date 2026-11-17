@@ -102,8 +102,9 @@ function untilAbort(p, signal) {
  */
 async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [] }) {
   await untilAbort(cursorModel.ensureLogin(modelCfg), signal);
+  const route = cursorModel.refreshCursorRoute();
   const selectedModel = await untilAbort(cursorModel.highModelSelection(modelCfg), signal);
-  sig = `${sig}\nreasoning:${JSON.stringify(selectedModel)}`;
+  sig = `${sig}\nreasoning:${JSON.stringify(selectedModel)}\nroute:${route}`;
   let session = sessions.get(key);
   if (session && (fresh || session.sig !== sig)) {
     closeSession(key);
@@ -140,6 +141,7 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, syst
   const currentContext = systemContext ? `【本轮 SpCode 当前规则与上下文；与旧指令冲突时以本段为准】\n${systemContext}\n\n` : '';
   const text = `${isNew ? `${firstPrefix}\n\n` : ''}${currentContext}${turnText || ''}`.trim();
   const images = imagesOf(userContent);
+  const archive = require('./training-recorder').current();
   let content = '';
   let reasoning = '';
   let sendText = text;
@@ -163,6 +165,8 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, syst
       try {
         sending = session.agent.send(sendImages.length ? { text: sendText, images: sendImages } : sendText, {
           onDelta: ({ update }) => {
+            // SDK 的回调可能来自外部异步资源，使用本次请求捕获的档案引用。
+            if (archive) archive.record('sdk-event', { provider: 'cursor', event: update });
             lastAt = Date.now();
             if (update?.type === 'text-delta' && update.text) {
               content += update.text;

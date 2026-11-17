@@ -178,7 +178,7 @@ function writeSlotBounds(slotNo, bounds) {
 function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
   const slotNo = clampInt(slotIndex, 1, 99, 1);
   let win = null;
-  // 桌宠与聊天共用这个窗口，控制器负责形态和脚底定位。
+  // 控制器管理角色窗口与独立对话窗口，两个页面共享同一会话事件。
   let petController = null;
   let pageReady = false;
   let userHidden = false;
@@ -198,6 +198,8 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
   const buckets = new Map();
   /** 余额是可替换快照，单独保存，避免定期刷新挤掉对话历史。 */
   const quotas = new Map();
+  // 独立对话窗可能晚于全局会话列表创建，首次加载需要恢复最近一次列表。
+  let sessionsEvent = null;
   /** 页面当前绑定的会话键：只有它的事件才即时投递 */
   let boundKey = '';
 
@@ -212,9 +214,15 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     return '';
   }
 
-  app.on('before-quit', function () {
-    quitting = true;
-  });
+  // 全局事件持有实例闭包；按窗口生命周期登记和解除，避免销毁后仍保留历史与回调。
+  const ipcListeners = [];
+  /** 保存本实例的监听引用；销毁时只移除自己的回调，不影响主进程及其它实例。 */
+  function listen(channel, handler) {
+    ipcMain.on(channel, handler);
+    ipcListeners.push({ channel, handler });
+  }
+  /** 应用退出时让角色窗正常关闭。 */
+  function beforeQuit() { quitting = true; }
 
   function resolveBounds() {
     return readSlotBounds(slotNo) || primaryBounds(slotNo);
@@ -244,27 +252,36 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     }, SAVE_DEBOUNCE_MS);
   }
 
+  /** 同一会话的事件同时投递到角色页与独立对话页，独立页加载时另行回灌。 */
+  function deliver(channel, data) {
+    win.webContents.send(channel, data);
+    petController.send(channel, data);
+  }
+
   function flushPending() {
     if (!pageReady || !win || win.isDestroyed()) return;
+    if (sessionsEvent) deliver('floatbar:event', sessionsEvent);
     if (pendingEvent) {
       const ev = pendingEvent;
       pendingEvent = null;
       // 补发前再核一遍：只有全局广播或当前绑定会话才给页面
       if (ev.kind === 'sessions' || keyOf(ev.sessionKey) === boundKey) {
-        win.webContents.send('floatbar:event', ev);
+        deliver('floatbar:event', ev);
       }
     }
     // 余额独立于事件队列；页面首次加载或重载时总能取得当前绑定的最新快照。
-    win.webContents.send('floatbar:event', { kind: 'quota', sessionKey: boundKey, snapshot: quotas.has(boundKey) ? quotas.get(boundKey) : null });
+    deliver('floatbar:event', { kind: 'quota', sessionKey: boundKey, snapshot: quotas.has(boundKey) ? quotas.get(boundKey) : null });
     if (pendingAsk) {
       const ask = pendingAsk;
       pendingAsk = null;
-      win.webContents.send('floatbar:ask', ask);
+      deliver('floatbar:ask', ask);
     }
   }
 
+  /** 初始化角色窗及其事件；销毁后再次唤起时重新绑定，不累计全局监听。 */
   function ensureWindow() {
     if (win && !win.isDestroyed()) return win;
+    registerInstanceEvents();
     pageReady = false;
     const b = resolveBounds();
     win = new BrowserWindow({
@@ -328,8 +345,12 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
       pageReady = true;
       flushPending();
     });
-    petController = desktopPet.attach(win, slotNo, b);
+    petController = desktopPet.attach(win, slotNo, b, function dialogueReady() {
+      setBoundKey(boundKey);
+      if (sessionsEvent) petController.send('floatbar:event', sessionsEvent);
+    });
     win.loadFile(path.join(__dirname, 'float-bar.html'));
+    // 启动只初始化角色页；独立对话窗由快捷键、菜单或待确认请求按需唤出，不自动抢焦点。
     return win;
   }
 
@@ -348,6 +369,7 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
       return;
     }
     userHidden = true;
+    // 宠物显隐不再影响输入窗，草稿和键盘焦点由输入窗自身管理。
     if (win && !win.isDestroyed()) win.hide();
   }
 
@@ -358,6 +380,12 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
   function toggle() {
     if (isVisible()) hide();
     else show();
+  }
+
+  /** 全局快捷键直接切换独立输入窗；不显示、移动或隐藏宠物。 */
+  function toggleInput() {
+    ensureWindow();
+    petController.setExpanded(!petController.isExpanded());
   }
 
   function isReady() {
@@ -386,7 +414,7 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
   function syncCompactState() {
     if (!win || win.isDestroyed()) return;
     try {
-      win.webContents.send('floatbar:state', { compact: compactOn });
+      deliver('floatbar:state', { compact: compactOn });
     } catch (e) {
       diag.log('floatbar', '同步小窗紧凑状态失败', { slot: slotNo, message: e && e.message });
     }
@@ -410,7 +438,7 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     try {
       // 与 flushPending / pushEvent 同一条通道、同一个 channel 名；页面没监听也不影响主流程
       if (win.webContents && !win.webContents.isDestroyed()) {
-        win.webContents.send('floatbar:event', { kind: 'repaint' });
+        deliver('floatbar:event', { kind: 'repaint' });
       }
     } catch (e) {
       diag.log('floatbar', '通知小窗强制重绘失败', { slot: slotNo, message: e && e.message });
@@ -526,7 +554,7 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
 
   /** 主进程按窗口找实例时用：判定传入窗口是不是本实例的小窗（认不出就走主进程自己的兜底判定） */
   function ownsWindow(target) {
-    return !!(win && !win.isDestroyed() && target === win);
+    return !!(win && !win.isDestroyed() && (target === win || petController.ownsDialogue(target)));
   }
 
   /**
@@ -550,11 +578,38 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     // 强制补 sessionKey：payload 自己带了的以它为准
     ev.sessionKey = (ev.sessionKey == null || ev.sessionKey === '') ? key : keyOf(ev.sessionKey);
 
+    // 会话清单是主窗提供的存活集合；关闭的标签与窗口不再占用历史、余额和待确认对象。
+    if (ev.kind === 'sessions') {
+      sessionsEvent = ev;
+      const live = new Set();
+      for (const item of ev.sessions) live.add(keyOf(item.key));
+      for (const sessionKey of buckets.keys()) if (!live.has(sessionKey)) buckets.delete(sessionKey);
+      for (const sessionKey of quotas.keys()) if (!live.has(sessionKey)) quotas.delete(sessionKey);
+      if (boundKey && !live.has(boundKey)) {
+        boundKey = '';
+        pendingAsk = null;
+        pendingEvent = { kind: 'history', sessionKey: '', items: [] };
+        if (pageReady) {
+          deliver('floatbar:event', pendingEvent);
+          deliver('floatbar:event', { kind: 'quota', sessionKey: '', snapshot: null });
+          pendingEvent = null;
+        }
+      }
+      ensureWindow();
+      if (pageReady) deliver('floatbar:event', ev);
+      return;
+    }
+    // 关闭会话后在途轮次可能仍有尾部事件，按已知存活清单丢弃，避免重新建立已释放的桶。
+    if (sessionsEvent && ev.sessionKey) {
+      let live = false;
+      for (const item of sessionsEvent.sessions) if (keyOf(item.key) === ev.sessionKey) live = true;
+      if (!live) return;
+    }
     // 余额不属于轮次消息，不计入每会话的 30 条历史限额。
     if (ev.kind === 'quota') {
       quotas.set(ev.sessionKey, ev.snapshot);
       const target = ensureWindow();
-      if (pageReady && ev.sessionKey === boundKey) target.webContents.send('floatbar:event', ev);
+      if (pageReady && ev.sessionKey === boundKey) deliver('floatbar:event', ev);
       return;
     }
     let bucket = buckets.get(ev.sessionKey);
@@ -566,15 +621,13 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     // 超出上限从头部丢
     while (bucket.length > HISTORY_LIMIT) bucket.shift();
 
-    // kind === 'sessions' 是全局广播（刷新会话列表），跟绑没绑定无关，始终发
-    const isGlobal = ev.kind === 'sessions';
     const w = ensureWindow();
     if (pageReady && w && !w.isDestroyed()) {
-      if (isGlobal || ev.sessionKey === boundKey) w.webContents.send('floatbar:event', ev);
+      if (ev.sessionKey === boundKey) deliver('floatbar:event', ev);
       return;
     }
-    // 页面没加载完先留最后一条，did-finish-load 后补发
-    if (isGlobal || ev.sessionKey === boundKey) pendingEvent = ev;
+    // 页面没加载完先留当前会话的最后一条，did-finish-load 后补发。
+    if (ev.sessionKey === boundKey) pendingEvent = ev;
   }
 
   /**
@@ -598,11 +651,11 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     pendingAsk = asks.size ? Array.from(asks.values())[asks.size - 1] : null;
     const w = ensureWindow();
     if (pageReady && w && !w.isDestroyed()) {
-      w.webContents.send('floatbar:event', ev);
-      w.webContents.send('floatbar:event', { kind: 'quota', sessionKey: boundKey, snapshot: quotas.has(boundKey) ? quotas.get(boundKey) : null });
+      deliver('floatbar:event', ev);
+      deliver('floatbar:event', { kind: 'quota', sessionKey: boundKey, snapshot: quotas.has(boundKey) ? quotas.get(boundKey) : null });
       if (pendingAsk) {
-        petController.setExpanded(true);
-        w.webContents.send('floatbar:ask', pendingAsk);
+        petController.setExpanded(true, false);
+        deliver('floatbar:ask', pendingAsk);
         pendingAsk = null;
       }
       return;
@@ -616,99 +669,116 @@ function createFloatBar({ slotIndex = 1, canHide = true, ...opts } = {}) {
     pushEvent(keyOf(payload.sessionKey), Object.assign({}, payload, { kind: 'ask' }));
     if (keyOf(payload.sessionKey) !== boundKey) return;
     const w = ensureWindow();
-    petController.setExpanded(true);
+    petController.setExpanded(true, false);
     if (pageReady && w && !w.isDestroyed()) {
-      w.webContents.send('floatbar:ask', payload);
+      deliver('floatbar:ask', payload);
       return;
     }
     pendingAsk = payload;
   }
 
+  /** 销毁双窗并释放本实例持有的全局监听、计时器与会话内存；磁盘记录不变。 */
   function destroy() {
-    // destroy 不触发 close 事件，所以不用动 quitting；quitting 只跟 app 的 before-quit 走
+    for (const item of ipcListeners) ipcMain.removeListener(item.channel, item.handler);
+    ipcListeners.length = 0;
+    app.removeListener('before-quit', beforeQuit);
     if (saveTimer) {
       clearTimeout(saveTimer);
       saveTimer = null;
     }
+    if (compactAnimTimer) {
+      clearTimeout(compactAnimTimer);
+      compactAnimTimer = null;
+    }
     saveBoundsNow();
     if (win && !win.isDestroyed()) win.destroy();
     win = null;
+    petController = null;
     pageReady = false;
+    pendingEvent = null;
+    pendingAsk = null;
+    sessionsEvent = null;
+    buckets.clear();
+    quotas.clear();
   }
 
-  // 悬浮栏通道在这里统一绑一次，避免主进程别处再绑一份造成重复发送
-  // 回调一律把会话键放第一位：页面带 key 就用页面的，没带就用当前绑定兜底
-  ipcMain.on('floatbar:send', function (_e, raw) {
-    const key = keyFromPayload(raw) || boundKey;
-    const text = (raw && typeof raw === 'object') ? raw.text : raw;
-    // 附件清单（图片粘贴后落盘得到的 { path, name } 数组）原样透传给主进程，
-    // 这里不筛选不校验：老的两参调用没带 attachments，统一兜底成空数组，主进程按数组处理
-    const attachments = (raw && typeof raw === 'object' && Array.isArray(raw.attachments))
-      ? raw.attachments
-      : [];
-    if (typeof opts.onSend === 'function') opts.onSend(key, String(text == null ? '' : text), attachments);
-  });
-  ipcMain.on('floatbar:answer', function (_e, raw) {
-    const key = keyFromPayload(raw) || boundKey;
-    const value = (raw && typeof raw === 'object' && 'value' in raw) ? raw.value : raw;
-    // 整对象透传：同一个窗口可能有多个标签页在等回答，turnId 必须一起带到主进程，主进程不允许猜
-    const turnId = String(raw && raw.turnId != null ? raw.turnId : '');
-    if (typeof opts.onAnswer === 'function') opts.onAnswer({ key: key, value: value, turnId: turnId });
-  });
-  ipcMain.on('floatbar:abort', function (_e, raw) {
-    const key = keyFromPayload(raw) || boundKey;
-    const turnId = String(raw && raw.turnId != null ? raw.turnId : '');
-    if (typeof opts.onAbort === 'function') opts.onAbort({ key: key, turnId: turnId });
-  });
-  // 小窗点「开始」：页面按契约发 { sessionKey, value }，两个键名都认
-  // key 定位哪个会话，value 是用户点的那颗方案按钮的值（顶栏按钮给的）：空串 = 点默认那颗，
-  // 数组 = 多选「一起开工」勾中的 value 清单（长度就是勾选数量）
-  // value 一律原样透传（数组保持数组），只有 undefined/null 才用空串兜底；
-  // 这里禁止 String()/join()/JSON 拼串，一转就会把数组压成 "[object Object]" 或 "a,b"
-  // 这里只透传，不解析 value 的含义，也不判断能不能开工（判定只有 renderer/app.js 一份）
-  // 补充说明 note（用户填的补充说明，字符串，可为空）同样原样透传到主进程：
-  // 这一环纯转发，不解析、不拼串、不做 String() 字符串化，没传时兜底成空串
-  ipcMain.on('floatbar:start', function (_e, raw) {
-    const key = keyFromPayload(raw) || (raw && typeof raw === 'object' ? keyOf(raw.sessionKey) : '') || boundKey;
-    const value = (raw && typeof raw === 'object' && raw.value != null) ? raw.value : '';
-    const note = (raw && typeof raw === 'object' && raw.note != null) ? raw.note : '';
-    if (typeof opts.onStart === 'function') opts.onStart(key, value, note);
-  });
-  /**
-   * 页面上报绑定键的统一入口（floatbar:bind → 主进程），绑定键的赋值只在这里发生，避免多处赋值不一致。
-   * 非空键：页面自己认领的会话，直接切桶回灌；
-   * 空键（空串／undefined）：不覆盖已有的非空绑定（本地的非空 boundKey 不被空值清掉），
-   * 但照常把这次上报转给主进程 —— 沿用文件里已有的这条上报通道 opts.onBind，不新造通道名 ——
-   * 由主进程回一次该会话的 history 回灌来校准，免得页面首发时机不巧时一条事件都收不到、顶栏一直「未绑定会话」
-   */
-  function reportBoundKeyFromPage(raw) {
-    const key = keyFromPayload(raw) || (typeof raw === 'string' ? keyOf(raw) : '');
-    if (key) setBoundKey(key);
-    if (typeof opts.onBind === 'function') opts.onBind(key || boundKey);
-  }
-  ipcMain.on('floatbar:bind', function (_e, raw) {
-    reportBoundKeyFromPage(raw);
-  });
-  ipcMain.on('floatbar:hide', function () {
-    hide();
-    if (typeof opts.onHide === 'function') opts.onHide();
-  });
-  // 小窗最小化/还原（主进程转发过来的指令）：跟本文件其他小窗通道同一 IP 风格注册，实例初始化时绑一次。
-  // 只有消息来自本实例的小窗才处理，认不出归属直接忽略，绝不误动别的小窗；重复调用由 setCompact 自行去重
-  ipcMain.on('floatbar:compact', function (event, on) {
-    let senderWin = null;
-    try {
-      senderWin = BrowserWindow.fromWebContents(event.sender);
-    } catch (e) {
-      senderWin = null;
+  /** 为当前窗口登记原有消息通道；销毁后可重新登记，每个实例仅保留一组。 */
+  function registerInstanceEvents() {
+    if (ipcListeners.length) return;
+    app.on('before-quit', beforeQuit);
+    // 回调一律把会话键放第一位：页面带 key 就用页面的，没带就用当前绑定兜底
+    listen('floatbar:send', function (_e, raw) {
+      const key = keyFromPayload(raw) || boundKey;
+      const text = (raw && typeof raw === 'object') ? raw.text : raw;
+      // 附件清单（图片粘贴后落盘得到的 { path, name } 数组）原样透传给主进程，
+      // 这里不筛选不校验：老的两参调用没带 attachments，统一兜底成空数组，主进程按数组处理
+      const attachments = (raw && typeof raw === 'object' && Array.isArray(raw.attachments))
+        ? raw.attachments
+        : [];
+      if (typeof opts.onSend === 'function') opts.onSend(key, String(text == null ? '' : text), attachments);
+    });
+    listen('floatbar:answer', function (_e, raw) {
+      const key = keyFromPayload(raw) || boundKey;
+      const value = (raw && typeof raw === 'object' && 'value' in raw) ? raw.value : raw;
+      // 整对象透传：同一个窗口可能有多个标签页在等回答，turnId 必须一起带到主进程，主进程不允许猜
+      const turnId = String(raw && raw.turnId != null ? raw.turnId : '');
+      if (typeof opts.onAnswer === 'function') opts.onAnswer({ key: key, value: value, turnId: turnId });
+    });
+    listen('floatbar:abort', function (_e, raw) {
+      const key = keyFromPayload(raw) || boundKey;
+      const turnId = String(raw && raw.turnId != null ? raw.turnId : '');
+      if (typeof opts.onAbort === 'function') opts.onAbort({ key: key, turnId: turnId });
+    });
+    // 小窗点「开始」：页面按契约发 { sessionKey, value }，两个键名都认
+    // key 定位哪个会话，value 是用户点的那颗方案按钮的值（顶栏按钮给的）：空串 = 点默认那颗，
+    // 数组 = 多选「一起开工」勾中的 value 清单（长度就是勾选数量）
+    // value 一律原样透传（数组保持数组），只有 undefined/null 才用空串兜底；
+    // 这里禁止 String()/join()/JSON 拼串，一转就会把数组压成 "[object Object]" 或 "a,b"
+    // 这里只透传，不解析 value 的含义，也不判断能不能开工（判定只有 renderer/app.js 一份）
+    // 补充说明 note（用户填的补充说明，字符串，可为空）同样原样透传到主进程：
+    // 这一环纯转发，不解析、不拼串、不做 String() 字符串化，没传时兜底成空串
+    listen('floatbar:start', function (_e, raw) {
+      const key = keyFromPayload(raw) || (raw && typeof raw === 'object' ? keyOf(raw.sessionKey) : '') || boundKey;
+      const value = (raw && typeof raw === 'object' && raw.value != null) ? raw.value : '';
+      const note = (raw && typeof raw === 'object' && raw.note != null) ? raw.note : '';
+      if (typeof opts.onStart === 'function') opts.onStart(key, value, note);
+    });
+    /**
+     * 页面上报绑定键的统一入口（floatbar:bind → 主进程），绑定键的赋值只在这里发生，避免多处赋值不一致。
+     * 非空键：页面自己认领的会话，直接切桶回灌；
+     * 空键（空串／undefined）：不覆盖已有的非空绑定（本地的非空 boundKey 不被空值清掉），
+     * 但照常把这次上报转给主进程 —— 沿用文件里已有的这条上报通道 opts.onBind，不新造通道名 ——
+     * 由主进程回一次该会话的 history 回灌来校准，免得页面首发时机不巧时一条事件都收不到、顶栏一直「未绑定会话」
+     */
+    function reportBoundKeyFromPage(raw) {
+      const key = keyFromPayload(raw) || (typeof raw === 'string' ? keyOf(raw) : '');
+      if (key) setBoundKey(key);
+      if (typeof opts.onBind === 'function') opts.onBind(key || boundKey);
     }
-    if (!senderWin || !ownsWindow(senderWin)) return;
-    setCompact(on === true);
-  });
+    listen('floatbar:bind', function (_e, raw) {
+      reportBoundKeyFromPage(raw);
+    });
+    listen('floatbar:hide', function () {
+      hide();
+      if (typeof opts.onHide === 'function') opts.onHide();
+    });
+    // 小窗最小化/还原（主进程转发过来的指令）：跟本文件其他小窗通道同一 IP 风格注册，实例初始化时绑一次。
+    // 只有消息来自本实例的小窗才处理，认不出归属直接忽略，绝不误动别的小窗；重复调用由 setCompact 自行去重
+    listen('floatbar:compact', function (event, on) {
+      let senderWin = null;
+      try {
+        senderWin = BrowserWindow.fromWebContents(event.sender);
+      } catch (e) {
+        senderWin = null;
+      }
+      if (!senderWin || !ownsWindow(senderWin)) return;
+      setCompact(on === true);
+    });
+  }
 
   ensureWindow();
 
-  return { show, hide, toggle, isVisible, pushEvent, setBoundKey, pushAsk, isReady, destroy, setCompact, ownsWindow, moveToPlace, resizeBy };
+  return { show, hide, toggle, toggleInput, isVisible, pushEvent, setBoundKey, pushAsk, isReady, destroy, setCompact, ownsWindow, moveToPlace, resizeBy };
 }
 
 module.exports = { createFloatBar };

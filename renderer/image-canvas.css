@@ -1,0 +1,25 @@
+/* 画布作为聊天右侧的独立工作区，窄窗口覆盖展示，避免把正文挤成细列。 */
+.image-canvas { flex: 0 1 390px; width: 390px; min-width: 260px; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--panel); }
+.image-canvas-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.image-canvas-head button { background: transparent; color: var(--muted); border: 0; font-size: 22px; cursor: pointer; }
+.image-canvas-tasks { overflow-y: auto; min-height: 0; padding: 14px; }
+.image-canvas-empty { color: var(--muted); line-height: 1.7; padding: 20px 4px; }
+.image-canvas-card { border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 14px; }
+.image-canvas-card header { display: flex; gap: 12px; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.image-canvas-card header strong { overflow-wrap: anywhere; font-size: 13px; }
+.image-canvas-card header span { flex-shrink: 0; color: var(--accent); font-size: 13px; }
+.image-canvas-preview { min-height: 160px; border-radius: 8px; display: flex; align-items: center; justify-content: center; background: var(--bg); color: var(--muted); overflow: hidden; }
+.image-canvas-preview img { display: block; width: 100%; height: auto; cursor: zoom-in; }
+.image-canvas-card progress { width: 100%; height: 6px; margin-top: 12px; accent-color: var(--accent); }
+.image-canvas-status { color: var(--muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.image-canvas-prompt { font-size: 12px; line-height: 1.6; max-height: 6.4em; overflow: auto; white-space: pre-wrap; }
+.image-canvas-card > button { margin-top: 10px; padding: 6px 10px; background: transparent; color: var(--accent); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; }
+.reasoning-control { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px; align-items: center; }
+.reasoning-control strong { font-size: 12px; }
+.reasoning-control select { width: auto; flex: 1; min-width: 90px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); }
+.reasoning-control small { flex-basis: 100%; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.chat-stage:has(.image-canvas:not(.hidden)) .messages { padding-left: 24px; padding-right: 24px; }
+@media (max-width: 900px) {
+  .image-canvas { position: absolute; inset: 0 0 0 auto; z-index: 8; width: min(390px, 100%); min-width: 0; }
+  .chat-stage { position: relative; }
+}

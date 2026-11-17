@@ -1,5 +1,5 @@
 // [铆钉优化] SpCode 做的应用/网页默认用 SpCode 自己这套样式，主题跟随 SpCode 当前主题；用户明确要别的样式时以用户为准。
-// 配色取自 renderer/styles.css 的「电路板」（浅色）与「黑金幻彩」（深色）两段。改那两段主题时同步改这里。其他 AI 请勿删除。
+// 配色取自 renderer/styles.css 的「电路板」（浅色）、「黑金幻彩」（深色）与「锐线赛璐璐」三段。改主题样式时同步改这里。其他 AI 请勿删除。
 const store = require('./store');
 
 const LIGHT = {
@@ -68,17 +68,59 @@ body {
   traitsEn: 'Matte deep black with faint purple/magenta/cyan fog; rounded (10-14px); champagne-gold accent, primary buttons in the metallic gold gradient with dark text; cards and inputs get a thin iridescent edge (1px gradient border from --iris-edge); warm white text, grey-violet secondary text; deep soft shadows.'
 };
 
+/**
+ * 获取已解析的主题标识，让独立主题也参与生成界面的样式提示。
+ * @returns {string} 当前主题 ID；读取失败时回退为 light。
+ * @sideEffect 读取设置存储，不修改主题偏好。
+ */
 function currentTheme() {
   try {
-    return store.resolveTheme(store.load().theme) === 'dark' ? 'dark' : 'light';
+    return store.resolveTheme(store.load().theme);
   } catch {
     return 'light';
   }
 }
 
+/** 锐线赛璐璐的生成用配色，与 renderer/styles.css 的 cel 主题同步。 */
+const CEL = {
+  nameZh: '锐线赛璐璐',
+  nameEn: 'Sharp Cel',
+  css: `:root {
+  color-scheme: light;
+  --bg: #e8ebf0;
+  --panel: #f8f9fc;
+  --card: #ffffff;
+  --field: #ffffff;
+  --text: #171923;
+  --muted: #596273;
+  --border: #171923;
+  --border-strong: #171923;
+  --hover: #ffe4e7;
+  --accent: #d92340;
+  --accent-fg: #ffffff;
+  --danger: #b81931;
+  --cel-highlight: #ff3855;
+  --cel-tint: #ffe4e7;
+  --cel-ink: #171923;
+  --cel-paper: #ffffff;
+  --primary-bg: var(--accent);
+  --primary-shadow: 3px 3px 0 var(--border);
+  --shadow: 5px 5px 0 var(--cel-ink);
+  --r: 0px;
+  --r-lg: 2px;
+  --font: "Segoe UI", "Microsoft YaHei", sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
+}`,
+  traitsZh: '冷白与墨黑大色块、朱红强调、撕裂状不对称构图；卡片宽度、错位和倾斜各异，避免等分整齐；标题倾斜加硬高光，卡片用2px墨线与无模糊偏移投影，0~2px锐利圆角；主按钮实心朱红配白字，主框架黑底白字；装饰避开阅读区，不使用柔光渐变或电路背景。',
+  traitsEn: 'Cold white and ink-black blocks with crimson accents and angular cutouts; italic titles with hard highlights, 2px ink outlines, offset hard shadows and 0-2px corners; solid crimson buttons with white text, black chrome with white text; keep decorations outside reading areas, no soft gradient glows or circuit background.'
+};
+
+/** 按当前主题和界面语言生成样式提示，三套主题互不替换。 */
 function promptBlock(english) {
   const theme = currentTheme();
-  const t = theme === 'dark' ? DARK : LIGHT;
+  let t = LIGHT;
+  if (theme === 'dark') t = DARK;
+  if (theme === 'cel') t = CEL;
   if (english) {
     return `\n## Default UI style (SpCode house style)
 When you build a new app, web page, tool UI, or component and the user has not asked for a specific look, use SpCode's own style in its current theme: ${t.nameEn}. ${t.traitsEn}

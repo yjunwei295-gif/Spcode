@@ -11,6 +11,8 @@ const REUSE_MS = 20000;
 // 闲置 1 分钟就关 OCR 引擎，及时还内存
 const OCR_IDLE_MS = 60 * 1000;
 const OCR_RETRY_MS = 60 * 1000;
+// Tesseract 5 按任务编号保留回调和结果；ocrQueue 保证逐帧串行，每个 worker 可复用同一任务槽。
+const OCR_RECOGNIZE_JOB_ID = 'screen-ocr';
 const HASH_W = 128;
 const HASH_H = 72;
 
@@ -138,7 +140,11 @@ function dedupeOverlap(pieces) {
   return kept;
 }
 
-// 返回原图像素坐标下的行片段 {text, x0, y0, x1, y1, conf}；maxWorkers 限制本次并行条数（电脑忙时传 1）
+/**
+ * 串行识别图像，返回原图像素坐标下的行片段 {text, x0, y0, x1, y1, conf}。
+ * maxWorkers 限制本次并行条数，繁忙时传 1；同一 worker 的前一任务结束后才开始下一帧，
+ * 因而能复用固定任务编号，覆盖 Tesseract 5 留存的回调，避免持续读屏累积历史识别结果。
+ */
 function recognize(image, maxWorkers) {
   const job = ocrQueue.then(async () => {
     const all = await getOcr();
@@ -155,8 +161,22 @@ function recognize(image, maxWorkers) {
       const h = Math.min(height, top + bandH + BAND_OVERLAP) - y;
       bands.push({ y, h, cutTop: i > 0, cutBottom: y + h < height });
     }
-    const results = await Promise.all(bands.map((b, i) =>
-      workers[i].recognize(image.crop({ x: 0, y: b.y, width, height: b.h }).toPNG())));
+    /**
+     * 使用本帧独占的 worker 识别一个图像条带。
+     * band 是原图裁剪范围，index 是对应 worker 下标；返回该条带的 OCR 结果。
+     * 裁剪失败也必须转为 Promise 拒绝，让 allSettled 等待其它在途条带后再开放下一帧。
+     */
+    async function recognizeBand(band, index) {
+      const png = image.crop({ x: 0, y: band.y, width, height: band.h }).toPNG();
+      return workers[index].recognize(png, {}, undefined, OCR_RECOGNIZE_JOB_ID);
+    }
+    // 某条带失败也要等其它 worker 结束，下一帧才能复用编号；识别错误仍原样抛给调用方。
+    const settled = await Promise.allSettled(bands.map(recognizeBand));
+    const results = [];
+    for (const result of settled) {
+      if (result.status === 'rejected') throw result.reason;
+      results.push(result.value);
+    }
     const pieces = [];
     results.forEach((res, i) => {
       const b = bands[i];

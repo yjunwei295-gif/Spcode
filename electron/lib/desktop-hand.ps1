@@ -1,4 +1,4 @@
-# ASCII-only helper. Node writes one JSON command per line and reads one JSON line back.
+﻿# 常驻 UTF-8 帮助进程：每行接收一个 JSON 请求并返回一个 JSON 结果。
 # [Rivet opt] rework: unicode typing via SendInput, window list/focus, foreground check, full key map. Other AIs: do not change or revert this to clipboard-only typing.
 $OutputEncoding = New-Object System.Text.UTF8Encoding $false
 [Console]::OutputEncoding = $OutputEncoding
@@ -112,6 +112,35 @@ public class DeskHand {
     return list;
   }
 
+  // 查询窗口和进程身份，拒绝失效句柄或复用后属于其它进程的窗口。
+  public static string ProcessIdentity(int processId) {
+    using (System.Diagnostics.Process p = System.Diagnostics.Process.GetProcessById(processId)) {
+      return processId.ToString() + ":" + p.StartTime.ToUniversalTime().Ticks.ToString();
+    }
+  }
+  public static void CheckWindow(long handle, int processId) {
+    uint actual;
+    GetWindowThreadProcessId(new IntPtr(handle), out actual);
+    if (actual == 0 || actual != (uint)processId) throw new InvalidOperationException("Window identity changed");
+  }
+  [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadProcessMemory(IntPtr process, IntPtr address, byte[] bytes, UIntPtr length, out UIntPtr count);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+  // 仅读取明确的短区间；复用当前帮助进程，避免每次采样重新启动并编译 PowerShell。
+  public static string ReadMemory(int processId, string address, int length) {
+    IntPtr process = OpenProcess(0x410, false, processId);
+    if (process == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    try {
+      byte[] bytes = new byte[length];
+      UIntPtr count;
+      long location = unchecked((long)Convert.ToUInt64(address.Substring(2), 16));
+      if (!ReadProcessMemory(process, new IntPtr(location), bytes, new UIntPtr((uint)length), out count))
+        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      if (count.ToUInt64() != (ulong)length) throw new InvalidOperationException("Partial memory read");
+      return Convert.ToBase64String(bytes);
+    } finally { CloseHandle(process); }
+  }
+
   public static bool Focus(IntPtr h) {
     if (IsIconic(h)) ShowWindow(h, 9);
     keybd_event(0x12, 0, 0, 0);
@@ -211,6 +240,79 @@ public static class Uia {
     seq++;
     return new object[] { seq, "", rows };
   }
+
+  // 单份在途查询限制 UIA 超时线程数量，独立于操作编号缓存。
+  static Thread stateRunning;
+  // 具名工作对象保存一次查询的输入与结果，线程不使用匿名闭包。
+  sealed class StateQuery {
+    readonly long handle;
+    readonly string[] keys, names, aids, types;
+    public readonly Dictionary<string, object> records = new Dictionary<string, object>();
+    public Exception failure;
+    // 输入数组仅在当前查询使用，结果不持有 AutomationElement 强引用。
+    public StateQuery(long handle, string[] keys, string[] names, string[] aids, string[] types) {
+      this.handle = handle; this.keys = keys; this.names = names; this.aids = aids; this.types = types;
+    }
+    // 在专用后台线程读取完整字段；错误交回等待方，不吞掉失效对象或多匹配。
+    public void Run() {
+      try {
+        AutomationElement root = AutomationElement.FromHandle(new IntPtr(handle));
+        for (int i = 0; i < keys.Length; i++) {
+          List<Condition> filters = new List<Condition>();
+          // PowerShell 绑定 string[] 时把未提供项转为空串；只为实际提供的非空属性建立条件。
+          if (!String.IsNullOrEmpty(names[i])) filters.Add(new PropertyCondition(AutomationElement.NameProperty, names[i]));
+          if (!String.IsNullOrEmpty(aids[i])) filters.Add(new PropertyCondition(AutomationElement.AutomationIdProperty, aids[i]));
+          Condition filter = filters.Count == 1 ? filters[0] : new AndCondition(filters.ToArray());
+          AutomationElementCollection found = root.FindAll(TreeScope.Descendants, filter);
+          AutomationElement match = null;
+          int count = 0;
+          foreach (AutomationElement element in found) {
+            string type = element.Current.ControlType.ProgrammaticName.Substring("ControlType.".Length);
+            if (!String.IsNullOrEmpty(types[i]) && type != types[i]) continue;
+            count++;
+            match = element;
+          }
+          if (count > 1) throw new InvalidOperationException("Ambiguous control: " + keys[i]);
+          if (count == 0) continue;
+          Dictionary<string, object> item = new Dictionary<string, object>();
+          item["name"] = match.Current.Name;
+          item["automationId"] = match.Current.AutomationId;
+          item["type"] = match.Current.ControlType.ProgrammaticName.Substring("ControlType.".Length);
+          item["runtimeId"] = String.Join(".", Array.ConvertAll(match.GetRuntimeId(), ConvertInt));
+          item["enabled"] = match.Current.IsEnabled;
+          item["offscreen"] = match.Current.IsOffscreen;
+          item["password"] = match.Current.IsPassword;
+          object pattern;
+          if (!match.Current.IsPassword && match.TryGetCurrentPattern(ValuePattern.Pattern, out pattern)) {
+            ValuePattern.ValuePatternInformation value = ((ValuePattern)pattern).Current;
+            item["value"] = value.Value;
+            item["readOnly"] = value.IsReadOnly;
+          }
+          if (match.TryGetCurrentPattern(TogglePattern.Pattern, out pattern)) item["toggle"] = ((TogglePattern)pattern).Current.ToggleState.ToString();
+          if (match.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern)) item["selected"] = ((SelectionItemPattern)pattern).Current.IsSelected;
+          if (match.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out pattern)) item["expanded"] = ((ExpandCollapsePattern)pattern).Current.ExpandCollapseState.ToString();
+          if (match.TryGetCurrentPattern(RangeValuePattern.Pattern, out pattern)) item["range"] = ((RangeValuePattern)pattern).Current.Value;
+          records.Add(keys[i], item);
+        }
+      } catch (Exception error) { failure = error; }
+    }
+  }
+  // 按精确选择器只读控件状态；超时明确失败，不更新屏幕控件编号。
+  public static Dictionary<string, object> Observe(long handle, string[] keys, string[] names, string[] aids, string[] types, int timeoutMs) {
+    if (stateRunning != null && stateRunning.IsAlive) throw new InvalidOperationException("State query still busy");
+    StateQuery query = new StateQuery(handle, keys, names, aids, types);
+    Thread thread = new Thread(query.Run);
+    thread.IsBackground = true;
+    thread.Priority = ThreadPriority.BelowNormal;
+    stateRunning = thread;
+    thread.Start();
+    if (!thread.Join(timeoutMs)) throw new TimeoutException("State query timeout");
+    stateRunning = null;
+    if (query.failure != null) throw query.failure;
+    return query.records;
+  }
+  // 运行时编号只用于识别对象替换，不转换成可操作的屏幕控件编号。
+  static string ConvertInt(int value) { return value.ToString(); }
 
   public static string Act(int s, int idx, string action, string text) {
     if (s != seq) return "stale";
@@ -405,6 +507,45 @@ while ($true) {
       [DeskHand]::GetWindowText($h, $caption, $caption.Capacity) | Out-Null
       $foregroundProc = Get-Process -Id $procId -ErrorAction Stop
       Send-Obj @{ ok = $true; hwnd = [string]$h.ToInt64(); pid = [int]$procId; title = $caption.ToString(); proc = $foregroundProc.ProcessName; left = $origin.X; top = $origin.Y; right = $extent.X; bottom = $extent.Y; monitor = @{ left = $monitorInfo.rcMonitor.Left; top = $monitorInfo.rcMonitor.Top; right = $monitorInfo.rcMonitor.Right; bottom = $monitorInfo.rcMonitor.Bottom } }
+      continue
+    }
+    # 结构化状态不截图、不做 OCR，也不更新 UIA 操作缓存；错误原样返回给调用者。
+    if ($op -eq "runtime_read") {
+      $startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+      $records = @{}
+      $identity = "windows"
+      if ($cmd.source -eq "windows") {
+        foreach ($window in (Window-List)) {
+          if ($window.pid -eq $cmd.selfPid) { continue }
+          if ($null -ne $cmd.target -and $window.pid -ne $cmd.target.pid) { continue }
+          $records["window:" + $window.hwnd] = $window
+        }
+      } else {
+        $identity = [DeskHand]::ProcessIdentity([int]$cmd.target.pid)
+        if ($cmd.source -eq "controls") {
+          [DeskHand]::CheckWindow([int64]$cmd.target.hwnd, [int]$cmd.target.pid)
+          $identity += ":" + [string]$cmd.target.hwnd
+          $keys = New-Object 'System.Collections.Generic.List[string]'
+          $names = New-Object 'System.Collections.Generic.List[string]'
+          $aids = New-Object 'System.Collections.Generic.List[string]'
+          $types = New-Object 'System.Collections.Generic.List[string]'
+          foreach ($selector in $cmd.controls) {
+            $keys.Add([string]$selector.key)
+            $names.Add($selector.name)
+            $aids.Add($selector.automationId)
+            $types.Add($selector.type)
+          }
+          $records = [Uia]::Observe([int64]$cmd.target.hwnd, $keys.ToArray(), $names.ToArray(), $aids.ToArray(), $types.ToArray(), 2500)
+          [DeskHand]::CheckWindow([int64]$cmd.target.hwnd, [int]$cmd.target.pid)
+          if ($identity -ne ([DeskHand]::ProcessIdentity([int]$cmd.target.pid) + ":" + [string]$cmd.target.hwnd)) { throw "Process identity changed" }
+        } elseif ($cmd.source -eq "memory") {
+          foreach ($field in $cmd.memory) {
+            $records[[string]$field.key] = @{ base64 = [DeskHand]::ReadMemory([int]$cmd.target.pid, [string]$field.address, [int]$field.length) }
+          }
+          if ($identity -ne [DeskHand]::ProcessIdentity([int]$cmd.target.pid)) { throw "Process identity changed" }
+        } else { throw "Unknown runtime source" }
+      }
+      Send-Obj @{ ok = $true; source = $cmd.source; identity = $identity; startedAt = $startedAt; observedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); records = $records }
       continue
     }
     if ($op -eq "focus") {

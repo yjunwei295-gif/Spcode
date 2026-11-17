@@ -6,6 +6,7 @@ const assert=require('node:assert/strict');
 const Module=require('module');
 const {spawnSync}=require('child_process');
 const studio=require('../electron/lib/artifact-studio');
+const store=require('../electron/lib/store');
 const windows=require('../electron/lib/artifact-window');
 const root=path.resolve(__dirname,'..');
 const errors=[];
@@ -29,6 +30,7 @@ function fullSetup(){const text=fs.readFileSync(path.join(root,'scripts/test-ui-
 
 async function main(){
   await app.whenReady();
+  check(store.resolveTheme('cel')==='cel','主题解析保留锐线赛璐璐 ID');
   const deadline=setTimeout(function timeout(){console.error('FAIL 作品验收超时');app.exit(1);},55000);
   fs.mkdirSync(path.join(root,'generated'),{recursive:true});workspace=fs.mkdtempSync(path.join(root,'generated','artifact-test-'));
   fs.writeFileSync(path.join(workspace,'scene.html'),animation(),'utf8');
@@ -68,8 +70,9 @@ async function main(){
   check(true,'缺时序、静态转视频、伪造清单明确失败');
   windows.registerIpc({ipcMain,getWorkspace:function ws(){return workspace;},getOwner:function owner(e){return BrowserWindow.fromWebContents(e.sender);}});
   const owner=new BrowserWindow({show:false});
-  const ctx=await windows.open({workspace,manifest:item.manifest,owner,theme:'dark'});
+  const ctx=await windows.open({workspace,manifest:item.manifest,owner,theme:'cel'});
   await until(function toolbar(){return ctx.win.webContents.executeJavaScript('!!document.getElementById("art-title").textContent.includes("动画更新")');},'工具栏初始化');
+  check(await ctx.win.webContents.executeJavaScript('document.documentElement.dataset.theme==="cel"'),'作品工具栏保留锐线赛璐璐主题');
   check(await ctx.view.webContents.executeJavaScript('typeof require==="undefined"&&typeof window.simple==="undefined"&&typeof window.artifactStudio==="undefined"'),'生成页面隔离 Node 与宿主桥接');
   await ctx.view.webContents.executeJavaScript('document.getElementById("interactive").click();true');
   check(await ctx.view.webContents.executeJavaScript('window.clicks===1'),'真实网页交互可用');

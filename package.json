@@ -1,7 +1,7 @@
 {
   "name": "simplecode",
   "productName": "SimpleCode",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "桌面 AI 编程助手",
   "main": "electron/main.js",
   "author": "SimpleCode",
@@ -23,6 +23,7 @@
     "@modelcontextprotocol/sdk": "^1.32.1",
     "@openai/codex-sdk": "^0.163.0",
     "@xenova/transformers": "^2.17.2",
+    "acorn": "^8.15.0",
     "jszip": "^3.10.1",
     "mammoth": "^1.9.1",
     "node-llama-cpp": "^3.20.0",
@@ -35,11 +36,13 @@
     "appId": "com.simplecode.app",
     "productName": "SimpleCode",
     "copyright": "Copyright © SimpleCode",
+    "asar": false,
     "directories": {
       "output": "dist"
     },
     "files": [
       "electron/**/*",
+      "!electron/lib/training-archive.js",
       "renderer/**/*",
       "package.json",
       "icons.png",
@@ -75,17 +78,6 @@
           "!**/*.sc-meta.json"
         ]
       }
-    ],
-    "asarUnpack": [
-      "**/*.node",
-      "**/node-llama-cpp/**",
-      "**/@xenova/**",
-      "**/onnxruntime-node/**",
-      "**/tesseract.js-core/**",
-      "node_modules/@openai/codex-*/**/*",
-      "node_modules/@anthropic-ai/claude-agent-sdk-*/**/*",
-      "electron/lib/desktop-hand.ps1",
-      "electron/lib/process-memory.ps1"
     ],
     "win": {
       "target": [

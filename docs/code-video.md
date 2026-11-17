@@ -18,6 +18,14 @@ HTML 必须定义 window.renderFrame(time, frame, info)：
 - Canvas 的像素宽高应使用 info.width / info.height；页面 margin 设为 0。
 - 页面无 Node.js 集成，没有 SpCode 的 preload/API。不要在动画页里调用文件或系统命令。
 
+## 知识讲解类视频的叙事
+
+制作「Vibe知识大赏」式知识短片时，先核实事实和数字的来源，再把内容排成「提问或选择 → 留出思考时间 → 证据与机制 → 可带走的结论」。开场保留悬念，不先报答案。每镜只讲一个核心概念，让主图形先行动，文字随后贴着图形出现；按文字量留足阅读时间。
+
+在源稿中保留可修改的分镜表，逐镜写明论点、来源、图形动作、屏幕文字、时长和选定的音乐卡点。先渲染开场样段检查叙事与版式，再渲染全片；最终检查事实、文字覆盖、画面和音画同步。参考作品的配色、画幅、时长、拍数和旁白形式不是固定规格，仍以用户要求为准。
+
+参考：[vibe-knowledge-interactive 的公开说明](https://github.com/wchhywizd/vibe-knowledge-interactive)；其互动开场、图形叙事与逐帧渲染是上述流程的依据。
+
 ## 调用
 
 先用 write_file/edit_file 写动画文件，再调用 render_code_video：

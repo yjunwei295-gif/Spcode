@@ -64,6 +64,13 @@ async function fetchWithLockedGuard(fetcher, url, init, retries = 2) {
 // 直连优先：先不走代理直接请求，网络层走不通（连不上/被墙/探测超时）再回退到带代理的默认会话。
 // 若系统代理本身不可用，默认会话同样会失败，此时再回退一次直连，避免因为代理配置错误就完全不可用。
 async function httpFetch(url, init) {
+  // 专用 SDK 地址不能通过代理重试变成 HTTP；提前报可操作的配置错误，不输出密钥或完整地址。
+  const scheme = /^\s*([a-z][a-z0-9+.-]*):/i.exec(String(url instanceof Request ? url.url : url));
+  if (scheme && !/^https?$/i.test(scheme[1])) {
+    throw Object.assign(new Error(`接口地址协议不受支持（${scheme[1].toLowerCase()}）。请在设置中检查厂商协议与接口地址；Codex 等直通厂商应使用对应直通协议。`), {
+      code: 'unsupported_url_scheme', retryable: false
+    });
+  }
   const net = resolveElectronNet();
   if (!net) return fetchWithLockedGuard(fetch, url, init);
   const direct = await ensureDirectSession();

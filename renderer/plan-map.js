@@ -33,7 +33,7 @@
    * 打开方案导图窗口。
    * opts: {
    *   title: 头部标题（显示为「方案导图 · title」）,
-   *   map: { nodes:[{ id, desc, status, file, reason }], edges },
+   *   map: { nodes:[{ id, desc, status, file, reason }], edges }；hierarchical=true 时按 edges 的父子关系展开参考树，rootLabel 为根标题，
    *   emptyText?: 非空时进入「只显示说明」的空态：不建 canvas / 图例 / 侧栏，body 只放一段居中说明,
    *   workspace, tabId,
    *   readOnly?: 长期目标等只读图隐藏源码方案删除；heading/requirementLabel 调整对应标题，省略时保持方案图行为。
@@ -267,7 +267,79 @@
     let placed = false;
     let rootY = 0;
 
+    /**
+     * 按参考导图的父子边布局多级节点。
+     * @param {object} map 已识别的参考文件、标题与正文节点，edges 定义真实父子关系
+     * @returns {void} 更新当前绘制节点；各分支在子节点的纵向中点对齐，不把层级压成平级方案
+     */
+    function setHierarchicalData(map) {
+      nodes = [];
+      links = [];
+      const byId = new Map();
+      const children = new Map();
+      for (const data of map.nodes) {
+        byId.set(data.id, data);
+        children.set(data.id, []);
+      }
+      for (const edge of map.edges) children.get(edge.from).push(edge.to);
+      let row = 0;
+      const root = place('需求', 0);
+      rootY = root.y;
+      if (!placed) {
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width && rect.height) {
+          let width = 0;
+          for (const node of nodes) width = Math.max(width, node.x + boxOf(node).w);
+          const height = Math.max(ROW, row * ROW);
+          // 多级参考树首次打开时整体入画，后续更新保留用户已经平移和缩放的位置。
+          scale = Math.min(1, (rect.width - ROW * 2) / width, (rect.height - ROW * 2) / height);
+          ox = (rect.width - width * scale) / 2;
+          oy = (rect.height - height * scale) / 2 + ROW * scale / 2;
+          placed = true;
+        }
+      }
+      // 首次数据到达可能早于 ResizeObserver；按当前实际尺寸初始化 Canvas，再绘制完整参考树。
+      resize();
+
+      /**
+       * 递归布置一个已识别层级分支。
+       * @param {string} id 当前节点标识
+       * @param {number} depth 距离参考根的层数，用于横向列位置
+       * @returns {object} 带画布坐标的节点
+       */
+      function place(id, depth) {
+        const data = byId.get(id);
+        const label = id === '需求' ? map.rootLabel : clip(data.title || id, 30);
+        const node = { label, x: depth * COL, y: row * ROW, kind: depth === 0 ? 'root' : 'leaf', data };
+        nodes.push(node);
+        const descendants = children.get(id);
+        if (!descendants.length) {
+          row++;
+          return node;
+        }
+        let first = null;
+        let last = null;
+        for (const childId of descendants) {
+          const child = place(childId, depth + 1);
+          links.push([node, child]);
+          if (!first) first = child;
+          last = child;
+        }
+        node.y = (first.y + last.y) / 2;
+        return node;
+      }
+    }
+
+    /**
+     * 将导图数据交给画布，参考树保留父子层级，普通方案沿用原有根到条目的布局。
+     * @param {object} map 节点和连线；hierarchical 表示参考树
+     * @returns {void} 重绘当前画布
+     */
     function setData(map) {
+      if (map.hierarchical) {
+        setHierarchicalData(map);
+        return;
+      }
       const items = (map.nodes || []).filter((n) => n.id !== '需求');
       nodes = [];
       links = [];

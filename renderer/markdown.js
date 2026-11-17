@@ -4,7 +4,7 @@
   两条硬约束：
 
   1. 输入是模型输出，**一律先 escape 再套格式**。任何时候都不能把原文直接交给
-     innerHTML。所有分支都走 esc()，链接只放行 http/https/mailto。
+     innerHTML。所有分支都走 esc()；网址只放行 http/https/mailto，本地文件只进入只读预览。
 
   2. 这是编程工具，满屏都是 snake_case 和 *.ps1 之类的东西，所以**不支持 _斜体_**
      —— 否则 MAIN_STORY_001.story.json 会被中间那段切成斜体。单星号斜体也加了
@@ -20,6 +20,28 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ESC[c]);
 }
 
+/** 还原本渲染器转义过的链接目标；输出随后按对应 HTML 属性重新编码。 */
+function decodeLinkEntity(entity) {
+  const decoded = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" };
+  return decoded[entity];
+}
+
+/**
+ * 将 Markdown 文件链接接入只读预览与已有右键菜单。
+ * 尖括号目标允许路径含空格；盘符绝对路径与相对路径保留原文，不作为网址导航或执行程序。
+ * 网页和邮件沿用原有入口，其它协议及页内锚点仍保留为文本。
+ */
+function renderInlineLink(whole, label, angleUrl, bareUrl) {
+  const escapedUrl = angleUrl === undefined ? bareUrl : angleUrl;
+  const url = escapedUrl.replace(/&(amp|lt|gt|quot|#39);/g, decodeLinkEntity);
+  if (/^(https?:|mailto:)/i.test(url)) {
+    return `<a href="${esc(url)}" target="_blank" rel="noreferrer noopener">${label}</a>`;
+  }
+  const windowsPath = /^[a-z]:[\\/]/i.test(url);
+  if ((!windowsPath && /^[a-z][a-z0-9+.-]*:/i.test(url)) || /^(#|\/\/)/.test(url)) return whole;
+  return `<a href="#" data-preview-file="${esc(encodeURIComponent(url))}">${label}</a>`;
+}
+
 // 行内规则。传进来的必须是**已经 escape 过**的文本。
 function inline(text) {
   // 先把行内代码抽成占位符，免得里面的 * 和 [] 被后面的规则改掉
@@ -29,11 +51,7 @@ function inline(text) {
     return `\u0000${codes.length - 1}\u0000`;
   });
 
-  s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (whole, label, url) => {
-    // 只认这三种协议。javascript: data: 一律原样留着当普通文字
-    if (!/^(https?:|mailto:)/i.test(url)) return whole;
-    return `<a href="${url}" target="_blank" rel="noreferrer noopener">${label}</a>`;
-  });
+  s = s.replace(/\[([^\]\n]+)\]\((?:&lt;([^\n]*?)&gt;|([^\s)]+))\)/g, renderInlineLink);
 
   s = s.replace(/\*\*(?!\s)([^*\n]+?)(?<!\s)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/~~(?!\s)([^~\n]+?)(?<!\s)~~/g, '<del>$1</del>');

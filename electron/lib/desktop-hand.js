@@ -13,6 +13,11 @@ const UNICODE_TYPE_MAX = 400;
 const FRAME_STALE_MS = 60 * 1000;
 
 let alive = false;
+// 每次开关切换递增，阻止关闭后又开启时旧观察任务恢复执行。
+let runtimeGeneration = 0;
+
+/** 返回本次 AGI 生命周期编号，供等待和缓存识别停止边界。 */
+function runtimeEpoch() { return runtimeGeneration; }
 let busy = false;
 let helper = null;
 let helperQueue = Promise.resolve();
@@ -114,11 +119,24 @@ function noteLook(frame) {
   };
 }
 
+/**
+ * 在常驻帮助进程中读取结构化窗口、指定控件或明确的内存区间。
+ * 参数由 runtime-state 校验；不截图、不刷新坐标帧或 UIA 操作编号，失败直接抛出。
+ */
+async function readRuntimeState(request) {
+  const denied = gate();
+  if (denied) throw new Error(denied);
+  const result = await winInput({ ...request, op: 'runtime_read', selfPid: process.pid });
+  if (!result.ok) throw new Error(result.message);
+  return result;
+}
+
 function currentFrame() {
   return lastFrame;
 }
 
 function setAlive(on) {
+  if (alive !== !!on) runtimeGeneration++;
   alive = !!on;
   const screenText = require('./screen-text-map');
   if (!alive) {
@@ -639,7 +657,7 @@ function importClipboardImage() {
 }
 
 module.exports = {
-  isAlive, isBusy, setAlive, hold, release, noteLook, currentFrame, listWindows, scanControls, foregroundWindow,
+  isAlive, isBusy, setAlive, hold, release, noteLook, currentFrame, listWindows, scanControls, foregroundWindow, readRuntimeState, runtimeEpoch,
   assessRisk, allowRiskyThisTurn, controlLabel, TYPE_ZH,
   clickAt, dragStroke, scrollAt, typeText, tapKeys, windowList, windowFocus, uiAct,
   captureScreen, importClipboardImage, nameSightFile

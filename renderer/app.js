@@ -1,12 +1,30 @@
-// 渲染层构建标记：用于诊断页面加载的是否为当前磁盘代码。
-// 每次改动渲染层资源（app.js / styles.css / index.html）都要 bump 这个值，
-// 否则旧页面缓存会继续跑磁盘上已经不存在的样式，排查“改了没生效”时会误判。
-window.__APP_BUILD = 'v20261029-pet-dashboard';
+// 渲染层构建标记用于诊断当前源码版本。
+// 热重载通过真实文件通知和 reloadIgnoringCache 加载资源，不依赖手动修改此标记。
+window.__APP_BUILD = 'v20261116-hot-reload';
 import { t, setLocale, applyDom, getLocale, isNewChatTitle } from './i18n.js';
 import { renderMarkdown } from './markdown.js';
 import { imageSettingsHtml, bindImageSettings, readImageSettings } from './image-generation-settings.js';
+import { renderReasoningControl } from './reasoning-control.js';
+import { updateImageTask, renderImageCanvas } from './image-canvas.js';
+import { mediaCardsHtml, existingMediaPlayers, loadMediaPreviews, releaseMediaPlayers } from './media-preview.js';
+import { createHotReloadController, takeHotReloadSnapshot } from './hot-reload.js';
 
 const api = window.simple || window.sinpo;
+
+/** 保存本页原生同步提示入口，统一恢复错误提示关闭后的系统键盘焦点。 */
+const nativeAlert = window.alert;
+/**
+ * 显示原生提示，并在用户关闭后请求修复 Electron 的键盘焦点状态。
+ * @param {*} message 原样交给原生提示框的内容。
+ * @returns {undefined} 保留原生 alert 的同步阻塞与返回行为；只追加关闭后的焦点恢复 IPC。
+ * 不强制选择聊天输入框，设置或导图仍打开时保留当前活动字段；IPC 失败走现有未处理拒绝诊断。
+ */
+function showAlert(message) {
+  nativeAlert.apply(window, arguments);
+  void api.focusWindow(true);
+}
+// 同页各界面模块共用此入口，避免只修复部分错误提示的关闭路径。
+window.alert = showAlert;
 
 // 界面层异常统一上报主进程写入诊断日志，闪退后可回溯
 window.addEventListener('error', (e) => {
@@ -53,6 +71,10 @@ const state = {
   sessions: [],
   tabs: [],
   activeTab: null,
+  // 主进程分配的稳定窗口持久化键；初始化前不保存标签清单。
+  sessionLayoutKey: '',
+  // 每次切标签或请求打开历史递增；异步回执只可更新仍属于本次选择的界面。
+  tabNavigationId: 0,
   attachments: [],
   contextPaths: [],
   skillId: null,
@@ -83,6 +105,140 @@ const state = {
 };
 
 function $(id) { return document.getElementById(id); }
+
+/** 在状态栏展示真实更新状态；错误同时由控制器写入诊断，不遮挡用户正在处理的对话。 */
+function showHotReloadStatus(message, failed) {
+  let label = $('status-hot-reload');
+  if (!label) {
+    label = document.createElement('span');
+    label.id = 'status-hot-reload';
+    label.setAttribute('role', 'status');
+    document.querySelector('.statusbar').appendChild(label);
+  }
+  label.textContent = message;
+  label.title = message;
+  label.style.fontWeight = failed ? 'bold' : '';
+}
+
+/** 判断所有标签、排队消息、下载和弹窗是否空闲，避免热重载打断模型请求或丢失未提交的设置。 */
+function hotReloadBusy() {
+  if (referenceImports.size) return true;
+  for (const tab of state.tabs) {
+    if (tab.sending || tab.aborting || tab.draining || tabQueue(tab).length) return true;
+  }
+  return activeDownloadCount() > 0 || !$('modal').classList.contains('hidden');
+}
+
+/**
+ * 保存当前窗口全部标签的一次性恢复状态，不触发会话落盘。
+ * @param {string} revision 本次待加载的界面版本；与各标签和草稿一起写入窗口 sessionStorage。
+ * @returns {void} 自动保存关闭时仍保留临时界面状态；单条提示词覆盖随各自队列保存。
+ */
+function saveHotReloadSnapshot(revision) {
+  const tab = activeSession();
+  if (tab) {
+    rememberComposer(tab);
+    tab.scrollPos = $('messages').scrollTop;
+    tab.refillFromIndex = state.refillFromIndex;
+    tab.refillRevertFiles = state.refillRevertFiles;
+  }
+  const input = $('input');
+  const snapshot = {
+    revision, workspace: state.workspace, tabs: state.tabs, activeTab: state.activeTab,
+    composer: collectComposer(), inputFocused: document.activeElement === input,
+    selectionStart: input.selectionStart, selectionEnd: input.selectionEnd,
+    currentModelId: state.currentModelId,
+    sidebar: state.sidebar, fileTree: state.fileTree, treeOpen: [...state.treeOpen],
+    previewPath: state.previewPath, previewMdRaw: state.previewMdRaw,
+    downloads: state.downloads, downloadPanelFolded: state.downloadPanelFolded
+  };
+  window.sessionStorage.setItem('spcode:hot-reload', JSON.stringify(snapshot));
+}
+
+/** 在主进程拒绝本次重载时清掉未使用的快照，避免后续普通打开页面恢复到过时状态。 */
+function clearHotReloadSnapshot() {
+  window.sessionStorage.removeItem('spcode:hot-reload');
+}
+
+/** 后端模块或文本资料更新后读取现有资料接口，不重新选择模型，也不替换正在运行的标签。 */
+async function refreshHotReloadMetadata() {
+  state.persona = await api.loadPersona();
+  await refreshMeta();
+}
+
+/** 将已确认空闲的页面交给主进程重载，版本核对与后台任务检查统一由主进程完成。 */
+function requestHotReload(revision) {
+  return api.hotReloadReady(revision);
+}
+
+/** 将热重载故障保留到现有诊断通道，便于核对具体加载失败原因。 */
+function reportHotReloadError(message, detail) {
+  api.reportError(message, detail);
+}
+
+const hotReloadController = createHotReloadController({
+  isBusy: hotReloadBusy, saveSnapshot: saveHotReloadSnapshot, clearSnapshot: clearHotReloadSnapshot,
+  ready: requestHotReload, refreshMetadata: refreshHotReloadMetadata,
+  showStatus: showHotReloadStatus, reportError: reportHotReloadError
+});
+
+/** 生命周期到达空闲节点时重试待加载版本；没有待处理更新时不会发起 IPC 或计时轮询。 */
+function retryHotReload() {
+  return hotReloadController.retry();
+}
+
+/** 接收主进程的真实更新事件；失败由控制器显示并报告，不将失败当作已经加载。 */
+function receiveHotReload(update) {
+  return hotReloadController.receive(update);
+}
+
+/**
+ * 恢复同一窗口全部标签和草稿，沿用已有上下文与消息渲染入口。
+ * @param {object} snapshot 本窗口界面重载前保存的快照，包含每个标签独立的队列和输入状态。
+ * @returns {Promise<void>} 界面、元数据和预览恢复后兑现；跳过磁盘的单标签恢复流程。
+ */
+async function restoreHotReloadSnapshot(snapshot) {
+  state.tabs = snapshot.tabs;
+  state.activeTab = snapshot.activeTab;
+  state.currentModelId = snapshot.currentModelId;
+  state.sidebar = snapshot.sidebar;
+  state.fileTree = snapshot.fileTree;
+  state.treeOpen = new Set(snapshot.treeOpen);
+  state.downloads = snapshot.downloads;
+  state.downloadPanelFolded = snapshot.downloadPanelFolded;
+  $('sidebar').classList.toggle('hidden', !state.sidebar);
+  $('file-tree').classList.toggle('hidden', !state.fileTree);
+  renderDownloadPanel();
+  setWorkspace(snapshot.workspace);
+  const tab = activeSession();
+  if (tab) {
+    applyTabContext(tab);
+    state.contextPaths = snapshot.composer.contextPaths;
+    state.attachments = snapshot.composer.attachments;
+    setSkillStack(snapshot.composer.skillIds);
+    $('input').value = snapshot.composer.text;
+    showChat();
+    renderTabs();
+    renderMessages();
+    $('messages').scrollTop = tab.scrollPos;
+    renderQueue();
+    renderChips();
+    syncSendBtn();
+    if (snapshot.inputFocused) {
+      focusComposer();
+      $('input').setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
+    }
+  } else {
+    showWelcome();
+  }
+  await refreshMeta();
+  if (snapshot.previewPath) {
+    state.previewMdRaw = snapshot.previewMdRaw;
+    await openCodePreview(snapshot.previewPath);
+  }
+  if (api.floatBind) api.floatBind(String(state.activeTab || ''), String(tab && tab.title || ''));
+}
+
 function uid() { return `s_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`; }
 
 function clampAgentRounds(n) {
@@ -103,19 +259,22 @@ function syncCursorDirectBtn() {
   if (!btn) return;
   const m = currentModel();
   const brainProtocol = !!m && m.type !== 'local' ? providerById(m.providerId)?.protocol : '';
-  const roleProtocols = ['summary', 'code', 'planning'].map((role) => {
-    const slot = rosterSlot(role);
-    if (slot?.protocol) return slot.protocol;
-    const model = slot?.apiId ? (state.models || []).find((x) => x.id === slot.apiId) : null;
-    return model && model.type !== 'local' ? providerById(model.providerId)?.protocol : '';
-  });
-  const directProtocols = [brainProtocol, ...roleProtocols].filter((p) => p === 'cursor' || p === 'codex' || p === 'claudecode');
+  const roleProtocols = [];
+  for (const role of ['summary', 'code', 'planning']) {
+    for (const slot of rosterSlots(role)) {
+      if (slot.protocol) { roleProtocols.push(slot.protocol); continue; }
+      const model = slot.apiId ? (state.models || []).find(function same(m) { return m.id === slot.apiId; }) : null;
+      if (model && model.type !== 'local') roleProtocols.push(providerById(model.providerId)?.protocol || '');
+    }
+  }
+  const directProtocols = [brainProtocol, ...roleProtocols].filter((p) => p === 'cursor' || p === 'codex' || p === 'claudecode' || p === 'grok');
   const on = directProtocols.length > 0;
   btn.disabled = true;
   btn.classList.toggle('on', on);
   btn.setAttribute('aria-pressed', on ? 'true' : 'false');
   btn.textContent = directProtocols.includes('codex') ? 'Codex 直通'
     : directProtocols.includes('claudecode') ? 'Claude 直通'
+    : directProtocols.includes('grok') ? 'Grok 直通'
     : (on ? 'Cursor 直通' : t('cursorDirect'));
 }
 
@@ -133,10 +292,14 @@ function syncRoundsInput(tab) {
   if (wrap) wrap.classList.toggle('off', on);
 }
 
+/** 应用主进程解析后的主题，并同步状态栏名称；不改用户保存的主题偏好。 */
 function applyTheme(resolved) {
   state.theme = resolved;
   document.documentElement.setAttribute('data-theme', resolved);
-  $('status-theme').textContent = t(resolved === 'dark' ? 'themeDark' : 'themeLight');
+  let label = 'themeLight';
+  if (resolved === 'dark') label = 'themeDark';
+  if (resolved === 'cel') label = 'themeCel';
+  $('status-theme').textContent = t(label);
 }
 
 /** 返回当前明确选中的模型；失效 ID 不冒充列表第一项，确保顶栏与发送目标一致。 */
@@ -159,6 +322,7 @@ async function persistModels(currentId) {
   const r = await api.saveModels(state.models, state.currentModelId, state.providers);
   if (r?.models) state.models = r.models;
   if (r?.providers) state.providers = r.providers;
+  state.videoProviderModels = r.videoProviderModels;
   if (r?.currentModelId) state.currentModelId = r.currentModelId;
   refreshQuotaBar();
 }
@@ -430,7 +594,9 @@ async function restoreOnboardingCompletion(settings) {
   const requiredRoles = ['summary', 'code', 'planning'];
   let configured = true;
   for (const role of requiredRoles) {
-    if (!capValOf(settings.capabilityDefaults?.[role]?.primary)) configured = false;
+    if (role === 'code') {
+      if (!codePoolRefs(settings.capabilityDefaults?.code).some(capValOf)) configured = false;
+    } else if (!capValOf(settings.capabilityDefaults?.[role]?.primary)) configured = false;
   }
   if (localStorage.getItem('spcode.onboarding.completed') !== 'true' && !configured) return false;
   await completeOnboarding();
@@ -494,7 +660,7 @@ async function startOnboarding() {
     }
     if (wizard.step === 'keys') {
       if (wizard.keyIndex >= wizard.selected.length) {
-        wizard.keyed = wizard.keyed.filter((p) => p.apiKey || ['cursor', 'codex', 'claudecode'].includes(p.protocol));
+        wizard.keyed = wizard.keyed.filter((p) => p.apiKey || ['cursor', 'codex', 'claudecode', 'grok'].includes(p.protocol));
         if (!wizard.keyed.length) {
           wizard.step = 'empty';
           render();
@@ -519,9 +685,9 @@ async function startOnboarding() {
       }
       const preset = wizard.presets[wizard.selected[wizard.keyIndex]];
       const saved = (state.providers || []).find((p) => p.name === preset.name);
-      const usesLocalLogin = ['cursor', 'codex'].includes(preset.protocol);
+      const usesLocalLogin = ['cursor', 'codex', 'grok'].includes(preset.protocol);
       const keyStepContent = usesLocalLogin
-        ? `<p class="hint">${escapeHtml(preset.protocol === 'cursor' ? 'Cursor 无需填写 API Key，下一步将直接使用本机 Cursor SDK 登录。' : 'Codex 无需填写 API Key，下一步将直接使用本机 Codex CLI 登录。')}</p>`
+        ? `<p class="hint">${escapeHtml(preset.protocol === 'cursor' ? 'Cursor 无需填写 API Key，下一步将直接使用本机 Cursor SDK 登录。' : preset.protocol === 'grok' ? 'Grok 无需填写 API Key，下一步将直接使用本机 Grok CLI 登录（grok login）。' : 'Codex 无需填写 API Key，下一步将直接使用本机 Codex CLI 登录。')}</p>`
         : `<label>${t('apiKey')}</label><input id="onboarding-key" type="password" value="${escapeHtml(saved?.apiKey || '')}" placeholder="sk-..." />`;
       openModal(`<h3>${t('onboardingStepKey')}（${wizard.keyIndex + 1}/${wizard.selected.length}）</h3>
         <p class="hint">${escapeHtml(preset.name || preset.id)}</p>
@@ -631,7 +797,7 @@ async function startOnboarding() {
   render();
 }
 
-// 引导第三步：配置 8 个能力模块的默认 / 备用模型；总结、代码、规划三项必选
+// 引导第三步：代码选择平等模型池，其余能力使用原有默认/备用配置；总结、代码、规划三项必选
 function openOnboardingModules() {
   const caps = state.capabilityDefaults || {};
   // 必选的三项：总结、代码、规划
@@ -639,11 +805,16 @@ function openOnboardingModules() {
   // 是否存在任何可选模型：API 模型或本地 gguf
   const hasAnyModel = (state.models || []).some((m) => m && m.type !== 'local') || (state.localFiles || []).length > 0;
 
-  // 生成 8 行模块配置：每行两个下拉，必选的三项标题后加红字标记
+  // 按能力角色生成配置：代码和审美是多选池，其余每行两个下拉；必选的三项标题后加红字标记
   const buildRows = () => {
     const parts = [];
     for (const role of CAP_ROLES) {
       const pack = caps[role.id] || {};
+      if (role.id === 'code' || role.id === 'aesthetic') {
+        const hintKey = role.id === 'aesthetic' ? 'aestheticPoolHint' : 'codePoolHint';
+        parts.push('<div class="model-row"><div><b>' + t(role.key) + '</b></div><div style="flex:1">' + poolHtml(role.id, pack, hintKey) + '</div></div>');
+        continue;
+      }
       const primary = capValOf(pack.primary);
       const fallback = capValOf((pack.fallbacks || [])[0]);
       const required = requiredRoles.indexOf(role.id) >= 0;
@@ -654,9 +825,9 @@ function openOnboardingModules() {
         <div style="min-width:96px;padding-top:8px"><b>${t(role.key)}</b>${mark}</div>
         <div style="flex:1">
           <label class="hint">${t('capabilityPrimary')}</label>
-          <select data-cap-role="${role.id}" data-cap-which="primary">${capSelectOptionsHtml(primary)}</select>
+          <select data-cap-role="${role.id}" data-cap-which="primary">${capSelectOptionsHtml(primary, role.id)}</select>
           <label class="hint">${t('capabilityFallback')}</label>
-          <select data-cap-role="${role.id}" data-cap-which="fallback">${capSelectOptionsHtml(fallback)}</select>
+          <select data-cap-role="${role.id}" data-cap-which="fallback">${capSelectOptionsHtml(fallback, role.id)}</select>
         </div>
       </div>`);
     }
@@ -684,8 +855,13 @@ function openOnboardingModules() {
     if (!box) return missing;
     for (const role of CAP_ROLES) {
       if (requiredRoles.indexOf(role.id) < 0) continue;
-      const sel = box.querySelector(`select[data-cap-role="${role.id}"][data-cap-which="primary"]`);
-      if (!sel || !String(sel.value || '').trim()) missing.push(role);
+      if (role.id === 'code') {
+        const pool = box.querySelector('[data-model-pool="code"]');
+        if (!pool || !pool.querySelector('input[data-pool-model]:checked')) missing.push(role);
+      } else {
+        const sel = box.querySelector(`select[data-cap-role="${role.id}"][data-cap-which="primary"]`);
+        if (!sel || !String(sel.value || '').trim()) missing.push(role);
+      }
     }
     return missing;
   };
@@ -781,6 +957,7 @@ function hideCtxMenu() {
   if (el) el.classList.add('hidden');
 }
 
+/** 显示文件与媒体共用的右键菜单，保留原路径用于定位资源和打开文件夹。 */
 function showFileCtx(e, rel) {
   const filePath = String(rel || '').replace(/\\/g, '/');
   if (!filePath) return;
@@ -791,12 +968,45 @@ function showFileCtx(e, rel) {
   const menu = $('ctx-menu');
   menu.classList.remove('hidden');
   const x = Math.min(e.clientX, window.innerWidth - 200);
-  const y = Math.min(e.clientY, window.innerHeight - 48);
+  const y = Math.max(0, Math.min(e.clientY, window.innerHeight - menu.offsetHeight));
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
   setTimeout(() => { state.ctxJustOpened = false; }, 400);
 }
 
+/** 展开资源树中的父目录并聚焦目标文件；只定位现有项目或已添加目录，不修改工作区配置。 */
+async function revealInResources(rel) {
+  hideCtxMenu();
+  let filePath = String(rel).replace(/\\/g, '/');
+  let root = '';
+  if (isAbsTreePath(filePath)) {
+    for (const folder of [state.workspace, ...extraFoldersOf(activeSession())]) {
+      const candidate = String(folder || '').replace(/\\/g, '/').replace(/\/$/, '');
+      if (candidate && filePath.toLowerCase().startsWith(candidate.toLowerCase() + '/') && candidate.length > root.length) root = candidate;
+    }
+    if (!root) throw new Error('该文件不在当前项目或已添加的资源目录中');
+    if (sameWorkspace(root, state.workspace)) {
+      filePath = filePath.slice(root.length + 1);
+      root = '';
+    } else state.treeOpen.add(root);
+  }
+  let parentEnd = filePath.lastIndexOf('/');
+  while (parentEnd > root.length) {
+    state.treeOpen.add(filePath.slice(0, parentEnd));
+    parentEnd = filePath.lastIndexOf('/', parentEnd - 1);
+  }
+  state.treeRevealPath = filePath;
+  state.fileTree = true;
+  $('file-tree').classList.remove('hidden');
+  await loadFileTree();
+  const encoded = encodeURIComponent(filePath);
+  const row = $('tree-body').querySelector('[data-tree-file="' + encoded + '"], [data-tree-dir="' + encoded + '"]');
+  if (!row) throw new Error('资源列表中未找到该文件：' + filePath);
+  row.scrollIntoView({ block: 'nearest' });
+  row.focus();
+}
+
+/** 在系统文件管理器中打开目标文件所在位置并选中它。 */
 async function revealInFolder(rel) {
   hideCtxMenu();
   try {
@@ -891,12 +1101,14 @@ function openModal(html) {
     });
   });
 }
+/** 关闭当前弹窗并恢复输入焦点；设置编辑结束后允许待处理的界面更新检查空闲状态。 */
 function closeModal() {
   const modal = $('modal');
   releaseFocus(modal);
   modal.classList.remove('is-open');
   modal.classList.add('hidden');
   focusComposer();
+  queueMicrotask(retryHotReload);
 }
 
 async function openProject(dir) {
@@ -927,8 +1139,13 @@ async function showProjectSession(ws) {
   syncSendBtn();
 }
 
-/** 加载项目侧栏资料；独立查询并行执行，文件树使用恢复后的当前标签。 */
+/**
+ * 并行加载当前项目的侧栏资料，过时导航的查询结果不覆盖新项目。
+ * @returns {Promise<void>} 当前导航的资料和文件树更新后兑现；导航已变化时丢弃旧回执。
+ * 调用时记录导航序号，查询期间切标签只影响新选择，不混入旧工作区的技能与快照。
+ */
 async function refreshMeta() {
+  const navigation = state.tabNavigationId;
   const [skills, rules, snapshots, milestones, globalMemory, snapshotMax] = await Promise.all([
     api.listSkills(),
     api.listRules(),
@@ -937,6 +1154,7 @@ async function refreshMeta() {
     loadGlobalMemory(),
     loadSnapshotMax()
   ]);
+  if (navigation !== state.tabNavigationId) return;
   state.skills = skills;
   state.rules = rules;
   state.snapshots = snapshots;
@@ -1483,6 +1701,12 @@ function emptyContext() {
   return { skillId: null, skillIds: [], contextPaths: [], attachments: [] };
 }
 
+/**
+ * 将指定标签的上下文、未提交草稿和编辑状态同步到输入区。
+ * @param {object} tab 目标标签，composer 保存该标签尚未提交的正文、附件与引用。
+ * @returns {void} 更新当前输入及相关控件；存在草稿时使用草稿引用，避免复活上次已提交请求的引用。
+ * 模型、技能和长存绑定沿用现有规则，不从其他标签读取输入内容。
+ */
 function applyTabContext(tab) {
   const ctx = tab?.context || emptyContext();
   // 这个对话还没勾过时默认 zabingsk。已经勾过的组合原样留着，不从旧会话草稿里捞
@@ -1500,6 +1724,7 @@ function applyTabContext(tab) {
     const stale = c && !sameAsBox && composerAlreadySent(tab, c.text);
     if (stale) tab.composer = null;
     const live = stale ? null : c;
+    if (live && Array.isArray(live.contextPaths)) state.contextPaths = [...live.contextPaths];
     if (live && Array.isArray(live.attachments) && live.attachments.length) {
       state.attachments = live.attachments.filter((x) => x && x.path).map((x) => ({ path: x.path, name: x.name || String(x.path).split(/[\\/]/).pop() }));
     }
@@ -1518,39 +1743,59 @@ function applyTabContext(tab) {
   if (api.longAliveBind) bindLongAlive(tab);
 }
 
-async function applyTabWorkspace(tab) {
+/**
+ * 将目标标签的工作区提交主进程，并加载仍属于本次导航的侧栏资料。
+ * @param {object} tab 正在切换到的标签；无工作区时不发送请求，有工作区时每次导航均提交。
+ * 前一导航的 IPC 可能尚未回执，界面缓存的工作区不能证明主进程仍在该项目。
+ * @param {number} navigation switchToTab 登记的导航序号，用于拒绝较早的异步回执。
+ * @returns {Promise<void>} 有效工作区与元数据加载后兑现；过时回执不更新前台状态。
+ */
+async function applyTabWorkspace(tab, navigation) {
   const ws = tab?.workspace || '';
-  if (!ws || sameWorkspace(ws, state.workspace)) return;
+  if (!ws) return;
   closeCodePreview();
   const next = await api.setWorkspace(ws);
+  if (navigation !== state.tabNavigationId) return;
   setWorkspace(next || ws);
   await refreshMeta();
 }
 
+/**
+ * 同步切换到指定标签，再等待离开标签的保存与目标资源加载。
+ * @param {string} id 已加载标签的会话编号；找不到标签时不改变当前选择。
+ * @returns {Promise<void>} 保存及仍有效的资源更新结束后兑现，失败继续报告给调用方。
+ * 旧草稿在第一次异步等待前采集，输入和消息也同步换好；后到的保存回执不得再次覆盖输入。
+ * 导航序号使较早的异步任务只能结束自身，不能抢回用户后来选择的标签。
+ */
 async function switchToTab(id) {
-  const tab = state.tabs.find((t) => t.id === id);
+  const tab = state.tabs.find(function target(item) { return item.id === id; });
   if (!tab) return;
-  const prevTab = state.tabs.find((t) => t.id === state.activeTab);
+  const navigation = ++state.tabNavigationId;
+  const prevTab = activeSession();
+  let saving = Promise.resolve();
   if (prevTab && prevTab.id !== id) {
+    rememberComposer(prevTab);
     prevTab.scrollPos = $('messages').scrollTop;
     prevTab.refillFromIndex = state.refillFromIndex != null ? state.refillFromIndex : null;
     prevTab.refillRevertFiles = !!state.refillRevertFiles;
+    saving = persistTab(prevTab);
+  } else {
+    rememberComposer(tab);
   }
-  if (state.activeTab !== id) await persistSession();
-  else rememberComposer(tab);
   stopTypewriter();
   flushLivePaint();
   state.activeTab = id;
   applyTabContext(tab);
-  await applyTabWorkspace(tab);
-  await loadFileTree();
   renderTabs();
   renderMessages(true);
   renderQueue();
   syncSendBtn();
-  // 标签切好了就把小窗绑到这个标签页：tabId 用于小窗回传，标题给小窗显示用
   if (api.floatBind) api.floatBind(String(id), String(tab.title || ''));
   if (isTabSending(tab) && tab.liveAssistant && !tab.liveAssistant.typewriterDone) ensureTypewriter();
+  // 两项异步工作都立即登记；期间的新输入已属于目标标签，不再被恢复旧快照。
+  await Promise.all([saving, applyTabWorkspace(tab, navigation)]);
+  if (navigation !== state.tabNavigationId) return;
+  await loadFileTree();
 }
 
 async function restoreLastSession(ws) {
@@ -1627,7 +1872,60 @@ function confirmRestore(snap) {
   });
 }
 
+/**
+ * 保存本窗口打开的标签顺序、当前选择及空白标签的配置。
+ * 无参数；仅在自动保存开启且主进程已分配窗口键后写入 localStorage，正文和草稿仍走会话存档。
+ * @returns {void} 关闭标签时同步更新清单，但不删除历史会话；不把全部旧历史当成打开的标签。
+ */
+function persistOpenTabs() {
+  if (!state.autoSave || !state.sessionLayoutKey) return;
+  const tabs = [];
+  for (const tab of state.tabs) {
+    tabs.push({
+      id: tab.id, title: tab.title, workspace: tab.workspace,
+      modelId: tab.modelId, extraFolders: tab.extraFolders, context: tab.context,
+      maxAgentRounds: tab.maxAgentRounds, unlimitedRounds: tab.unlimitedRounds,
+      // 非空会话必须从会话存档恢复；存档已被其他窗口删除时不能复活成空白会话。
+      saved: !!(tab.messages?.length || tab.composer || submittedTextHistory(tab).length)
+    });
+  }
+  window.localStorage.setItem(state.sessionLayoutKey, JSON.stringify({ tabs, activeTab: state.activeTab }));
+}
+
+/**
+ * 冷启动时恢复本窗口上次打开的标签，不依赖只在热重载中存在的临时快照。
+ * 无参数；按持久化顺序读取仍存在的会话，空白标签使用清单里的配置重建。
+ * @returns {Promise<boolean>} 恢复并切换到原选中标签后返回 true；没有清单或可恢复标签时返回 false。
+ * 已删除的非空会话不再打开；原选中会话已删除时选择剩余首项，读取失败继续交给现有错误通道。
+ */
+async function restoreOpenTabs() {
+  const raw = window.localStorage.getItem(state.sessionLayoutKey);
+  if (raw === null) return false;
+  const layout = JSON.parse(raw);
+  const items = await api.loadSessions();
+  const available = new Set();
+  for (const item of items) available.add(item.id);
+  const tabs = [];
+  for (const entry of layout.tabs) {
+    if (entry.saved && !available.has(entry.id)) continue;
+    const data = available.has(entry.id) ? await api.loadSession(entry.id) : entry;
+    tabs.push(hydrateTab(data, entry.workspace));
+  }
+  if (!tabs.length) return false;
+  let selected = tabs[0];
+  for (const tab of tabs) {
+    if (tab.id === layout.activeTab) selected = tab;
+  }
+  state.tabs = tabs;
+  showChat();
+  // 使用既有导航入口同时恢复草稿、项目、侧栏和桌宠绑定，不能只画出标签而留下错误项目。
+  await switchToTab(selected.id);
+  return true;
+}
+
+/** 重绘本窗口的标签，并将本次打开顺序和当前选择同步到持久化清单；无参数，无返回值。 */
 function renderTabs() {
+  persistOpenTabs();
   $('tabs').innerHTML = state.tabs.map((tab) => `
     <button class="tab ${tab.id === state.activeTab ? 'active' : ''}${isTabSending(tab) ? ' busy' : ''}" data-id="${tab.id}" title="${t('renameTabHint')}">
       ${escapeHtml(tab.title)} <span class="x" data-close="${tab.id}">×</span>
@@ -1685,6 +1983,7 @@ function renderChips() {
       bits.push(`<span class="chip">${escapeHtml(a.name)} <button data-rm="att" data-p="${encodeURIComponent(a.path)}">×</button></span>`);
     }
   }
+  bits.push('<button type="button" class="chip map-button" data-reference-map title="查看本会话已识别并保存的参考文件层级">参考导图</button>');
   $('chips').innerHTML = bits.join('');
   syncAgentBtn();
 }
@@ -1726,6 +2025,52 @@ async function addAttachments(list) {
   }
   scheduleComposerSave();
   renderChips();
+}
+
+// 识别请求可能有多个并行批次，逐批登记，全部完成前不允许页面热重载。
+const referenceImports = new Set();
+
+/**
+ * 展示已经识别并持久化的参考文件层级。
+ * @param {object} map 后端返回的参考节点与父子边
+ * @param {object} tab 导图归属的会话，不改变当前会话的模型或上下文选择
+ * @returns {void} 复用现有只读导图弹层，节点详情保留识别原文
+ */
+function showReferenceMap(map, tab) {
+  window.PlanMap.open({
+    title: tab.title, heading: '参考导图', requirementLabel: '参考原文',
+    map, readOnly: true, workspace: tab.workspace, tabId: tab.id,
+    emptyText: map.nodes.length === 1 ? '本会话还没有已识别的参考文件。把参考文件拖入输入框后，会按文件、标题和列表层级保存。' : ''
+  });
+}
+
+/**
+ * 读取当前会话已保存的参考图，不重复识别或调用模型。
+ * @returns {Promise<void>} 读取完成后打开现有导图弹层；失败由调用处提示
+ */
+async function openReferenceMap() {
+  const tab = activeSession();
+  const map = await api.referenceTree({ tabId: tab.id });
+  showReferenceMap(map, tab);
+}
+
+/**
+ * 将拖入的附件识别后分层存入当前会话参考导图。
+ * @param {Array<{path:string,name:string}>} list 真实落盘的附件列表
+ * @returns {Promise<void>} 保留现有附件发送能力，等待识别与持久化后展示层级；失败继续向调用处报告
+ */
+async function importDroppedReferences(list) {
+  const tab = activeSession();
+  const request = { tabId: tab.id };
+  referenceImports.add(request);
+  try {
+    await addAttachments(list);
+    const map = await api.referenceImport({ tabId: tab.id, files: list });
+    if (activeSession() === tab) showReferenceMap(map, tab);
+  } finally {
+    referenceImports.delete(request);
+    retryHotReload();
+  }
 }
 
 /* ===== 剪贴板常驻面板：文本点击填入输入框，图片/文件点击加入引用 ===== */
@@ -1869,7 +2214,7 @@ function markTurnFailed(assistant, raw) {
   const msg = cleanErrorMessage(raw);
   const note = t('errorPrefix', { msg });
   // 地区限制这类永久性错误，发「继续」也只会再失败一次
-  const hint = /在当前地区不可用/.test(msg) ? '' : t('errorContinueHint');
+  const hint = /在当前地区不可用|ERR_UNKNOWN_URL_SCHEME|接口地址协议不受支持/.test(msg) ? '' : t('errorContinueHint');
   const body = assistant.text || '';
   if (!assistant.errorShown && !body.includes(note) && !body.includes(msg)) {
     assistant.text = [body, note, hint].filter(Boolean).join('\n\n');
@@ -2588,12 +2933,18 @@ function stopTypewriter() {
   }
 }
 
+/**
+ * 将指定消息的流式文字标记为完整显示。
+ * @param {object} msg 要结束显示的消息；为空或仍由独立补字动画管理时不处理。
+ * @returns {void} 更新消息显示进度；只有当前标签自己的回复才停止窗口共用的打字帧。
+ * 后台会话结束时不能取消前台另一条回复的动画。
+ */
 function finishTypewriter(msg) {
   if (!msg) return;
   if (revealingMsgs.has(msg)) return;
   msg.revealLen = (msg.text || '').length;
   msg.typewriterDone = true;
-  stopTypewriter();
+  if (activeSession()?.liveAssistant === msg) stopTypewriter();
 }
 
 function cancelReveal(msg) {
@@ -2756,13 +3107,19 @@ function ensureTypewriter() {
 const MESSAGE_RENDER_BATCH = 60;
 function renderMessages(switching = false) {
   const box = $('messages');
+  // 先保留当前视频；切换会话立即释放，普通重绘只复用仍在新页面中的节点。
+  const mediaPlayers = existingMediaPlayers(box);
+  if (switching) releaseMediaPlayers(mediaPlayers);
   const keep = box.scrollTop;
   const wasNearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 96;
   const tab = activeSession();
   const msgs = tab?.messages || [];
+  paintImageCanvas();
   box.classList.toggle('empty-center', msgs.length === 0);
   if (!msgs.length) {
     box.innerHTML = '';
+    // 空会话也必须清除上个会话的媒体缓存和播放器引用。
+    loadMediaPreviews(box, api, state.workspace, mediaPlayers);
     reportStartReady(tab, false, []);
     updateUndoRedo();
     return;
@@ -2852,10 +3209,11 @@ function renderMessages(switching = false) {
           <button class="msg-fork" data-fork="${i}" title="${t('forkTitle')}">${t('fork')}</button>
         </span>
       </div>
-      ${m.role === 'assistant' ? renderThink(m, i) : ''}${m.role === 'assistant' ? renderTodoCard(m) : ''}${bubble}${artifactCardsHtml(m)}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, planIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
+      ${m.role === 'assistant' ? renderThink(m, i) : ''}${m.role === 'assistant' ? renderTodoCard(m) : ''}${bubble}${mediaCardsHtml(m, escapeHtml)}${artifactCardsHtml(m)}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, planIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
     </div>`;
   }).join('');
-  // [铆钉优化] 进入/切换对话一律滚到最新；同一标签页重绘时原来贴底就继续贴底，否则保持原位。其他 AI 请勿改回恢复 scrollPos 旧位置
+  loadMediaPreviews(box, api, state.workspace, mediaPlayers);
+  // 进入或切换对话时滚到最新；同一标签页重绘时保留用户当前阅读位置。
   if (switching) {
     tab.scrollPos = null;
     scrollMessagesToBottom();
@@ -3277,7 +3635,13 @@ function renderSidebar() {
   $('rule-list').innerHTML = ruleListHtml();
 }
 
+/**
+ * 读取当前标签工作区与附加目录的文件树。
+ * @returns {Promise<void>} 仍属于当前导航的树缓存绘制后兑现；切标签后到达的旧结果不更新界面。
+ * 导航序号在读取前固定，防止多次异步目录请求把旧历史的资源树显示到新历史。
+ */
 async function loadFileTree() {
+  const navigation = state.tabNavigationId;
   const extra = extraFoldersOf(activeSession());
   if (!state.workspace && !extra.length) {
     $('tree-root-name').textContent = t('noProject');
@@ -3305,6 +3669,7 @@ async function loadFileTree() {
       next[key] = [];
     }
   }
+  if (navigation !== state.tabNavigationId) return;
   state.treeCache = next;
   renderFileTree();
 }
@@ -3384,7 +3749,7 @@ function renderTreeNodes(rel, depth) {
         ${kids}
       </div>`;
     }
-    return `<button class="tree-row ${state.previewPath === it.path ? 'on' : ''}" style="padding-left:${pad}px" data-tree-file="${encodeURIComponent(it.path)}">
+    return `<button class="tree-row ${(state.treeRevealPath || state.previewPath) === it.path ? 'on' : ''}" style="padding-left:${pad}px" data-tree-file="${encodeURIComponent(it.path)}">
       <span class="tree-arrow"> </span>
       <span class="tree-name">${escapeHtml(it.name)}</span>
     </button>`;
@@ -3441,6 +3806,7 @@ function roleLabel(roleId) {
     summary: 'roleSummary',
     code: 'roleCode',
     planning: 'rolePlanning',
+    aesthetic: 'roleAesthetic',
     imageGen: 'roleImageGen',
     videoGen: 'roleVideoGen',
     model3d: 'roleModel3d',
@@ -3490,12 +3856,38 @@ function rosterSlot(role) {
   return backs.map((r) => capRefSlot(r, role)).find(Boolean) || null;
 }
 
+/** 列出当前角色全部展示项；代码池全部显示，不把首项当作默认模型。 */
+function rosterSlots(role) {
+  if (role !== 'code') {
+    const slot = rosterSlot(role);
+    return slot ? [slot] : [];
+  }
+  const slots = [];
+  const pack = state.assemblies && state.assemblies[state.assemblyKey];
+  for (const slot of pack?.slots || []) {
+    if (slot.role === role && slotDisplayName(slot)) slots.push(slot);
+  }
+  for (const ref of codePoolRefs(state.capabilityDefaults?.code)) {
+    const slot = capRefSlot(ref, role);
+    if (slot) slots.push(slot);
+  }
+  const out = [];
+  const seen = new Set();
+  for (const slot of slots) {
+    const id = slot.apiId || slot.modelPath || slot.model;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(slot);
+  }
+  return out;
+}
+
 function slotIsCursor(slot) {
   if (!slot) return false;
-  if (['cursor', 'codex', 'claudecode'].includes(slot.protocol)) return true;
+  if (['cursor', 'codex', 'claudecode', 'grok'].includes(slot.protocol)) return true;
   const m = slot.apiId ? (state.models || []).find((x) => x.id === slot.apiId) : null;
   const protocol = !!m && m.type !== 'local' ? providerById(m.providerId)?.protocol : '';
-  return ['cursor', 'codex', 'claudecode'].includes(protocol);
+  return ['cursor', 'codex', 'claudecode', 'grok'].includes(protocol);
 }
 
 function idleRoster() {
@@ -3503,10 +3895,10 @@ function idleRoster() {
   const name = cur?.model || cur?.name || t('model');
   const list = [{ name, role: 'brain' }];
   for (const role of ROSTER_ROLES) {
-    const slot = rosterSlot(role);
-    const n = slotDisplayName(slot);
-    if (!n) continue;
-    list.push({ name: n, role });
+    for (const slot of rosterSlots(role)) {
+      const n = slotDisplayName(slot);
+      if (n) list.push({ name: n, role });
+    }
   }
   return list;
 }
@@ -3519,7 +3911,7 @@ function rosterForButton() {
 }
 
 function rosterChipOn(m, x) {
-  if (m.activeRole && x.role === m.activeRole) return true;
+  if (m.activeRole && x.role === m.activeRole) return !m.activeModel || x.name === m.activeModel;
   return !!(m.activeModel && x.name === m.activeModel && !m.activeRole);
 }
 
@@ -3561,6 +3953,26 @@ function paintModelButton(activeName, activeRole) {
   syncCursorDirectBtn();
 }
 
+/** 只更新画布区域，切换会话时重新取当前会话的任务，不触碰聊天正文。 */
+function paintImageCanvas() {
+  renderImageCanvas($('image-canvas-tasks'), activeSession(), api, openLightbox, state.workspace);
+}
+
+/** 同步画布和工具栏按钮的展开状态，开始绘图时可自动展开。 */
+function setImageCanvasOpen(open) {
+  $('image-canvas').classList.toggle('hidden', !open);
+  $('btn-image-canvas').setAttribute('aria-expanded', String(open));
+  if (open) paintImageCanvas();
+}
+
+/** 按模型保存推理档位，已有请求保持本轮参数，后续请求读取新配置。 */
+async function saveReasoningEffort(id, effort) {
+  const model = state.models.find(function sameModel(item) { return item.id === id; });
+  if (!model) throw new Error('模型已不存在');
+  model.reasoningEffort = effort;
+  await persistModels();
+}
+
 /** 重绘模型选择菜单，并同步当前大脑的显示名称与桌宠额度；标签恢复同样调用本入口。 */
 function renderModelMenu() {
   paintModelButton();
@@ -3583,7 +3995,8 @@ function renderModelMenu() {
   const listBody = (locals || `<button disabled>${t('noLocalGguf')}</button>`)
     + (apis ? `<div class="sep"></div>${apis}` : '');
   $('model-menu').innerHTML = `<div class="model-menu-scroll">${listBody}</div>`
-    + `<div class="model-menu-foot"><div class="sep"></div><button data-act="settings">${t('manageModels')}</button></div>`;
+    + `<div class="model-menu-foot"><div class="sep"></div><div id="reasoning-control" class="reasoning-control"></div><button data-act="settings">${t('manageModels')}</button></div>`;
+  renderReasoningControl($('reasoning-control'), currentModel(), api, saveReasoningEffort);
   $('status-model').textContent = modelLabel();
   // 模型选择与标签恢复共用此入口，立即同步当前大脑，避免显示上一模型余额。
   api.reportAccountQuota(currentBrainQuotaSnapshot());
@@ -3625,10 +4038,15 @@ function closeCodePreview() {
   focusComposer();
 }
 
+/**
+ * 在侧栏只读预览文件；本地链接与资源树共用同一入口。
+ * 图片、视频、文档及文本展示内容，二进制展示元信息；读取失败保留实际错误，不执行文件。
+ */
 async function openCodePreview(rel) {
   const filePath = String(rel || '').replace(/\\/g, '/');
   if (!filePath) return;
   state.previewPath = filePath;
+  state.treeRevealPath = '';
   state.previewMdText = '';
   state.previewMdRaw = false;
   const mdBtn = $('btn-preview-md');
@@ -3644,6 +4062,10 @@ async function openCodePreview(rel) {
       $('preview-body').innerHTML = `<img src="${data.content}" alt="${escapeHtml(data.name)}" data-zoom-src="${data.content}">`;
       return;
     }
+    if (data.kind === 'video') {
+      $('preview-body').innerHTML = `<video class="preview-video" controls playsinline preload="metadata" src="${escapeHtml(data.content)}"></video>`;
+      return;
+    }
     if (data.kind === 'document') {
       const imgs = (data.images || []).map((img) =>
         `<img class="preview-doc-img" src="${img.dataUrl}" alt="${escapeHtml(img.name || '')}" data-zoom-src="${img.dataUrl}">`
@@ -3653,7 +4075,9 @@ async function openCodePreview(rel) {
       return;
     }
     if (data.kind === 'binary') {
-      $('preview-body').innerHTML = `<div class="hint" style="padding:12px">${t('binaryNoPreview')}</div>`;
+      const size = t('previewFileBytes', { n: data.size.toLocaleString() });
+      const modified = new Date(data.modifiedAt).toLocaleString();
+      $('preview-body').innerHTML = `<div class="file-info-preview"><strong>${escapeHtml(data.name)}</strong><dl><dt>${t('previewFileSize')}</dt><dd>${escapeHtml(size)}</dd><dt>${t('previewFileModified')}</dt><dd>${escapeHtml(modified)}</dd></dl><p class="hint">${t('binaryNoPreview')}</p></div>`;
       return;
     }
     // Markdown：默认按样式渲染，可切回源码行号视图
@@ -3713,32 +4137,32 @@ function promptRename(id, current, onDone) {
   };
 }
 
+/**
+ * 打开指定历史会话，并复用同窗口中已经加载的标签。
+ * @param {string} id 历史会话编号，同时用作标签编号；并发加载后须再次查重。
+ * @returns {Promise<void>} 目标标签完成切换后兑现；读取或保存失败继续向调用方报告。
+ * 切换统一交给 switchToTab，保存加载等待期间的最新草稿、编辑位置并绑定对应小窗。
+ * 较早的历史读取回执只登记标签，不覆盖用户在等待期间后来选择的其他历史。
+ */
 async function openHistorySession(id) {
-  await persistSession();
-  const existing = state.tabs.find((t) => t.id === id);
-  if (existing) {
-    closeModal();
-    showChat();
-    await switchToTab(id);
+  const navigation = ++state.tabNavigationId;
+  let tab = state.tabs.find(function sameSession(item) { return item.id === id; });
+  if (!tab) {
+    const data = await api.loadSession(id);
+    // 同一历史可能被快速重复点击；异步读取结束后只保留先完成加载的那份会话对象。
+    tab = state.tabs.find(function loadedSession(item) { return item.id === data.id; });
+    if (!tab) {
+      tab = hydrateTab(data, data.workspace || state.workspace);
+      state.tabs.push(tab);
+    }
+  }
+  if (navigation !== state.tabNavigationId) {
+    renderTabs();
     return;
   }
-  const data = await api.loadSession(id);
-  if (data.workspace && data.workspace !== state.workspace) {
-    const ws = await api.setWorkspace(data.workspace);
-    setWorkspace(ws || data.workspace);
-    await refreshMeta();
-  }
-  const tab = hydrateTab(data, data.workspace || state.workspace);
-  state.tabs.push(tab);
-  state.activeTab = data.id;
-  applyTabContext(tab);
   closeModal();
   showChat();
-  renderTabs();
-  renderMessages();
-  renderQueue();
-  syncSendBtn();
-  await loadFileTree();
+  await switchToTab(tab.id);
 }
 
 async function deleteConversation(id, title) {
@@ -3747,6 +4171,7 @@ async function deleteConversation(id, title) {
   await api.deleteSession(id);
   const closing = state.tabs.find((t) => t.id === id);
   if (isTabSending(closing)) abortTab(closing);
+  api.floatForget(id);
   state.tabs = state.tabs.filter((t) => t.id !== id);
   if (state.activeTab === id) state.activeTab = state.tabs[0]?.id || null;
   if (!state.tabs.length) newTab();
@@ -3974,14 +4399,24 @@ function confirmSubmitFromPrevious() {
   });
 }
 
+/**
+ * 消费指定会话自己的旧消息编辑位置，沿用用户已确认的重发处理。
+ * @param {object} tab 本条队列任务所属标签；未编辑旧消息时不改变消息与快照。
+ * @returns {Promise<void>} 本会话尾部处理完成后兑现；后台执行不读写前台其他标签的编辑状态。
+ * 快照处理仍只按该会话已确认的选择执行，编辑锚点在异步操作前消费，避免下一条任务重复使用。
+ */
 async function beginRefillResend(tab) {
-  const from = state.refillFromIndex;
-  if (from == null || from < 0 || !tab) return;
+  if (!tab) return;
+  const from = tab.refillFromIndex;
+  if (from == null || from < 0) return;
   const tail = tab.messages.slice(from);
-  const revert = !!state.refillRevertFiles;
-  state.refillRevertFiles = false;
-  state.refillFromIndex = null;
-  if (tab) { tab.refillFromIndex = null; tab.refillRevertFiles = false; }
+  const revert = !!tab.refillRevertFiles;
+  tab.refillFromIndex = null;
+  tab.refillRevertFiles = false;
+  if (isActiveTab(tab)) {
+    state.refillRevertFiles = false;
+    state.refillFromIndex = null;
+  }
   if (revert) {
     const ids = [];
     for (let i = tail.length - 1; i >= 0; i--) {
@@ -3989,7 +4424,7 @@ async function beginRefillResend(tab) {
       if (id && !ids.includes(id)) ids.push(id);
     }
     for (const id of ids) {
-      try { await api.restoreSnapshot(id); } catch { /* 快照可能已过期 */ }
+      try { await api.restoreSnapshot({ id, workspace: tab.workspace }); } catch { /* 快照可能已过期 */ }
     }
     try { await refreshAfterRestore(); } catch { /* 忽略刷新失败 */ }
   }
@@ -4036,8 +4471,10 @@ function restoreStoppedDraft(tab, assistant) {
 
 /**
  * 发送指定会话队列中的一条任务并维护回复状态。
- * draft 是入队时的独立载荷；屏幕任务只消费自身内容，保留手动草稿与附件，停止时也不覆盖输入框。
- * 返回是否中止当前队列，发送、快照和验收沿用现有 chatSend 链路。
+ * @param {object} tab 本条任务所属的标签；所有消息、编辑状态与持久化结果只写入该标签。
+ * @param {string} text 入队时固定的任务正文。
+ * @param {object} draft 本条独立载荷，含模型、附件、引用和 sysOverrides；屏幕任务保留手动草稿，停止也不覆盖输入框。
+ * @returns {Promise<boolean>} 是否中止当前队列；发送、快照和验收沿用现有 chatSend 链路。
  */
 async function sendOne(tab, text, draft) {
   if (!tab) return true;
@@ -4119,7 +4556,7 @@ async function sendOne(tab, text, draft) {
   // 预览面板里改过人设 / 规则正文 / 技能正文时，把覆盖值带上这一轮请求；
   // 没改过就是 null，payload 里连字段都不出现，行为与原来完全一致
   // 后台屏幕任务不消费用户为未发送消息准备的提示词覆盖。
-  const sysOverrides = background ? null : (state.promptOverrides || null);
+  const sysOverrides = background ? null : (draft.sysOverrides || null);
   const payload = {
     text,
     action: draft.action === 'start-work' ? 'start-work' : undefined,
@@ -4153,10 +4590,7 @@ async function sendOne(tab, text, draft) {
     };
   }
   if (isActiveTab(tab)) {
-    if (!background) {
-      state.contextPaths = [];
-      state.attachments = [];
-    }
+    // 已提交的输入在入队时消费；队列现在启动时，输入区可能已经属于用户下一条未提交的草稿。
     renderChips();
     renderTabs();
     renderMessages();
@@ -4175,10 +4609,8 @@ async function sendOne(tab, text, draft) {
   let aborted = false;
   let residentError = '';
   try {
-    // 请求发出后立刻清空：预览面板的覆盖值只影响这一轮，下一轮仍按磁盘上的规则、人设、技能拼
-    const sending = api.chatSend(payload);
-    if (!background) state.promptOverrides = null;
-    const result = await sending;
+    // 覆盖值随本条队列载荷进入请求，不消费其他标签或后续输入的提示词。
+    const result = await api.chatSend(payload);
     if (isStopError(null, tab)) {
       if (isActiveTab(tab)) {
         flushLivePaint();
@@ -4258,6 +4690,7 @@ async function sendOne(tab, text, draft) {
   return aborted;
 }
 
+/** 按顺序执行指定标签的消息队列；全部结束后释放执行状态，并尝试加载已排队的界面更新。 */
 async function processQueue(tab) {
   if (!tab || tab.draining) return;
   tab.draining = true;
@@ -4279,6 +4712,7 @@ async function processQueue(tab) {
       renderQueue();
       syncSendBtn();
     }
+    retryHotReload();
   }
 }
 
@@ -4310,7 +4744,13 @@ function showScreenRequestStatus(text) {
   if (button) button.title = text;
 }
 
-/** 提交当前输入；通过发送前置检查后即追加原始正文历史，供上下键浏览，排队和插话无需等待模型启动。 */
+/**
+ * 提交当前输入到所属会话的插话或队列，并记录可召回的原始正文。
+ * @param {object} options 本次提交选项；action 表示开工授权，sysOverrides 是预览面板仅作用于本条的提示词覆盖。
+ * @returns {Promise<void>} 插话投递或本次队列处理结束后兑现；未通过发送条件时不提交。
+ * 确认弹窗前固定正文、模型、技能、附件、引用与覆盖提示词；确认结果和草稿消费始终归原会话。
+ * 带覆盖的请求作为独立任务排队；确认期间切换历史，不读取新标签载荷，也不清理新标签输入或编辑锚点。
+ */
 async function send(options = {}) {
   const tab = activeSession() || (newTab(), activeSession());
   if (!tab.workspace && state.workspace) tab.workspace = state.workspace;
@@ -4331,49 +4771,63 @@ async function send(options = {}) {
     openSettings();
     return;
   }
+  // 确认弹窗前固定本次提交的完整载荷，等待期间切换标签不能改用另一会话的模型、附件或引用。
+  const ids = [...skillStack()];
+  const item = {
+    text,
+    action: options.action === 'start-work' ? 'start-work' : undefined,
+    sysOverrides: options.sysOverrides,
+    skillId: ids[0] || null,
+    skillIds: ids,
+    modelId: tab.modelId || state.currentModelId,
+    contextPaths: [...state.contextPaths],
+    attachments: state.attachments.map(copySubmittedAttachment)
+  };
+  /**
+   * 复制提交时的附件，保留预览与路径供原会话发送。
+   * @param {object} attachment 确认弹窗前的原附件。
+   * @returns {object} 独立浅副本，不修改原对象或当前附件列表。
+   */
+  function copySubmittedAttachment(attachment) { return { ...attachment }; }
+  /**
+   * 消费原会话已提交的草稿，只有原会话仍在前台时才清理输入控件与附件栏。
+   * @returns {void} 清除 tab.composer；后台确认不触碰当前标签的输入、附件、引用或草稿保存计时器。
+   */
+  function consumeSubmittedComposer() {
+    tab.composer = null;
+    if (!isActiveTab(tab)) return;
+    input.value = '';
+    clearComposer(tab);
+    scheduleComposerSave();
+    state.attachments = [];
+    state.contextPaths = [];
+    renderChips();
+  }
   if (refillHasTail()) {
     const choice = await confirmSubmitFromPrevious();
     if (choice === 'cancel') return;
     if (choice === 'new') {
-      // 放弃编辑、保留旧消息：清空编辑锚点，后续按普通发送把当前输入作为全新消息追加
-      state.refillFromIndex = null;
-      state.refillRevertFiles = false;
-      const rt = activeSession();
-      if (rt) { rt.refillFromIndex = null; rt.refillRevertFiles = false; }
+      // 确认只修改发起会话的编辑锚点；切换到别的历史后，前台编辑状态保持原样。
+      tab.refillFromIndex = null;
+      tab.refillRevertFiles = false;
+      if (isActiveTab(tab)) {
+        state.refillFromIndex = null;
+        state.refillRevertFiles = false;
+      }
     } else {
-      state.refillRevertFiles = choice === 'revert';
+      tab.refillRevertFiles = choice === 'revert';
+      if (isActiveTab(tab)) state.refillRevertFiles = tab.refillRevertFiles;
     }
   }
-  // 在任何异步插话或队列处理之前追加原始正文；同一句重复提交也分别记录。
+  // 用户确认后只记录原会话的原始正文，取消不提交；同一句重复提交也分别记录。
   recordSubmittedText(tab, submittedText);
-  // 每条消息入队时各自拍快照（文本/技能/引用/附件），队列里互不继承上一轮的内容
-  const snapItem = () => {
-    const ids = skillStack();
-    return {
-      text,
-      // 每条队列项独立保存按钮意图，不放进输入框或全局状态，避免下一条聊天继承。
-      action: options.action === 'start-work' ? 'start-work' : undefined,
-      skillId: ids[0] || null,
-      skillIds: ids,
-      modelId: tab.modelId || state.currentModelId,
-      contextPaths: [...state.contextPaths],
-      attachments: state.attachments.map((a) => ({ ...a }))
-    };
-  };
   // 运行中的正文与图片走插话，其他文件仍按原队列提交。
   if (tab.sending || tab.draining) {
-    // 图片已有本地路径和预览，可与正文一同送入当前轮；纯图也可插话。
-    const imageOnlyAttachments = state.attachments.every(function isImage(att) { return !!att.preview; });
-    if ((text || state.attachments.length) && imageOnlyAttachments && options.action !== 'start-work' && text !== '/spcode-start') {
-      // 提交时固定本条载荷并消费输入框；等待回执期间的新草稿不能被异步清空或混进队列。
-      const item = snapItem();
-      input.value = '';
-      clearComposer(tab);
-      scheduleComposerSave();
-      state.contextPaths = [];
-      renderChips();
-      state.attachments = []; // 本条附件已进入item快照，后续草稿不受异步回执影响。
-      renderChips();
+    // 图片可随插话进入当前轮；预览覆盖只属于新请求，须保留在独立队列项中。
+    const imageOnlyAttachments = item.attachments.every(/** att为提交快照的附件；返回是否含图片预览，不读取或修改当前输入。 */ function isImage(att) { return !!att.preview; });
+    if ((text || item.attachments.length) && imageOnlyAttachments && !item.sysOverrides && item.action !== 'start-work' && text !== '/spcode-start') {
+      // 载荷已在确认前固定；清理只作用于本次提交所属会话。
+      consumeSubmittedComposer();
       // 回执可能延迟，先持久化提交列表和已消费的草稿，重开也能召回本条插话。
       persistTab(tab);
       let res = null;
@@ -4400,32 +4854,20 @@ async function send(options = {}) {
       return;
     }
     // 带附件（或只有附件）仍旧排队，附件快照/缩略图/清空行为都不变
-    if (text || state.attachments.length) {
-      tabQueue(tab).push(snapItem());
-      input.value = '';
-      clearComposer(tab);
-      scheduleComposerSave();
-      // 发送即消费输入区：附件/引用/技能已随队列项快照，清空避免下一条重复带上
-      state.attachments = [];
-      state.contextPaths = [];
-      renderChips();
+    if (text || item.attachments.length) {
+      tabQueue(tab).push(item);
+      consumeSubmittedComposer();
       persistTab(tab);
     }
-    renderQueue();
+    if (isActiveTab(tab)) renderQueue();
     return;
   }
-  if (text || state.attachments.length) {
-    tabQueue(tab).push(snapItem());
-    input.value = '';
-    clearComposer(tab);
-    scheduleComposerSave();
-    // 发送即消费附件和引用。当前对话勾着的技能留着，直到自己取消
-    state.attachments = [];
-    state.contextPaths = [];
-    renderChips();
+  if (text || item.attachments.length) {
+    tabQueue(tab).push(item);
+    consumeSubmittedComposer();
     persistTab(tab);
   }
-  renderQueue();
+  if (isActiveTab(tab)) renderQueue();
   await processQueue(tab);
 }
 
@@ -4884,13 +5326,16 @@ async function openContextPreview(turnId) {
  * 参数全部取输入区与会话当前状态：输入框文本、当前技能栈、上下文引用、附件、当前模型、
  * 本会话的工作记忆与较早摘要、轮数开关；交给主进程 chat:promptPreview，用与真正发送同一套逻辑
  * 拼出这一轮会发出去的 system 文本。
- * 面板里人设、每条规则正文、技能正文可以改，改动只收进 state.promptOverrides，
+ * 面板里人设、每条规则正文、技能正文可以改，改动只收进本条发送载荷的 sysOverrides，
  * 不写回磁盘、不改规则/技能/人设的加载来源；完整 system 原文与 notes 是只读段，
  * notes 标出联网检索、看图识别、工具返回、方案文件正文这些要到发送时才现场生成。
+ * @returns {Promise<void>} 当前会话预览面板显示并绑定提交动作后兑现；无活动会话或导航已变化时不打开面板。
+ * 异步回执和点击提交均核对原标签与导航序号，失效预览不得向另一个历史提交覆盖内容。
  */
 async function openPromptPreview() {
   const tab = activeSession();
   if (!tab) return;
+  const navigation = state.tabNavigationId;
   const text = $('input').value.trim();
   const skillIds = skillStack();
   // 历史用于回复语言等当前会话判断，不在 system 中生成对话索引。
@@ -4919,6 +5364,8 @@ async function openPromptPreview() {
     contextSummary: tab.contextSummary || '',
     extraFolders: extraFoldersOf(tab)
   });
+  // 预览属于发起时的标签；迟到回执不能在后来选中的历史上弹出或携带旧提示词。
+  if (activeSession() !== tab || navigation !== state.tabNavigationId) return;
   const editable = data.editable || {};
   // 规则按「规则名 + 正文」两栏列出，正文可改，规则名不参与编辑
   const ruleRows = [];
@@ -4970,18 +5417,20 @@ async function openPromptPreview() {
   </div>`);
   $('modal-card').classList.add('wide');
   // 按修改发送：把可编辑区的值收成 overrides 交给发送流程；面板里的改动只留在内存，不写回磁盘
-  $('m-preview-send').onclick = () => {
+  $('m-preview-send').onclick = function submitPreview() {
+    // 面板打开后也可能切过历史；失效面板不发送、不关闭当前用户正在操作的界面。
+    if (activeSession() !== tab || navigation !== state.tabNavigationId) return;
     const rules = [];
     for (let i = 0; i < (editable.rules || []).length; i++) {
       rules.push({ name: editable.rules[i].name, body: $(`ov-rule-${i}`).value });
     }
-    state.promptOverrides = {
+    const sysOverrides = {
       persona: $('ov-persona').value,
       rules,
       skill: editable.skill ? $('ov-skill').value : ''
     };
     closeModal();
-    send();
+    send({ sysOverrides });
   };
   $('m-preview-close').onclick = () => closeModal();
 }
@@ -5073,7 +5522,7 @@ function onChatEvent(ev) {
   }
   const tab = (ev.turnId && (findTabByTurnId(ev.turnId) || state.tabs.find((t) => t.liveTurnId === ev.turnId)))
     || (!ev.turnId ? activeSession() : null);
-  if (!tab || tab.aborting) return;
+  if (!tab || (tab.aborting && ev.type !== 'image_generation')) return;
   const last = (ev.turnId
     ? tab.messages.find((m) => m.role === 'assistant' && m.turnId === ev.turnId)
     : null) || tab.liveAssistant;
@@ -5130,6 +5579,21 @@ function onChatEvent(ev) {
     pushThink(last, 'tool', toolText);
     last.status = ev.status === 'running' ? `${t('running')} · ${toolText}` : '';
     if (touchUi) scheduleLivePaint();
+  } else if (ev.type === 'image_generation') {
+    const first = !(last.imageGenerations || []).some(function sameTask(task) { return task.taskId === ev.taskId; });
+    updateImageTask(last, ev);
+    scheduleStreamSave(tab);
+    if (touchUi) {
+      if (first) setImageCanvasOpen(true);
+      else paintImageCanvas();
+    }
+  } else if (ev.type === 'generated_media') {
+    // 生成成功事件单独保存文件引用，流式正文未结束也能预览，重开会话时仍能恢复。
+    if (!Array.isArray(last.generatedMedia)) last.generatedMedia = [];
+    const exists = last.generatedMedia.some(function sameMedia(item) { return item.path === ev.media.path; });
+    if (!exists) last.generatedMedia.push(ev.media);
+    scheduleStreamSave(tab);
+    if (touchUi) { flushLivePaint(); renderMessages(); }
   } else if (ev.type === 'artifact') {
     if (!Array.isArray(last.artifacts)) last.artifacts = [];
     const artifactIndex = last.artifacts.findIndex(function sameArtifact(item) { return item.manifest === ev.artifact.manifest; });
@@ -5574,17 +6038,20 @@ function paintIndexCard(st) {
 
 // ===== 能力槽位公用配置项与小工具：设置页和引导界面共用同一套，避免两处各写一份 =====
 
-// 八项能力角色；key 是界面文案的 i18n 键（与 roleLabel 里的映射一致）
+// 能力角色；key 是界面文案的 i18n 键（与 roleLabel 里的映射一致）
 const CAP_ROLES = [
   { id: 'vision', key: 'roleVision' },
   { id: 'summary', key: 'roleSummary' },
   { id: 'code', key: 'roleCode' },
   { id: 'planning', key: 'rolePlanning' },
+  { id: 'aesthetic', key: 'roleAesthetic' },
   { id: 'imageGen', key: 'roleImageGen' },
   { id: 'videoGen', key: 'roleVideoGen' },
   { id: 'model3d', key: 'roleModel3d' },
   { id: 'docGen', key: 'roleDocGen' }
 ];
+// 这两项是平等模型池：代码由大脑点名，审美是全部一起投票。
+const POOL_ROLE_IDS = ['code', 'aesthetic'];
 
 // 把一条能力引用压成下拉框的取值：API 模型 → api:<模型id>，本地模型 → local:<文件名>
 function capValOf(ref) {
@@ -5609,7 +6076,7 @@ function parseCapRef(v) {
   if (!body) return null;
   if (kind === 'local') return { type: 'local', model: body };
   if (kind !== 'api') return null;
-  const found = (state.models || []).find((x) => x.id === body);
+  const found = [...state.models, ...state.videoProviderModels].find(function matchingModel(model) { return model.id === body; });
   const ref = {
     type: 'api',
     apiId: body,
@@ -5624,7 +6091,8 @@ function parseCapRef(v) {
 }
 
 // 生成一颗能力下拉框的全部选项：未设置 + 本地模型 + API 模型
-function capSelectOptionsHtml(selected) {
+/** 生成能力选项；视频角色同时提供已添加 MXAPI 厂商的文档模型，其他角色不混入。 */
+function capSelectOptionsHtml(selected, role) {
   const cur = String(selected == null ? '' : selected);
   const html = [`<option value=""${cur ? '' : ' selected'}>${t('capabilityUnset')}</option>`];
   let found = !cur;
@@ -5637,6 +6105,7 @@ function capSelectOptionsHtml(selected) {
     html.push(`<option value="${escapeHtml(value)}"${value === cur ? ' selected' : ''}>${t('local')} · ${escapeHtml(name)}</option>`);
   }
   const apis = (state.models || []).filter((m) => m && m.type !== 'local');
+  if (role === 'videoGen') apis.push(...state.videoProviderModels);
   for (const m of apis) {
     const value = `api:${String(m.id || '')}`;
     if (!m.id) continue;
@@ -5648,17 +6117,67 @@ function capSelectOptionsHtml(selected) {
   return html.join('');
 }
 
-// 从指定容器里按 select[data-cap-role][data-cap-which] 读取全部能力槽位，得到 { 角色id: { primary, fallbacks } }
+/** 读取代码池引用；旧主/备用引用只做一次平等候选转换，不丢掉原设置。 */
+function codePoolRefs(pack) {
+  const row = pack || {};
+  if (Array.isArray(row.models)) return row.models;
+  const refs = [];
+  if (row.primary) refs.push(row.primary);
+  for (const ref of row.fallbacks || []) refs.push(ref);
+  return refs;
+}
+
+/** 生成可多选的平等模型池。roleId 用来区分代码池和审美池，已保存但暂不可用的模型保留可见。 */
+function poolHtml(roleId, pack, hintKey) {
+  const selected = new Set();
+  const choices = new Map();
+  for (const ref of codePoolRefs(pack)) {
+    const value = capValOf(ref);
+    if (!value) continue;
+    selected.add(value);
+    choices.set(value, ref.name || ref.model || value);
+  }
+  for (const file of state.localFiles || []) choices.set('local:' + file.name, t('local') + ' · ' + file.name);
+  for (const model of state.models || []) {
+    if (model.type === 'local') continue;
+    choices.set('api:' + model.id, (model.name || model.model) + ' · ' + model.model);
+  }
+  let html = '<p class="hint">' + t(hintKey) + '</p><div data-model-pool="' + roleId + '">';
+  for (const [value, label] of choices) {
+    html += '<label class="code-pool-option"><input type="checkbox" data-pool-model value="' +
+      escapeHtml(value) + '"' + (selected.has(value) ? ' checked' : '') + '> ' + escapeHtml(label) + '</label>';
+  }
+  return html + '</div>';
+}
+
+// 从配置容器读取能力配置；代码和审美使用平等模型池，其余能力保持原有配置形态。
 function readCapFromContainer(container, previous = state.capabilityDefaults || {}) {
   if (!container) {
     throw new Error(t('saveFail'));
   }
   const out = {};
   for (const role of CAP_ROLES) {
-    out[role.id] = { primary: null, fallbacks: [] };
+    out[role.id] = POOL_ROLE_IDS.indexOf(role.id) >= 0 ? { models: [] } : { primary: null, fallbacks: [] };
+  }
+  const pools = container.querySelectorAll('[data-model-pool]');
+  if (pools.length !== POOL_ROLE_IDS.length) throw new Error(t('saveFail'));
+  const seenPools = new Set();
+  for (const pool of pools) {
+    const roleId = String(pool.getAttribute('data-model-pool') || '');
+    if (POOL_ROLE_IDS.indexOf(roleId) < 0 || seenPools.has(roleId)) throw new Error(t('saveFail'));
+    seenPools.add(roleId);
+    for (const checkbox of pool.querySelectorAll('input[data-pool-model]:checked')) {
+      let ref = null;
+      for (const saved of codePoolRefs(previous[roleId])) {
+        if (capValOf(saved) === checkbox.value) ref = saved;
+      }
+      if (!ref) ref = parseCapRef(checkbox.value);
+      if (!ref) throw new Error(t('saveFail'));
+      out[roleId].models.push(ref);
+    }
   }
   const selects = container.querySelectorAll('select[data-cap-role][data-cap-which]');
-  if (selects.length !== CAP_ROLES.length * 2) {
+  if (selects.length !== (CAP_ROLES.length - POOL_ROLE_IDS.length) * 2) {
     throw new Error(t('saveFail'));
   }
   const seen = new Set();
@@ -5666,7 +6185,7 @@ function readCapFromContainer(container, previous = state.capabilityDefaults || 
     const roleId = String(sel.getAttribute('data-cap-role') || '');
     const which = String(sel.getAttribute('data-cap-which') || '');
     const key = `${roleId}:${which}`;
-    if (!Object.hasOwn(out, roleId) || !['primary', 'fallback'].includes(which) || seen.has(key)) {
+    if (!Object.hasOwn(out, roleId) || POOL_ROLE_IDS.indexOf(roleId) >= 0 || !['primary', 'fallback'].includes(which) || seen.has(key)) {
       throw new Error(t('saveFail'));
     }
     seen.add(key);
@@ -5691,6 +6210,7 @@ function openSettings() {
     if (p === 'cursor') return t('protocolCursor');
     if (p === 'codex') return t('protocolCodex');
     if (p === 'claudecode') return t('protocolClaudeCode');
+    if (p === 'grok') return t('protocolGrok');
     return t('protocolOpenai');
   };
   const providerRows = (state.providers || []).map((p) => `
@@ -5710,6 +6230,7 @@ function openSettings() {
       <div>
         <b>${escapeHtml(m.name || m.model)}</b>
         <div class="hint">${escapeHtml(providerNameOf(m))} · ${escapeHtml(m.model)}${m.pricing?.text ? ` · ${escapeHtml(m.pricing.text)}` : ''}${m.vision ? ` · ${t('supportsVision')}` : ''}${m.id === state.currentModelId ? ` · ${t('inUse')}` : ''}</div>
+        <div class="reasoning-control" data-model-reasoning="${escapeHtml(m.id)}"></div>
       </div>
       <div>
         <button type="button" data-model-use="${escapeHtml(m.id)}">${t('use')}</button>
@@ -5726,6 +6247,7 @@ function openSettings() {
       <option value="system">${t('themeSystem')}</option>
       <option value="light">${t('themeLight')}</option>
       <option value="dark">${t('themeDark')}</option>
+      <option value="cel">${t('themeCel')}</option>
     </select>
     <h3 style="margin-top:16px">${t('localModels')}</h3>
     <p class="hint">${t('localHint')}</p>
@@ -5787,10 +6309,11 @@ function openSettings() {
       <option value="cursor">${t('protocolCursor')}</option>
       <option value="codex">${t('protocolCodex')}</option>
       <option value="claudecode">${t('protocolClaudeCode')}</option>
+      <option value="grok">${t('protocolGrok')}</option>
     </select>
     <label>${t('apiUrl')}</label><input id="p-url" placeholder="https://api.openai.com/v1" />
     <label id="p-key-label">${t('apiKey')}</label><input id="p-key" type="password" placeholder="sk-..." />
-    <div id="p-key-hint" style="display:none">Cursor / Codex 无需填写 Key，直接使用本机登录态</div>
+    <div id="p-key-hint" style="display:none">Cursor / Codex / Grok 无需填写 Key，直接使用本机登录态</div>
     <div class="model-row" style="gap:8px;margin-top:8px">
       <div style="flex:1"><label>${t('timeoutSec')}</label><input id="p-timeout" type="number" min="5" value="120" /></div>
       <div style="flex:1"><label>${t('maxRetries')}</label><input id="p-retries" type="number" min="0" value="3" /></div>
@@ -5885,15 +6408,19 @@ function openSettings() {
     const caps = capDraft;
     box.innerHTML = CAP_ROLES.map((r) => {
       const pack = caps[r.id] || {};
+      if (r.id === 'code' || r.id === 'aesthetic') {
+        const hintKey = r.id === 'aesthetic' ? 'aestheticPoolHint' : 'codePoolHint';
+        return '<div class="model-row"><div><b>' + t(r.key) + '</b></div><div style="flex:1">' + poolHtml(r.id, pack, hintKey) + '</div></div>';
+      }
       const primary = capValOf(pack.primary);
       const fb = capValOf((pack.fallbacks || [])[0]);
       return `<div class="model-row" style="align-items:flex-start;gap:8px;margin:8px 0">
         <div style="min-width:72px;padding-top:8px"><b>${t(r.key)}</b></div>
         <div style="flex:1">
           <label class="hint">${t('capabilityPrimary')}</label>
-          <select data-cap-role="${r.id}" data-cap-which="primary">${capSelectOptionsHtml(primary)}</select>
+          <select data-cap-role="${r.id}" data-cap-which="primary">${capSelectOptionsHtml(primary, r.id)}</select>
           <label class="hint">${t('capabilityFallback')}</label>
-          <select data-cap-role="${r.id}" data-cap-which="fallback">${capSelectOptionsHtml(fb)}</select>
+          <select data-cap-role="${r.id}" data-cap-which="fallback">${capSelectOptionsHtml(fb, r.id)}</select>
         </div>
       </div>`;
     }).join('');
@@ -6000,12 +6527,39 @@ function openSettings() {
     }
   };
 
-  const paintSavedModels = () => {
+  /**
+   * 保存指定模型的档位并同步顶栏快捷控件，不改变当前对话模型或能力槽位。
+   * @param {string} id 已保存模型的独立 ID
+   * @param {string} effort 厂商支持的档位，空字符串表示模型默认
+   */
+  async function saveManagedReasoningEffort(id, effort) {
+    await saveReasoningEffort(id, effort);
+    renderModelMenu();
+  }
+
+  /** 为每条已保存模型绑定自己的档位控件；模型增删重绘后按 ID 重新绑定。 */
+  function bindSavedModelReasoning() {
+    for (const root of $('api-model-list').querySelectorAll('[data-model-reasoning]')) {
+      const id = root.dataset.modelReasoning;
+      let model;
+      for (const item of state.models) {
+        if (item.id === id) {
+          model = item;
+          break;
+        }
+      }
+      renderReasoningControl(root, model, api, saveManagedReasoningEffort);
+    }
+  }
+
+  /** 重绘已保存模型列表及各模型档位，同时刷新引用模型的能力选项。 */
+  function paintSavedModels() {
     const rows = state.models.filter((m) => m.type !== 'local').map((m) => `
       <div class="model-row" data-model-id="${escapeHtml(m.id)}">
         <div>
           <b>${escapeHtml(m.name || m.model)}</b>
           <div class="hint">${escapeHtml(providerNameOf(m))} · ${escapeHtml(m.model)}${m.pricing?.text ? ` · ${escapeHtml(m.pricing.text)}` : ''}${m.id === state.currentModelId ? ` · ${t('inUse')}` : ''}</div>
+          <div class="reasoning-control" data-model-reasoning="${escapeHtml(m.id)}"></div>
         </div>
         <div>
           <button type="button" data-model-use="${escapeHtml(m.id)}">${t('use')}</button>
@@ -6013,9 +6567,10 @@ function openSettings() {
         </div>
       </div>`).join('');
     $('api-model-list').innerHTML = rows || `<p class="hint">${t('noApiModels')}</p>`;
+    bindSavedModelReasoning();
     paintBrainSelect();
     paintCapDefaults();
-  };
+  }
 
   const paintWalletForm = () => {
     const pid = $('mm-provider')?.value || '';
@@ -6077,7 +6632,7 @@ function openSettings() {
       + presets.map((p) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join('');
   })();
   const syncProviderKeyVisibility = () => {
-    const needsNoKey = ['cursor', 'codex'].includes($('p-protocol').value);
+    const needsNoKey = ['cursor', 'codex', 'grok'].includes($('p-protocol').value);
     $('p-key-label').style.display = needsNoKey ? 'none' : '';
     $('p-key').style.display = needsNoKey ? 'none' : '';
     $('p-key-hint').style.display = needsNoKey ? '' : 'none';
@@ -6099,6 +6654,7 @@ function openSettings() {
     if ($('p-protocol').value === 'cursor') $('p-url').value = 'cursor://sdk';
     else if ($('p-protocol').value === 'codex') $('p-url').value = 'codex://sdk';
     else if ($('p-protocol').value === 'claudecode') $('p-url').value = 'claudecode://sdk';
+    else if ($('p-protocol').value === 'grok') $('p-url').value = 'grok://cli';
     syncProviderKeyVisibility();
   };
 
@@ -6403,6 +6959,7 @@ function openSettings() {
     $('mm-provider').value = activeProviderId;
   }
   paintWalletForm();
+  bindSavedModelReasoning();
 }
 
 /* ===== 下载模型：用途 → 本机配置 → 建议 → 下载 ===== */
@@ -7006,6 +7563,7 @@ function pumpDownloadQueue() {
   if (running + 1 < MAX_CONCURRENT_DOWNLOADS) pumpDownloadQueue();
 }
 
+/** 执行一个已入队下载并记录真实结果；继续下载队列，全部空闲后允许加载界面更新。 */
 async function startDownloadItem(item) {
   item.status = 'downloading';
   renderDownloadPanel();
@@ -7041,8 +7599,10 @@ async function startDownloadItem(item) {
   }
   renderDownloadPanel();
   pumpDownloadQueue();
+  retryHotReload();
 }
 
+/** 取消指定的排队或运行中下载；排队项立即释放后重新检查待处理的界面更新。 */
 function cancelDownloadItem(id) {
   const item = state.downloads.find((d) => d.id === id);
   if (!item) return;
@@ -7050,6 +7610,7 @@ function cancelDownloadItem(id) {
     item.status = 'canceled';
     renderDownloadPanel();
     pumpDownloadQueue();
+    retryHotReload();
     return;
   }
   if (item.status === 'downloading') {
@@ -7182,13 +7743,21 @@ function bind() {
     if (act === 'toggle-autosave') {
       state.autoSave = await api.setAutoSave(!state.autoSave);
       $('btn-autosave').querySelector('.check').classList.toggle('on', state.autoSave);
+      // 开启成功就保存此前打开的全部标签，不能等下一次切换才建立恢复清单。
+      if (state.autoSave) {
+        persistOpenTabs();
+        const saves = [];
+        for (const tab of state.tabs) saves.push(persistTab(tab));
+        await Promise.all(saves);
+      }
     }
     if (act === 'settings') openSettings();
     if (act === 'manage-skills') openSkillManager();
     if (act === 'edit-persona') openPersonaEditor();
     if (act === 'manage-rules') openRuleManager();
     if (act === 'exit') api.close();
-    if (act === 'theme-light' || act === 'theme-dark' || act === 'theme-system') {
+    // 菜单与设置共用同一保存接口，新主题不会覆盖原有浅色、深色选项。
+    if (act === 'theme-light' || act === 'theme-dark' || act === 'theme-cel' || act === 'theme-system') {
       state.themePref = act.replace('theme-', '');
       applyTheme(await api.setTheme(state.themePref));
     }
@@ -7291,6 +7860,10 @@ function bind() {
   };
   $('btn-history').onclick = () => openHistory();
   $('btn-artifacts').onclick = openArtifactLibrary;
+  $('btn-image-canvas').onclick = function toggleImageCanvas() {
+    setImageCanvasOpen($('image-canvas').classList.contains('hidden'));
+  };
+  $('image-canvas-close').onclick = function closeImageCanvas() { setImageCanvasOpen(false); };
   $('btn-more').onclick = openSettings;
 
   $('tabs').onclick = async (e) => {
@@ -7301,6 +7874,8 @@ function bind() {
       if (isTabSending(closing)) abortTab(closing);
       if (state.activeTab === close) await persistSession();
       const wasActive = state.activeTab === close;
+      // 标签已经退出，主进程和桌宠不再持有该标签的选项、历史事件及余额快照。
+      api.floatForget(close);
       state.tabs = state.tabs.filter((t) => t.id !== close);
       if (!state.tabs.length) newTab();
       if (wasActive) await switchToTab(state.tabs[0].id);
@@ -7403,7 +7978,16 @@ function bind() {
       renderModelMenu();
     }
   };
-  $('chips').onclick = (e) => {
+  /** 参考入口只读已保存导图；附件删除与图片预览仍由原入口处理。 */
+  $('chips').onclick = async function onChipClick(e) {
+    if (e.target.closest('[data-reference-map]')) {
+      try {
+        await openReferenceMap();
+      } catch (error) {
+        alert(error.message || error);
+      }
+      return;
+    }
     const img = e.target.closest('.chip-img img');
     if (img && !e.target.closest('button')) {
       openLightbox(img.src);
@@ -7457,9 +8041,11 @@ function bind() {
     const restore = e.target.closest('[data-restore]')?.getAttribute('data-restore');
     if (skill) { addSkillToStack(skill); renderChips(); }
     if (restore) {
+      // 在确认弹窗前固定侧栏快照的项目，等待用户确认期间切历史不改变操作归属。
+      const workspace = state.workspace;
       const snap = state.snapshots.find((s) => s.id === restore);
       if (!await confirmRestore(snap)) return;
-      await api.restoreSnapshot(restore);
+      await api.restoreSnapshot({ id: restore, workspace });
       await refreshAfterRestore();
       openModal(`<h3>${t('restored')}</h3><p class="hint">${t('restoredHint')}</p><div class="modal-actions"><button class="primary" id="m-ok">${t('ok')}</button></div>`);
       $('m-ok').onclick = closeModal;
@@ -7975,6 +8561,8 @@ function bind() {
     if (artifactManifest) { await openArtifact(decodeURIComponent(artifactManifest)); return; }
     const previewFile = e.target.closest('[data-preview-file]')?.getAttribute('data-preview-file');
     if (previewFile) {
+      // Markdown 本地文件链接只打开侧栏，阻止锚点改变当前页面位置。
+      e.preventDefault();
       const rel = decodeURIComponent(previewFile);
       await openCodePreview(rel);
       return;
@@ -7987,18 +8575,21 @@ function bind() {
     const id = e.target.closest('[data-restore]')?.getAttribute('data-restore');
     if (!id) return;
     const btn = e.target.closest('[data-restore]');
+    // 消息卡片归当前标签所有；确认期间窗口即使切到另一个项目，仍使用该消息的原项目。
+    const workspace = activeSession().workspace;
     const snap = state.snapshots.find((s) => s.id === id) || {
       label: t('thisChange'),
       changes: [...(btn?.closest('.file-card')?.querySelectorAll('[data-preview-file]') || [])]
         .map((el) => ({ path: decodeURIComponent(el.getAttribute('data-preview-file')) }))
     };
     if (!await confirmRestore(snap)) return;
-    await api.restoreSnapshot(id);
+    await api.restoreSnapshot({ id, workspace });
     if (btn) btn.textContent = t('restored');
     await refreshAfterRestore();
   };
   $('messages').addEventListener('contextmenu', (e) => {
-    const previewFile = e.target.closest('[data-preview-file]')?.getAttribute('data-preview-file')
+    const previewFile = e.target.closest('[data-media-path]')?.getAttribute('data-media-path')
+      || e.target.closest('[data-preview-file]')?.getAttribute('data-preview-file')
       || e.target.closest('[data-reveal]')?.getAttribute('data-reveal');
     if (!previewFile) return;
     showFileCtx(e, decodeURIComponent(previewFile));
@@ -8010,9 +8601,14 @@ function bind() {
     if (e.target.closest('button')) return;
     if (state.previewPath) showFileCtx(e, state.previewPath);
   };
-  $('ctx-menu').onclick = (e) => {
+  $('ctx-menu').onclick = async function fileContextAction(e) {
     e.stopPropagation();
-    if (e.target.closest('[data-ctx="reveal"]') && state.ctxRel) revealInFolder(state.ctxRel);
+    if (!state.ctxRel) return;
+    if (e.target.closest('[data-ctx="reveal"]')) await revealInFolder(state.ctxRel);
+    if (e.target.closest('[data-ctx="resource"]')) {
+      try { await revealInResources(state.ctxRel); }
+      catch (error) { alert(error.message); }
+    }
   };
   document.addEventListener('contextmenu', (e) => {
     if (e.defaultPrevented || e.target.closest('#ctx-menu')) return;
@@ -8031,6 +8627,10 @@ function bind() {
   }
   $('btn-preview-at').onclick = () => {
     if (state.previewPath) addContextPath(state.previewPath);
+  };
+  // 预览内容与标题共用文件菜单，右键文件信息或画面即可打开所在目录。
+  $('preview-body').oncontextmenu = function previewFileContext(e) {
+    if (state.previewPath) showFileCtx(e, state.previewPath);
   };
   $('preview-body').onclick = (e) => {
     const img = e.target.closest('img');
@@ -8177,7 +8777,8 @@ function bind() {
     composer.classList.add('drop-on');
   });
   composer.addEventListener('dragleave', () => composer.classList.remove('drop-on'));
-  composer.addEventListener('drop', async (e) => {
+  /** 拖入参考文件后先保留附件，再等待内容识别、层级落盘与导图展示完成。 */
+  composer.addEventListener('drop', async function onReferenceDrop(e) {
     e.preventDefault();
     composer.classList.remove('drop-on');
     const files = [...(e.dataTransfer?.files || [])];
@@ -8185,7 +8786,7 @@ function bind() {
     try {
       const list = [];
       for (const f of files) list.push(await fileToAttachment(f));
-      await addAttachments(list);
+      await importDroppedReferences(list);
     } catch (err) {
       alert(err.message || err);
     }
@@ -8229,6 +8830,11 @@ function bind() {
 }
 
 api.onChatEvent(onChatEvent);
+const unsubscribeHotReload = api.onHotReload(receiveHotReload);
+/** 页面重载后只保留新文档的更新监听，避免旧页面重复处理通知。 */
+function releaseHotReloadListener() { unsubscribeHotReload(); }
+window.addEventListener('beforeunload', releaseHotReloadListener, { once: true });
+window.addEventListener('focus', retryHotReload);
 // 后台接单使用独立入口；主窗草稿和悬浮栏手动发送保持各自现有流程。
 if (api.onLongAliveTask) {
   const unsubscribeTask = api.onLongAliveTask(onLongAliveTask);
@@ -8330,6 +8936,7 @@ api.onUiRefresh(() => { refreshUiKeepChat(); });
 api.onDownloadProgress(onDownloadProgress);
 api.onIndexProgress(paintIndexCard);
 
+/** 加载设置并初始化界面；热重载优先恢复本窗口临时状态，再接收加载期间遗漏的更新。 */
 (async function init() {
   bind();
   const s = await api.getState();
@@ -8337,12 +8944,14 @@ api.onIndexProgress(paintIndexCard);
   applyDom();
   state.themePref = s.theme;
   state.autoSave = s.autoSave;
+  state.sessionLayoutKey = s.sessionLayoutKey;
   state.recents = s.recents || [];
   state.models = s.models || [];
   state.currentModelId = s.currentModelId;
   state.modelsDir = s.modelsDir || '';
   state.searchSites = s.searchSites || [];
   state.providers = s.providers || [];
+  state.videoProviderModels = s.videoProviderModels;
   state.proxy = s.proxy || '';
   state.commandSandbox = s.commandSandbox || { enabled: true, timeoutSec: 60 };
   state.maxAgentRounds = clampAgentRounds(s.maxAgentRounds);
@@ -8372,7 +8981,20 @@ api.onIndexProgress(paintIndexCard);
   state.persona = persona || '';
   state.globalMemory = globalMemory;
   const onboardingCompleted = await restoreOnboardingCompletion(s);
-  if (s.workspace && onboardingCompleted) {
+  let hotReloadSnapshot = null;
+  try {
+    hotReloadSnapshot = takeHotReloadSnapshot(window.sessionStorage);
+  } catch (error) {
+    showHotReloadStatus('热重载状态恢复失败：' + String(error.message || error), true);
+    reportHotReloadError('热重载状态恢复失败', { message: String(error.message || error) });
+    return;
+  }
+  if (hotReloadSnapshot) {
+    await restoreHotReloadSnapshot(hotReloadSnapshot);
+    syncAgentBtn();
+  } else if (onboardingCompleted && await restoreOpenTabs()) {
+    syncAgentBtn();
+  } else if (s.workspace && onboardingCompleted) {
     await Promise.all([refreshMeta(), showProjectSession(s.workspace)]);
     // 启动时就已经落在一个标签上，这里也上报一次，小窗一打开就能看到当前标签
     if (api.floatBind) api.floatBind(String(state.activeTab || ''), String(activeSession()?.title || ''));
@@ -8391,4 +9013,6 @@ api.onIndexProgress(paintIndexCard);
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) refreshQuotaBar(false, { auto: true });
   });
+  await hotReloadController.initialize(hotReloadSnapshot ? hotReloadSnapshot.revision : 0);
+  await receiveHotReload(await api.hotReloadStatus());
 })();

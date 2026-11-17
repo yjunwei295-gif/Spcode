@@ -151,6 +151,7 @@ const ROLES = [
   { id: 'summary', key: 'roleSummary' },
   { id: 'code', key: 'roleCode' },
   { id: 'planning', key: 'rolePlanning' },
+  { id: 'aesthetic', key: 'roleAesthetic' },
   { id: 'imageGen', key: 'roleImageGen' },
   { id: 'videoGen', key: 'roleVideoGen' },
   { id: 'model3d', key: 'roleModel3d' },
@@ -214,6 +215,7 @@ async function openVisionSettings() {
   visionState = {
     models: (s && s.models) || [],
     providers: (s && s.providers) || [],
+    videoProviderModels: s.videoProviderModels,
     currentModelId: (s && s.currentModelId) || '',
     assemblyKey: key,
     slots: Array.isArray(pack.slots) ? pack.slots.map((x) => ({ ...x })) : [],
@@ -243,6 +245,7 @@ async function saveAssembly() {
   }
 }
 
+/** 根据槽位角色生成模型选项；视频角色加入厂商派生模型，选中状态沿用已保存引用。 */
 function modelOptions(slot) {
   const local = visionState.localFiles.map((f) => {
     const tag = f.purposeLabel || f.meta?.purpose || '';
@@ -257,7 +260,10 @@ function modelOptions(slot) {
       const label = `${tag} zbaing · ${m.name || m.id} · ${m.params || ''}`;
       return `<option value="zbaing:${escapeHtmlVs(m.id)}" ${sel}>${escapeHtmlVs(label)}</option>`;
     }).join('');
-  const apis = visionState.models.filter((m) => m.type !== 'local').map((m) =>
+  // 视频槽直接展示已添加 MXAPI 厂商的候选项，选择只保存引用，不复制 API Key。
+  const choices = [...visionState.models];
+  if (slot.role === 'videoGen') choices.push(...visionState.videoProviderModels);
+  const apis = choices.filter((m) => m.type !== 'local').map((m) =>
     `<option value="api:${escapeHtmlVs(m.id)}" ${slot.apiId === m.id ? 'selected' : ''}>${t('api')} · ${escapeHtmlVs(m.name)} · ${escapeHtmlVs(m.model || '')}</option>`
   ).join('');
   return `<option value="">${t('unset')}</option>${zmods}${local}${apis}`;
@@ -434,7 +440,7 @@ function renderVisionModal() {
         slot.type = 'api';
         slot.apiId = v.slice(4);
         slot.moduleId = '';
-        const m = visionState.models.find((x) => x.id === slot.apiId);
+        const m = [...visionState.models, ...visionState.videoProviderModels].find(function selectedModel(item) { return item.id === slot.apiId; });
         slot.model = m?.model || '';
         slot.name = m?.name || '';
       } else if (v.startsWith('local:')) {

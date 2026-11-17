@@ -2,6 +2,7 @@ const { app, nativeTheme } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const wallet = require('./wallet');
+const mxapi = require('./mxapi');
 
 const LOCAL_SLOT = {
   id: 'local-gguf',
@@ -25,6 +26,8 @@ const DEFAULTS = {
   theme: 'system',
   locale: 'zh',
   autoSave: true,
+  // 内部采集仅用于源码开发版，发布版默认设置中不提供这两个字段。
+  ...(!app.isPackaged ? { trainingDataEnabled: false, trainingDataDir: 'D:\\Shuju' } : {}),
   currentModelId: 'local-gguf',
   visionAgentModel: '',
   visionAgentMmproj: '',
@@ -58,16 +61,22 @@ const PROVIDER_PRESETS = [
   { id: 'anthropic', name: 'Anthropic', protocol: 'anthropic', baseUrl: 'https://api.anthropic.com' },
   { id: 'gemini', name: 'Google Gemini', protocol: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta' },
   { id: 'bai', name: 'B.AI', protocol: 'openai', baseUrl: 'https://api.b.ai/v1' },
+  // SuperAPI 中转站：一个 Key 走 OpenAI 兼容的 /v1/chat/completions，模型目录在同一地址的 /models
+  { id: 'superapi', name: 'SuperAPI', protocol: 'openai', baseUrl: 'https://superapi.store/v1' },
   // MXAPI 聚合平台的 OpenAI 兼容入口：生图走 /v1/images/generations，模型名填 nano-banana / nano-banana-pro / gpt-image-2 等
   { id: 'mxapi', name: 'MXAPI 生图', protocol: 'openai', baseUrl: 'https://open.mxapi.org/v1' },
   // MXAPI 原生 Nano 异步端点：提交只收 prompt，先拿到 task_id，再轮询 /task 取图
   { id: 'mxapi-nano', name: 'MXAPI Nano 异步生图', protocol: 'openai', baseUrl: 'https://open.mxapi.org/api/v2/nano' },
+  // 原生视频由模型名分派到 video/generate 或 veo/generate，并查询各自任务接口。
+  { id: 'mxapi-video', name: 'MXAPI 原生视频（Seedance / Veo）', protocol: 'openai', baseUrl: 'https://open.mxapi.org/api/v2' },
   // Cursor 走 SDK，不需要真实地址；Key 可空，空时测试连接会打开浏览器登录 Cursor
   { id: 'cursor', name: 'Cursor', protocol: 'cursor', baseUrl: 'cursor://sdk' },
   // Codex SDK 复用本机 Codex CLI 登录；也可在 API Key 中填写 OpenAI API Key
   { id: 'codex', name: 'Codex', protocol: 'codex', baseUrl: 'codex://sdk' },
   // Claude Code SDK：Key 空时复用本机 Claude Code 登录；地址可改成兼容接口（如 DeepSeek 的 Anthropic 接口）绕开地区限制
-  { id: 'claudecode', name: 'Claude Code', protocol: 'claudecode', baseUrl: 'claudecode://sdk' }
+  { id: 'claudecode', name: 'Claude Code', protocol: 'claudecode', baseUrl: 'claudecode://sdk' },
+  // Grok CLI 走本机 grok agent stdio（ACP）；Key 可空，空时复用 grok login / XAI_API_KEY
+  { id: 'grok', name: 'Grok', protocol: 'grok', baseUrl: 'grok://cli' }
 ];
 
 function filePath() {
@@ -102,15 +111,7 @@ function newId(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 8)}`;
 }
 
-function normalizeProtocol(raw) {
-  const p = String(raw || 'openai').toLowerCase().trim();
-  if (p === 'claude' || p === 'anthropic') return 'anthropic';
-  if (p === 'google' || p === 'gemini') return 'gemini';
-  if (p === 'cursor') return 'cursor';
-  if (p === 'codex') return 'codex';
-  if (p === 'claudecode') return 'claudecode';
-  return 'openai';
-}
+const { normalizeProtocol } = require('./provider-protocol');
 
 function isOllamaEntry(m) {
   if (!m) return false;
@@ -126,7 +127,7 @@ function normalizeProvider(raw) {
   const out = {
     id: String(raw.id || newId('prov')),
     name: String(raw.name || 'API').trim() || 'API',
-    protocol: normalizeProtocol(raw.protocol),
+    protocol: normalizeProtocol(raw.protocol, raw.baseUrl),
     baseUrl,
     apiKey: String(raw.apiKey || ''),
     timeout: Math.max(5, Number(raw.timeout) || 120),
@@ -274,7 +275,7 @@ function migrateProvidersAndModels(data) {
     }
 
     if (m.baseUrl) {
-      const protocol = normalizeProtocol(m.protocol);
+      const protocol = normalizeProtocol(m.protocol, m.baseUrl);
       const key = `${protocol}|${String(m.baseUrl).replace(/\/$/, '')}|${m.apiKey || ''}`;
       let prov = providers.find((p) =>
         `${p.protocol}|${String(p.baseUrl).replace(/\/$/, '')}|${p.apiKey || ''}` === key
@@ -324,9 +325,13 @@ function resolveModelCfg(modelOrId, settings) {
   const s = settings || load();
   const models = s.models || [];
   const providers = s.providers || [];
-  const m = typeof modelOrId === 'string'
+  let m = typeof modelOrId === 'string'
     ? models.find((x) => x.id === modelOrId)
     : modelOrId;
+  // 视频槽可以直接引用已添加的 MXAPI 厂商；每次调用都重新取当前厂商的密钥。
+  if (typeof modelOrId === 'string' && modelOrId.startsWith(mxapi.MODEL_ID_PREFIX)) {
+    m = mxapi.resolveModel(modelOrId, providers);
+  }
   if (!m) return null;
   if (m.type === 'zbaingAi' || m.id === 'zbaingAi') {
     return {
@@ -375,7 +380,9 @@ function resolveModelCfg(modelOrId, settings) {
       model: m.model,
       baseUrl: m.baseUrl,
       apiKey: m.apiKey || '',
-      protocol: normalizeProtocol(m.protocol),
+      protocol: normalizeProtocol(m.protocol, m.baseUrl),
+      // 推理强度属于模型，不能从厂商公共配置读取。
+      reasoningEffort: m.reasoningEffort,
       vision: !!m.vision
     };
   }
@@ -400,7 +407,9 @@ function resolveModelCfg(modelOrId, settings) {
     model: m.model,
     baseUrl: p.baseUrl,
     apiKey: p.apiKey || '',
-    protocol: normalizeProtocol(p.protocol),
+    protocol: normalizeProtocol(p.protocol, p.baseUrl),
+    // 辅助模型与大脑都通过此入口取得用户为该模型保存的档位。
+    reasoningEffort: m.reasoningEffort,
     vision: !!m.vision,
     providerId: p.id,
     providerName: p.name,
@@ -527,6 +536,7 @@ function load() {
     const out = require('./assembly').migrateAssemblies(merged);
     if (JSON.stringify(out.assemblies || {}) !== before
       || !Array.isArray(data.providers)
+      || data.providers.some(p => p && normalizeProtocol(p.protocol, p.baseUrl) !== p.protocol)
       || (data.models || []).some((m) => m && m.baseUrl && m.type !== 'local')) {
       try { save(out); } catch { /* 迁移写入失败不影响本次运行 */ }
     }
@@ -619,6 +629,9 @@ function save(data) {
   // 别的实例刚写入、本实例内存里没有的设置项抹掉。
   const disk = readDiskSettings();
   const out = (disk && typeof disk === 'object') ? mergeDiskWithMemory(disk, data) : data;
+  // 即使旧窗口再次提交错误协议，也在持久化边界修复直通占位地址。
+  if (Array.isArray(out.providers)) out.providers = out.providers.map(p =>
+    p && typeof p === 'object' ? { ...p, protocol: normalizeProtocol(p.protocol, p.baseUrl) } : p);
   const text = JSON.stringify(out, null, 2);
   // 原子写：临时文件名带进程号，避免多实例踩到同一个临时文件；
   // 先写临时文件再改名，别的实例读到的永远是完整文件，不会是写了一半的 JSON。
@@ -633,8 +646,9 @@ function save(data) {
   }
 }
 
+/** 解析保存的主题；独立主题原样返回，仅跟随系统时按系统明暗解析。 */
 function resolveTheme(theme) {
-  if (theme === 'light' || theme === 'dark') return theme;
+  if (theme === 'light' || theme === 'dark' || theme === 'cel') return theme;
   return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
 }
 

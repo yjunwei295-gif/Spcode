@@ -36,26 +36,92 @@ function configuredProxy() {
   }
 }
 
-// Cursor SDK 在主进程里用 Node 自己的网络模块直连，不认 Electron 的代理设置；直连出口在受限地区时
-// Cursor 会按地区拒绝 Claude 等模型。填了代理就让主进程默认 HTTPS 连接走代理，并让 SDK 改用 HTTP/1.1
-// （Node 的代理只支持 HTTP/1.1）。只在首次加载 SDK 时读一次，改代理后需重启
-function routeSdkThroughProxy(mod) {
+// 设置里写了代理，但代理软件没开时，连上去会 ECONNREFUSED。先探一下端口，没在听就保持直连。
+// 探测放在子线程里：主线程一旦 Atomics.wait，自己的 socket 回调就跑不了
+function proxyListening(proxy) {
+  let url;
+  try { url = new URL(proxy); } catch { return false; }
+  const port = Number(url.port);
+  if (!port) return false;
+  const sab = new SharedArrayBuffer(4);
+  const flag = new Int32Array(sab);
+  const { Worker } = require('worker_threads');
+  const worker = new Worker(
+    `const { workerData } = require('worker_threads');
+     const net = require('net');
+     const flag = new Int32Array(workerData.sab);
+     const socket = net.connect({ host: workerData.host, port: workerData.port });
+     const done = (ok) => {
+       if (Atomics.compareExchange(flag, 0, 0, ok ? 1 : 2) === 0) Atomics.notify(flag, 0);
+       socket.destroy();
+     };
+     socket.once('connect', () => done(true));
+     socket.once('error', () => done(false));
+     socket.setTimeout(400, () => done(false));`,
+    { eval: true, workerData: { host: url.hostname, port, sab } }
+  );
+  try { Atomics.wait(flag, 0, 0, 500); } catch { /* 主线程不能等待时当作代理没开 */ }
+  worker.terminate();
+  return Atomics.load(flag, 0) === 1;
+}
+
+// 启动时代理没开会一直直连，直连 api2.cursor.sh 在这里会超时，SDK 只报 [unavailable]。
+// 每轮重新看端口：开了就切到代理。Node 的 fetch 不认 https.globalAgent，要同时写环境变量。
+let cursorRoute = '';
+let savedProxyEnv = null;
+function refreshCursorRoute(mod) {
   const proxy = configuredProxy();
-  if (!proxy) return;
-  const env = { HTTPS_PROXY: proxy, HTTP_PROXY: proxy, NO_PROXY: 'localhost,127.0.0.1,::1' };
+  const up = !!(proxy && proxyListening(proxy));
+  const next = up ? proxy : '';
+  if (next === cursorRoute) return next ? 'proxy' : 'direct';
+  const sdkMod = mod || sdk();
+  if (savedProxyEnv == null) {
+    savedProxyEnv = {
+      HTTPS_PROXY: process.env.HTTPS_PROXY,
+      HTTP_PROXY: process.env.HTTP_PROXY,
+      NODE_USE_ENV_PROXY: process.env.NODE_USE_ENV_PROXY
+    };
+  }
   const https = require('https');
   const http = require('http');
-  https.globalAgent = new https.Agent({ keepAlive: true, proxyEnv: env });
-  http.globalAgent = new http.Agent({ keepAlive: true, proxyEnv: env });
-  mod.Cursor.configure({ local: { useHttp1ForAgent: true } });
-  require('./diag').log('cursor', 'Cursor SDK 已改走网络代理', { proxy });
+  if (up) {
+    process.env.HTTPS_PROXY = proxy;
+    process.env.HTTP_PROXY = proxy;
+    process.env.NODE_USE_ENV_PROXY = '1';
+    const env = { HTTPS_PROXY: proxy, HTTP_PROXY: proxy, NO_PROXY: 'localhost,127.0.0.1,::1' };
+    https.globalAgent = new https.Agent({ keepAlive: true, proxyEnv: env });
+    http.globalAgent = new http.Agent({ keepAlive: true, proxyEnv: env });
+    try { sdkMod.Cursor.configure({ local: { useHttp1ForAgent: true } }); } catch { /* 旧 SDK 没有这个开关 */ }
+    // 换 Key 用的是全局 fetch。只改环境变量时，已经初始化过的 fetch 仍会直连。
+    try {
+      const undici = require('undici');
+      undici.setGlobalDispatcher(new undici.ProxyAgent(proxy));
+    } catch (e) {
+      require('./diag').log('cursor', 'fetch 代理设置失败', { message: e && e.message });
+    }
+    require('./diag').log('cursor', 'Cursor 直通改走网络代理', { proxy });
+  } else {
+    for (const key of Object.keys(savedProxyEnv)) {
+      if (savedProxyEnv[key] == null) delete process.env[key];
+      else process.env[key] = savedProxyEnv[key];
+    }
+    https.globalAgent = new https.Agent({ keepAlive: true });
+    http.globalAgent = new http.Agent({ keepAlive: true });
+    try {
+      const undici = require('undici');
+      undici.setGlobalDispatcher(new undici.Agent());
+    } catch { /* 没有 undici 时沿用默认 fetch */ }
+    require('./diag').log('cursor', '网络代理没开，Cursor 改为直连', { proxy: proxy || '' });
+  }
+  cursorRoute = next;
+  return next ? 'proxy' : 'direct';
 }
 
 let sdkMod = null;
 function sdk() {
   if (!sdkMod) {
     const mod = require('@cursor/sdk');
-    try { routeSdkThroughProxy(mod); } catch (e) { require('./diag').log('cursor', 'Cursor SDK 设置代理失败', { message: e && e.message }); }
+    try { refreshCursorRoute(mod); } catch (e) { require('./diag').log('cursor', 'Cursor SDK 设置代理失败', { message: e && e.message }); }
     sdkMod = mod;
   }
   return sdkMod;
@@ -231,6 +297,7 @@ function localOptions(cwd, extra) {
 
 // 没填 Key 时用 SDK 浏览器登录，凭据由 SDK 存在 ~/.cursor/sdk/auth.json
 async function ensureLogin(modelCfg) {
+  refreshCursorRoute();
   if (apiKeyOf(modelCfg)) return;
   if (reloginPromise) await reloginPromise;
   const { Cursor } = sdk();
@@ -259,47 +326,56 @@ async function listModels(modelCfg) {
   for (const m of rows || []) {
     if (!m?.id || catalog[m.id]) continue;
     models.push(m.id);
-    catalog[m.id] = { id: m.id, name: m.displayName || m.id, priceText: m.displayName || '', input: null, output: null };
+    catalog[m.id] = { id: m.id, name: m.displayName || m.id, priceText: m.displayName || '', input: null, output: null,
+      reasoningOptions: reasoningOptionsOf(m) };
   }
   return { ok: true, protocol: CURSOR_PROTOCOL, models, catalog, balance: await fetchUsageBalance() };
 }
 
-/** 只使用厂商目录声明的高档推理参数；不猜测参数名，也不更换用户所选模型。 */
+/** 提取 Cursor 目录声明的推理选项，保留原始参数名和值，供普通请求和直通共用。 */
+function reasoningOptionsOf(row) {
+  const options = [];
+  for (const param of row?.parameters || []) {
+    if (!/reason|think|effort|推理|思考/i.test(`${param.id} ${param.displayName || ''}`)) continue;
+    for (const choice of param.values || []) {
+      options.push({ value: String(choice.value), label: choice.displayName || String(choice.value),
+        params: [{ id: param.id, value: choice.value }] });
+    }
+  }
+  for (const variant of row?.variants || []) {
+    const params = [];
+    for (const param of variant.params || []) {
+      if (/reason|think|effort|推理|思考/i.test(param.id)) params.push(param);
+    }
+    if (!params.length) continue;
+    const value = String(params[0].value);
+    if (options.some(function sameOption(option) { return option.value === value; })) continue;
+    options.push({ value, label: variant.displayName || value, params });
+  }
+  return options;
+}
+
+/**
+ * 按用户保存的推理强度构造 Cursor 模型参数；空值表示厂商默认。
+ * 从目录取原始参数名和值，档位失效直接报错，不替用户换档或换模型。
+ */
 async function highModelSelection(modelCfg) {
+  const id = String(modelCfg?.model || 'default');
+  if (!modelCfg.reasoningEffort) return { id };
   const key = apiKeyOf(modelCfg) || '';
   let cached = modelParameterCache.get(key);
   if (!cached || Date.now() - cached.at > MODEL_PARAMETER_CACHE_MS) {
     if (!modelParameterPending.has(key)) {
-      const pending = listModels(modelCfg).finally(() => modelParameterPending.delete(key));
+      const pending = listModels(modelCfg).finally(function clearPending() { modelParameterPending.delete(key); });
       modelParameterPending.set(key, pending);
     }
     await modelParameterPending.get(key);
     cached = modelParameterCache.get(key);
   }
-  const id = String(modelCfg?.model || 'default');
-  const row = cached.rows.find((m) => m.id === id || m.aliases?.includes(id));
-  const params = [];
-  for (const param of row?.parameters || []) {
-    if (!/reason|think|effort|推理|思考/i.test(`${param.id} ${param.displayName || ''}`)) continue;
-    const high = param.values?.find((v) => /^(high|高|高档|高强度)$/i.test(String(v.value)))
-      || param.values?.find((v) => /^(high|高|高档|高强度)$/i.test(String(v.displayName || '')));
-    // 仅有思考开关的模型，使用厂商声明的开启值。
-    const enabled = !high && /think|思考/i.test(`${param.id} ${param.displayName || ''}`)
-      ? param.values?.find((v) => /^(enabled|on|true)$/i.test(String(v.value))) : null;
-    const choice = high || enabled;
-    if (choice) params.push({ id: param.id, value: choice.value });
-  }
-  // 有的模型只在 variants 中声明参数，仍按目录的原始 id/value 发送。
-  for (const variant of row?.variants || []) {
-    for (const param of variant.params || []) {
-      if (/reason|think|effort|推理|思考/i.test(param.id)
-        && String(param.value).toLowerCase() === 'high'
-        && !params.some((chosen) => chosen.id === param.id)) {
-        params.push({ id: param.id, value: param.value });
-      }
-    }
-  }
-  return { id, ...(params.length ? { params } : {}) };
+  const row = cached.rows.find(function sameModel(model) { return model.id === id || model.aliases?.includes(id); });
+  const choice = reasoningOptionsOf(row).find(function selected(option) { return option.value === modelCfg.reasoningEffort; });
+  if (!choice) throw new Error('该模型目录不支持已选推理强度：' + modelCfg.reasoningEffort);
+  return { id, params: choice.params };
 }
 
 function partsText(content) {
@@ -501,6 +577,7 @@ function warmUp(modelCfg) {
     const t0 = Date.now();
     clearAgentStore();
     clearStaleStores();
+    refreshCursorRoute();
     if (!apiKeyOf(modelCfg)) {
       const st = await sdk().Cursor.auth.status();
       if (st.status !== 'logged-in') return { skipped: 'not-logged-in' };
@@ -526,5 +603,5 @@ function warmUp(modelCfg) {
 module.exports = {
   CURSOR_PROTOCOL, CURSOR_BASE_URL, complete, listModels, ensureLogin, flatten, warmUp,
   sdk, apiKeyOf, localOptions, sandboxDir, releaseAgent, highModelSelection,
-  regionError, runError, fetchUsageBalance, isPlanRequired, poolAccountError, beginRelogin
+  regionError, runError, fetchUsageBalance, isPlanRequired, poolAccountError, beginRelogin, refreshCursorRoute
 };

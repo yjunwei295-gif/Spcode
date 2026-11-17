@@ -4,7 +4,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) · [Download Windows installer](https://github.com/yjunwei295-gif/Spcode/releases/latest) · [Detailed English user guide](docs/user-guide.en.md) · [中文逐步操作手册](docs/user-guide.zh-CN.md)
 
-Current release: **1.0.4 · Windows 10/11 x64**. The installer includes the application runtime. You do not need Node.js to use the installer. AI accounts, API credits and local model weights are configured separately.
+Current release: **1.0.5 · Windows 10/11 x64**. The installer includes the application runtime. You do not need Node.js to use the installer. AI accounts, API credits and local model weights are configured separately.
 
 ## What is this application for?
 
@@ -48,6 +48,14 @@ For example, after opening a game project, you can ask: “Find why the camera j
 | Desktop pet | Task activity, expandable chat, skins, scale and glasses X/Y adjustment | Use the Pet button; choose appearance settings |
 | Personal workflow | Skills, rules, persona, chat history, snapshots and milestones | Configure these in the app; review the defaults |
 
+## New in 1.0.5
+
+- **Session restoration:** preserve open tabs, their order, the active tab and drafts across a full exit and restart, with separate layouts for each window.
+- **Task continuity:** keep pending work and mid-task corrections in the original conversation; serialize Codex requests for the same session until the previous stream exits.
+- **Verified hot updates:** reload compatible methods and interface resources at idle boundaries while preserving conversation state. Initialization, function-signature and closure-layout changes require a full restart; a rejected update is never reported as applied.
+
+See the [1.0.5 verification record](docs/release-1.0.5-verification.md) and [hot-update scope](docs/hot-reload.md). Fully exit all old instances before starting the new version.
+
 ## New in 1.0.4
 
 - **Long-running tasks:** save a goal and permitted scope, set a check interval and per-turn timeout, start/stop recurring work, inspect memory, and resume from saved progress. Goal and context views reuse the existing maps.
@@ -78,17 +86,17 @@ Read the [complete English guide](docs/user-guide.en.md) for each feature's actu
 
 1. Open [Releases](https://github.com/yjunwei295-gif/Spcode/releases/latest).
 2. Expand **Assets** if necessary.
-3. Download **`SimpleCode-Setup-1.0.4.exe`** for the installer. GitHub's “Source code” archives are not installers.
+3. Download **`SimpleCode-Setup-1.0.5.exe`** for the installer. GitHub's “Source code” archives are not installers.
 4. Fully exit an older running instance before installing an update.
 5. Run the installer and select the destination when asked. For an update, use the existing installation directory.
 6. Start **SimpleCode** from the shortcut.
 7. Click **EN** at the upper right for English. Some newer panels still contain Chinese labels; the English guide gives the original labels alongside their meanings.
 8. Configure a model before sending your first project request.
 
-The installer is approximately 662 MiB. Model weights are not included. The 1.0.4 installer SHA256 is:
+The installer is approximately 670 MiB. Model weights are not included. A portable executable is also available in the release assets. The 1.0.5 installer SHA256 is:
 
 ```text
-bd503a1b18488fd7b735a5802ab8b7d7d039c5884d0b96a9293de28e443faf3f
+b119dfea6beb84fe33c8477badd9912ea8cbc3e32a22bd66a638bd80cfc7d1b0
 ```
 
 For every individual click, field and expected result, follow [Installation and first run](docs/user-guide.en.md#s2).

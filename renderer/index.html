@@ -7,6 +7,7 @@
   <link rel="icon" href="../icons.png" type="image/png" />
   <link rel="stylesheet" href="./styles.css" />
   <link rel="stylesheet" href="./artifact.css" />
+  <link rel="stylesheet" href="./image-canvas.css" />
 </head>
 <body>
   <div class="bg-pcb" id="bg-pcb" aria-hidden="true"></div>
@@ -40,6 +41,8 @@
           <div class="menu-drop" id="menu-view">
             <button data-act="theme-light"><span data-i18n="themeLight">浅色</span></button>
             <button data-act="theme-dark"><span data-i18n="themeDark">深色</span></button>
+            <!-- 独立新增主题，与浅色、深色和跟随系统并列。 -->
+            <button data-act="theme-cel"><span data-i18n="themeCel">锐线赛璐璐</span></button>
             <button data-act="theme-system"><span data-i18n="themeSystem">跟随系统</span></button>
           </div>
         </div>
@@ -106,6 +109,7 @@
           <button id="btn-new-tab" data-i18n-title="newChat" title="新建对话">+</button>
           <button id="btn-history" data-i18n-title="history" title="历史">⏱</button>
           <button id="btn-artifacts" data-i18n="artifacts" title="代码作品">作品</button>
+          <button type="button" id="btn-image-canvas" aria-controls="image-canvas" aria-expanded="false">画布</button>
           <button id="btn-more" data-i18n-title="more" title="更多">⋯</button>
           <button id="btn-sidebar" data-i18n-title="sidebar" title="侧栏">☰</button>
         </div>
@@ -163,6 +167,11 @@
         <div class="chat-main">
           <div class="chat-stage">
           <div class="messages" id="messages"></div>
+          <!-- 绘图任务按当前会话隔离；生成中显示实际采样进度，完成后展示图片。 -->
+          <aside id="image-canvas" class="image-canvas hidden" aria-label="绘图画布">
+            <header class="image-canvas-head"><strong>绘图画布</strong><button type="button" id="image-canvas-close" aria-label="关闭画布">×</button></header>
+            <div id="image-canvas-tasks" class="image-canvas-tasks"></div>
+          </aside>
           <aside id="download-panel" class="download-drawer hidden" aria-label="download list">
             <button type="button" id="download-drawer-tab" class="download-drawer-tab" data-i18n-title="downloadList" title="下载列表">
               <span class="download-tab-label" data-i18n="downloadTab">下载</span>
@@ -272,6 +281,7 @@
   </div>
 
   <div class="ctx-menu hidden" id="ctx-menu">
+    <button type="button" data-ctx="resource" data-i18n="showInResources">在资源列表显示</button>
     <button type="button" data-ctx="reveal" data-i18n="showInFolder">在文件夹中显示</button>
   </div>
 

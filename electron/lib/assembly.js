@@ -6,8 +6,9 @@ const modelMeta = require('./model-meta');
 const ROLES = [
   { id: 'vision', name: '看图', hint: '主模型看不到图时，先用这个模型识别画面' },
   { id: 'summary', name: '总结', hint: '长文先压缩。实现改完文件后，用它核对代码和需求是否一致、功能是否已经落地' },
-  { id: 'code', name: '代码', hint: '写代码、改 bug 时先出一版草案再交给主模型' },
+  { id: 'code', name: '代码', hint: '配置平等模型池，由大脑按任务明确选择，可分别调用多个模型配合' },
   { id: 'planning', name: '规划', hint: '大脑先理解需求，再把理解交给这里拆步骤' },
+  { id: 'aesthetic', name: '审美', hint: '可查询参考图、查看真实画面进行对比，只在前端、视频、美术成果上挑刺。多个模型一起投票，通过数必须超过 90% 才算通过。不改文件。' },
   { id: 'imageGen', name: '生图', hint: '画图、出插画时用挂上的本地 GGUF 或接口模型直接出图' },
   { id: 'videoGen', name: '生视频', hint: '做短片时用挂上的接口直接出视频' },
   { id: 'model3d', name: '生3D', hint: '做三维模型时用挂上的接口直接出 3D 文件' },
@@ -64,7 +65,23 @@ function normalizeCapabilityDefaults(raw) {
     const fallbacks = Array.isArray(pack.fallbacks)
       ? pack.fallbacks.map(normalizeCapRef).filter(Boolean)
       : [];
-    out[role] = { primary, fallbacks };
+    if (role === 'code' || role === 'aesthetic') {
+      // 代码池和审美池都是平等候选。旧的主/备用记录只迁入池，顺序不再表示优先级。
+      const refs = Array.isArray(pack.models) ? pack.models : [primary, ...fallbacks];
+      const models = [];
+      const seen = new Set();
+      for (const rawRef of refs) {
+        const ref = normalizeCapRef(rawRef);
+        if (!ref) continue;
+        const key = ref.apiId || ref.modelPath || ref.model;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        models.push(ref);
+      }
+      out[role] = { models };
+    } else {
+      out[role] = { primary, fallbacks };
+    }
   }
   return out;
 }
@@ -104,11 +121,28 @@ function localImageGenSlots(s) {
 }
 
 /**
- * 解析某能力要用的槽位候选：组合 → 本地自动发现（生图）→ 全局 primary → fallbacks → 旧视觉字段
+ * 解析能力候选：代码汇集平等模型池；其余能力沿用组合、全局及既有备用顺序。
  * @returns {{ slot: object, source: string }[]}
  */
 function roleCandidates(s, role) {
   const out = [];
+  if (role === 'code' || role === 'aesthetic') {
+    // 代码池由大脑点名调用；审美池则全部参加投票，都不按顺序选主模型。
+    const configured = normalizeCapabilityDefaults(s.capabilityDefaults || {})[role].models;
+    const slots = [];
+    for (const slot of slotsOf(s)) {
+      if (slot.role === role && slotFilled(slot)) slots.push(slot);
+    }
+    for (const ref of configured) slots.push(refToSlot(ref, role));
+    const seen = new Set();
+    for (const slot of slots) {
+      const key = slot.apiId || slot.modelPath || slot.model || slot.id;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ slot, source: 'pool' });
+    }
+    return out;
+  }
   const combo = slotByRole(s, role);
   if (combo) out.push({ slot: combo, source: 'assembly' });
 
@@ -151,9 +185,11 @@ function roleCandidates(s, role) {
   return out;
 }
 
-/** 取第一个可用候选 */
+/** 普通能力按既有配置解析；代码池有多个候选时必须由大脑指定，不能默认取首项。 */
 function resolveRole(s, role) {
-  return roleCandidates(s, role)[0] || null;
+  const candidates = roleCandidates(s, role);
+  if ((role === 'code' || role === 'aesthetic') && candidates.length !== 1) return null;
+  return candidates[0] || null;
 }
 
 function isLocalGenSlot(slot) {
@@ -294,6 +330,8 @@ function slotToModelCfg(slot, s) {
     };
   }
   if (slot.apiId) {
+    // 派生的视频模型 ID 由厂商配置实时解析，不复制密钥到组合槽位。
+    if (slot.apiId.startsWith(require('./mxapi').MODEL_ID_PREFIX)) return store.resolveModelCfg(slot.apiId, s);
     const m = (s.models || []).find((x) => x.id === slot.apiId);
     if (m) return require('./store').resolveModelCfg(m, s);
   }
@@ -355,6 +393,9 @@ function helperPrompt(role, lang) {
   }
   if (role === 'planning') {
     return `You are the planning module. You do not receive the user directly. Plan only from the brain's brief: steps, order, and risks. Do not call tools. ${langLine}`;
+  }
+  if (role === 'aesthetic') {
+    return `You are one aesthetic reviewer. Critique only the finished frontend, video, or art. Do not edit files or propose a patch. Vote with 【审美投票】通过 or 【审美投票】不通过. ${langLine}`;
   }
   if (role === 'docGen') {
     return `You write a complete markdown document from the user's request. Output markdown only, no chatter. Start with a title. Do not call tools. ${langLine}`;

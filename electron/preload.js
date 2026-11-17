@@ -1,8 +1,14 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-/** 桌宠复用现有窗口；主进程按发送者身份路由到本实例。 */
+/** 角色与独立对话页共用桌宠接口；主进程按发送者身份路由到同一实例。 */
 contextBridge.exposeInMainWorld('desktopPet', {
   call: function call(method, payload) { return ipcRenderer.invoke('desktop-pet:invoke', { method: 'desktop-pet:' + method, payload }); },
+  /** 独立置顶输入窗展开或再次聚焦时，把焦点交给现有文本框。 */
+  onFocus: function onFocus(cb) {
+    function receive() { cb(); }
+    ipcRenderer.on('desktop-pet:focus', receive);
+    return function unsubscribe() { ipcRenderer.removeListener('desktop-pet:focus', receive); };
+  },
   onView: function onView(cb) {
     function receive(_event, data) { cb(data); }
     ipcRenderer.on('desktop-pet:view', receive);
@@ -12,6 +18,16 @@ contextBridge.exposeInMainWorld('desktopPet', {
 
 const api = {
   getState: () => ipcRenderer.invoke('app:state'),
+  /** 订阅本窗口的源码或资源更新；页面卸载时由返回函数移除监听。 */
+  onHotReload: function onHotReload(callback) {
+    function receive(_event, update) { callback(update); }
+    ipcRenderer.on('app:hot-reload', receive);
+    return function unsubscribe() { ipcRenderer.removeListener('app:hot-reload', receive); };
+  },
+  /** 界面已保存临时状态后，请主进程核对指定版本和运行任务，再安排页面重载。 */
+  hotReloadReady: function hotReloadReady(revision) { return ipcRenderer.invoke('app:hotReloadReady', revision); },
+  /** 初始化后读取加载期间错过的更新通知，不触发扫描或重载。 */
+  hotReloadStatus: function hotReloadStatus() { return ipcRenderer.invoke('app:hotReloadStatus'); },
   /** 长时存活的配置、执行确认和结束回执，全部按发送者窗口路由。 */
   longAliveBind: function longAliveBind(payload) { return ipcRenderer.invoke('long-alive:bind', payload); },
   longAliveStart: function longAliveStart(payload) { return ipcRenderer.invoke('long-alive:start', payload); },
@@ -63,6 +79,18 @@ const api = {
   setCursorDirect: (on) => ipcRenderer.invoke('app:cursorDirect', !!on),
   planWrite: (payload) => ipcRenderer.invoke('plan:write', payload),
   planTree: (payload) => ipcRenderer.invoke('plan:tree', payload),
+  /**
+   * 识别指定会话的参考文件并持久化分层导图。
+   * @param {{tabId:string,files:Array<{path:string,name:string}>}} payload 会话 ID 和真实落盘文件；path 为文件路径，name 为来源名称。
+   * @returns {Promise<object>} 已保存的完整层级导图；解析、视觉识别或落盘失败时 Promise 拒绝，错误原样交给调用方显示。
+   */
+  referenceImport: function referenceImport(payload) { return ipcRenderer.invoke('reference:import', payload); },
+  /**
+   * 读取指定会话已经持久化的参考导图，不重新识别原文件。
+   * @param {{tabId:string}} payload 需要读取的会话 ID。
+   * @returns {Promise<object>} 该会话的层级导图；没有参考时返回空树，读取或存档解析失败时 Promise 拒绝。
+   */
+  referenceTree: function referenceTree(payload) { return ipcRenderer.invoke('reference:tree', payload); },
   // 链路导图：把 { tabId, turnId } 之类参数原样转给主进程 chain:tree，
   // 由主进程解析本轮回答里的【链路】段并回传节点/边；preload 只做透传，不做任何解析或兜底
   chainTree: (p) => ipcRenderer.invoke('chain:tree', p),
@@ -76,7 +104,12 @@ const api = {
   planClear: (payload) => ipcRenderer.invoke('plan:clear', payload),
   dialogIndex: (payload) => ipcRenderer.invoke('dialog:index', payload),
   newWindow: () => ipcRenderer.invoke('window:new'),
-  focusWindow: () => ipcRenderer.invoke('window:focus'),
+  /**
+   * 请求所属主窗口获得键盘焦点。
+   * @param {boolean} [restoreAfterDialog] 原生提示框关闭后传 true，普通聚焦不传；由主进程处理原生激活状态。
+   * @returns {Promise<boolean>} 窗口原本已在前台时为 true，刚请求激活或窗口失效时为 false；IPC 失败保持拒绝。
+   */
+  focusWindow: function focusWindow(restoreAfterDialog) { return ipcRenderer.invoke('window:focus', restoreAfterDialog); },
   minimize: () => ipcRenderer.invoke('window:minimize'),
   maximize: () => ipcRenderer.invoke('window:maximize'),
   close: () => ipcRenderer.invoke('window:close'),
@@ -96,6 +129,8 @@ const api = {
 
   saveModels: (models, currentModelId, providers) => ipcRenderer.invoke('models:save', { models, currentModelId, providers }),
   listProviderPresets: () => ipcRenderer.invoke('providers:presets'),
+  /** 查询指定已保存模型的厂商推理档位，不触发聊天。 */
+  modelReasoningOptions: function modelReasoningOptions(id) { return ipcRenderer.invoke('models:reasoningOptions', id); },
   saveVisionAgent: (payload) => ipcRenderer.invoke('models:saveVision', payload),
   saveAssembly: (payload) => ipcRenderer.invoke('models:saveAssembly', payload),
   saveCapabilityDefaults: (payload) => ipcRenderer.invoke('models:saveCapabilityDefaults', payload),
@@ -135,7 +170,12 @@ const api = {
   listSnapshots: () => ipcRenderer.invoke('snapshot:list'),
   getSnapshotMax: () => ipcRenderer.invoke('snapshot:getMax'),
   setSnapshotMax: (max) => ipcRenderer.invoke('snapshot:setMax', max),
-  restoreSnapshot: (id) => ipcRenderer.invoke('snapshot:restore', id),
+  /**
+   * 转交用户已确认的项目快照操作，始终保留快照所属工作区。
+   * @param {{id: string, workspace: string}} payload 已确认的快照编号与项目路径。
+   * @returns {Promise<object>} 主进程的实际处理结果；不改用当前窗口的其他项目。
+   */
+  restoreSnapshot: function restoreSnapshot(payload) { return ipcRenderer.invoke('snapshot:restore', payload); },
   undoSnapshot: (id) => ipcRenderer.invoke('snapshot:undo', id),
   redoSnapshot: (id) => ipcRenderer.invoke('snapshot:redo', id),
   listHunks: (payload) => ipcRenderer.invoke('snapshot:hunks', payload),
@@ -182,6 +222,8 @@ const api = {
   // 把当前标签页注册到悬浮窗：tabId 用于回传，title 用于小窗标题
   // 主窗上报当前标签；active=true 表示主窗真的开工（发了消息），此时小窗才把绑定切过来
   floatBind: (tabId, title, active) => ipcRenderer.send('floatbar:bind-from-window', { tabId, title, active: active === true }),
+  /** 关闭标签只释放内存中的桌宠会话登记，持久化历史仍由原会话接口管理。 */
+  floatForget: function floatForget(tabId) { ipcRenderer.send('floatbar:forget-session', tabId); },
   // 上报当前标签页是否可被浮窗接管（key 留空，主进程按 senderWindow 补全真实 key）
   // options 是这段复述里拆出来的开工方案：[{ value: 'a', label: 'A 开始' }]，没方案就是空数组。
   // 判定只有 renderer/app.js 一份，这里只做透传，不在 preload 里再判一次。

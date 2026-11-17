@@ -194,15 +194,17 @@ function fullPageSetup() {
     completeOnboarding: async function completeOnboarding() { return true; },
     getState: async function getState() { return { locale: 'zh', theme: 'dark', resolvedTheme: 'dark', autoSave: true,
       workspace: 'fixture', models: [{ id: 'fixture', name: '测试模型', type: 'api', model: 'fixture' }],
-      currentModelId: 'fixture', providers: [], recents: [], localFiles: [], assemblies: {}, capabilityDefaults: {} }; },
+      currentModelId: 'fixture', providers: [], videoProviderModels: [], recents: [], localFiles: [], assemblies: {}, capabilityDefaults: {} }; },
     listSkills: emptyList, listRules: emptyList, listSnapshots: emptyList, listMilestones: emptyList,
     loadPersona: nullValue, getGlobalMemory: nullValue, getSnapshotMax: async function getSnapshotMax() { return 20; },
-    listChildren: emptyList, loadSessions: emptyList, saveModels: async function saveModels() { return {}; },
+    listChildren: emptyList, loadSessions: emptyList,
+    // 模型保存回包同步包含厂商派生的视频候选，夹具遵循真实 IPC 契约。
+    saveModels: async function saveModels() { return { videoProviderModels: [] }; },
     onChatEvent: function onChatEvent(callback) { window.emitTestChat = callback; },
     onWorkspaceChanged: noOp, onUiRefresh: noOp, onDownloadProgress: noOp, onIndexProgress: noOp,
     // 余额同步是新增的主窗桥接口，完整页面夹具同步提供入口。
     reportAccountQuota: noOp,
-    floatBind: noOp, floatCanStart: noOp, logSummaryTrace: noOp,
+    floatBind: noOp, floatForget: noOp, floatCanStart: noOp, logSummaryTrace: noOp,
     reportError: function reportError(stage, details) {
       if (stage === '界面脚本报错' || stage === '界面未处理的 Promise 拒绝') record.errors.push({ stage, details });
     },

@@ -8,6 +8,7 @@
   },
   "files": [
     "electron/**/*",
+    "!electron/lib/training-archive.js",
     "renderer/**/*",
     "package.json",
     "icons.png",

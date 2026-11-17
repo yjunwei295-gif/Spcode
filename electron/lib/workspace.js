@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { StringDecoder } = require('string_decoder');
+const { pathToFileURL } = require('node:url');
 
 const SKIP = new Set([
   'node_modules', '.git', 'dist', 'out', '.sinpo-snapshots', '.simple', '.sinpo',
@@ -89,21 +90,27 @@ function extraRoots(appRoot, workspace, extraFolders) {
   return resolved;
 }
 
+/**
+ * 解析工具目标路径，不限制目标所在目录。
+ * @param {string} workspace 相对路径的首选基准目录。
+ * @param {string[]} extra 附加目录及技能目录，沿用原有相对路径查找顺序。
+ * @param {string} relPath 绝对路径或相对路径；允许目标尚未创建及使用上级目录。
+ * @returns {string} 目标绝对路径；空路径或相对路径没有基准目录时抛错，不创建文件。
+ */
 function resolveAllowed(workspace, extra, relPath) {
   const raw = String(relPath || '').trim();
   if (!raw) throw new Error('路径为空');
+  if (isAbsPath(raw)) return path.resolve(raw);
   const roots = [];
   if (workspace) roots.push(path.resolve(workspace));
   for (const r of extra || []) roots.push(path.resolve(r));
   const tries = [];
-  if (isAbsPath(raw)) tries.push(path.resolve(raw));
   for (const r of roots) tries.push(path.resolve(r, raw));
-  const allowed = (abs) => roots.some((r) => isInside(r, abs));
   for (const abs of tries) {
-    if (allowed(abs) && fs.existsSync(abs)) return abs;
+    if (fs.existsSync(abs)) return abs;
   }
-  // [铆钉优化] 模型常把工作目录末尾几级再拼一遍（工作目录是 …/Assets/Script，却写 Assets/Script/X.cs），
-  // 从上几级目录再解析一次，落回工作目录内就用它，避免读不到或新建出重复的嵌套目录。其他 AI 请勿删除
+  // 相对路径重复携带工作目录末尾几级时，沿用原有定位方式，避免新建重复的嵌套目录。
+  // 这里只选择已有路径，不再以目录归属限制文件操作。
   const overlap = [];
   if (!isAbsPath(raw)) {
     for (const r of roots) {
@@ -120,29 +127,29 @@ function resolveAllowed(workspace, extra, relPath) {
   for (const abs of overlap) {
     if (fs.existsSync(abs)) return abs;
   }
+  let hasExistingParent = false;
+  for (const abs of tries) {
+    if (fs.existsSync(path.dirname(abs))) {
+      hasExistingParent = true;
+      break;
+    }
+  }
   for (const abs of overlap) {
-    if (fs.existsSync(path.dirname(abs)) && !tries.some((t) => allowed(t) && fs.existsSync(path.dirname(t)))) return abs;
+    if (fs.existsSync(path.dirname(abs)) && !hasExistingParent) return abs;
   }
   for (const abs of tries) {
-    if (allowed(abs)) return abs;
-  }
-  throw new Error('路径超出允许范围（工作目录、附加目录或技能/规则目录）');
-}
-
-// 工作区外已经存在的文件，读得到就必须能写回。不能读完又说找不到。
-function resolveWrite(workspace, extra, relPath) {
-  try {
-    return resolveAllowed(workspace, extra, relPath);
-  } catch (err) {
-    const raw = String(relPath || '').trim();
-    if (!isAbsPath(raw)) throw err;
-    const abs = path.resolve(raw);
-    if (isForeignAiSkill(abs, extra)) throw err;
-    let st;
-    try { st = fs.statSync(abs); } catch { throw err; }
-    if (!st.isFile()) throw err;
     return abs;
   }
+  throw new Error('相对路径缺少工作目录或附加目录');
+}
+
+/**
+ * 为写入及局部编辑解析目标路径。
+ * 参数与返回值同 resolveAllowed；已有文件与新文件使用同一定位规则，不要求位于工作区内。
+ * 此方法只返回路径，文件创建及写入由调用工具执行。
+ */
+function resolveWrite(workspace, extra, relPath) {
+  return resolveAllowed(workspace, extra, relPath);
 }
 
 /** 读取：工作区内相对路径，或任意存在的绝对路径（与 Cursor 一样） */
@@ -276,10 +283,11 @@ function readTextFile(abs) {
 }
 
 /**
- * 只读预览：文本 / 图片 / 二进制
+ * 只读预览：文本 / 图片 / 视频 / 二进制；视频返回编码后的文件 URL，由播放器按需读取。
  * @param {string} root 工作目录
- * @param {string} rel 相对路径
- * @returns {{ kind: string, path: string, name: string, content?: string, truncated?: boolean }}
+ * @param {string} rel 相对工作目录的路径或已有文件的绝对路径
+ * @param {number} maxBytes 文本与二进制识别最多读取的字节数
+ * @returns {{ kind: string, path: string, name: string, content?: string, truncated?: boolean, size?: number, modifiedAt?: string }} 二进制返回字节大小及 ISO 修改时间供文件信息预览。
  */
 function readForPreview(root, rel, maxBytes = 512 * 1024) {
   const raw = String(rel || '');
@@ -288,6 +296,10 @@ function readForPreview(root, rel, maxBytes = 512 * 1024) {
   const name = path.basename(abs);
   const filePath = String(rel || '').replace(/\\/g, '/');
   const ext = path.extname(abs).toLowerCase();
+  // 视频交给 Chromium 按需解码和拖动，避免整段读入内存或经 IPC 复制 Base64。
+  if (['.mp4', '.webm', '.mov', '.m4v'].includes(ext)) {
+    return { kind: 'video', path: filePath, name, content: pathToFileURL(abs).href };
+  }
   const mime = IMAGE_MIME[ext];
   const stat = fs.statSync(abs);
   if (mime) {
@@ -305,7 +317,8 @@ function readForPreview(root, rel, maxBytes = 512 * 1024) {
   } else {
     buf = fs.readFileSync(abs);
   }
-  if (isProbablyBinary(buf)) return { kind: 'binary', path: filePath, name };
+  // 二进制只返回文件元信息；预览 EXE 等文件不会执行程序，也不把完整内容送到渲染层。
+  if (isProbablyBinary(buf)) return { kind: 'binary', path: filePath, name, size: stat.size, modifiedAt: stat.mtime.toISOString() };
   let content = buf.toString('utf8');
   if (truncated) content += '\n\n[文件过大，已截断]';
   return { kind: 'text', path: filePath, name, content, truncated };

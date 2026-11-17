@@ -229,6 +229,29 @@ function walkFiles(base, rel, out, skip) {
 }
 
 /**
+ * 从文件头识别 mac 原生程序及脚本入口，交叉打包时恢复执行权限。
+ * Windows 的 stat 权限不能反映 mac 可执行位；Mach-O 与 shebang 使用 0755，其余资源使用 0644。
+ * @param {string} abs 待打包文件的绝对路径
+ * @returns {number} 写入 ZIP 的 Unix 文件类型与权限位
+ */
+function appFileMode(abs) {
+  const fd = fs.openSync(abs, 'r');
+  const header = Buffer.alloc(4);
+  let count;
+  try { count = fs.readSync(fd, header, 0, header.length, 0); }
+  finally { fs.closeSync(fd); }
+  if (count >= 2 && header[0] === 0x23 && header[1] === 0x21) return 0o100755;
+  if (count === 4) {
+    const magic = header.readUInt32BE(0);
+    // 包含大小端 32/64 位 Mach-O 以及通用架构二进制，不依赖程序文件名。
+    const executable = [0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe,
+      0xcafebabe, 0xbebafeca, 0xcafebabf, 0xbfbafeca];
+    if (executable.includes(magic)) return 0o100755;
+  }
+  return 0o100644;
+}
+
+/**
  * 收集要写进 app 包的所有文件
  * 大文件只记路径不预读，写到 zip 时才逐个读，避免几百 MB 依赖同时压在内存里
  * @param {string} version 应用版本
@@ -266,6 +289,8 @@ function collectAppFiles(version, arch) {
     const list = [];
     walkFiles(base, '', list, null);
     for (const rel of list) {
+      // 内部训练采集实现不得进入任何发布安装包。
+      if (dir.from === 'electron' && rel === 'lib/training-archive.js') continue;
       const abs = path.join(base, rel);
       const target = 'Resources/' + dir.to.replace(/^Resources\//, '') + '/' + rel;
       pushPath(path.posix.normalize(target), abs);
@@ -417,7 +442,8 @@ async function buildPackage(opts) {
   for (const file of collected.files) {
     // 大文件在这里才读，写完即释放，内存里同时只留一个
     const content = file.data || fs.readFileSync(file.abs);
-    writer.addFile('SimpleCode.app/Contents/' + file.name, content, { mode: 0o100644 });
+    const mode = file.abs ? appFileMode(file.abs) : 0o100644;
+    writer.addFile('SimpleCode.app/Contents/' + file.name, content, { mode });
   }
   console.log('应用资源写入：' + collected.stats.total + ' 个文件，' +
     Math.round(collected.stats.bytes / 1048576) + 'MB（未压缩）');
@@ -435,7 +461,11 @@ async function main() {
   await buildPackage({ arch: args.arch, version: version, zipPath: zipPath, outPath: outPath });
 }
 
-main().catch(function onError(err) {
-  console.error('打包失败：' + (err && err.stack ? err.stack : err));
-  process.exit(1);
-});
+// 被验收脚本加载时只暴露打包函数，不自动开始构建。
+if (require.main === module) {
+  main().catch(function onError(err) {
+    console.error('打包失败：' + (err && err.stack ? err.stack : err));
+    process.exit(1);
+  });
+}
+module.exports = { appFileMode, collectAppFiles, buildPackage };

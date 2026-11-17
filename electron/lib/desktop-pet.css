@@ -1,7 +1,10 @@
-/* 同一小窗的宠物外形；聊天和附件仍使用原页面节点。 */
+/* 角色页与独立对话页共用样式；对话、输入和附件继续使用原有节点。 */
 :root { --pet-size:192px; --pet-height:246px; }
-body.pet-collapsed #frame { display:none; }
-body.pet-expanded #frame { position:absolute;left:var(--panel-left);top:var(--panel-top);width:var(--panel-width);height:var(--panel-height); }
+/* 原角色页不再承载输入区；独立对话页始终使用整个窗口。 */
+body:not(.pet-dialogue) #frame { display:none; }
+body.pet-dialogue #pet-stage { display:none; }
+body.pet-dialogue #frame { display:block;position:absolute;inset:0;width:100%;height:100%; }
+body.pet-dialogue #pet-menu { left:8px;top:8px;width:calc(100% - 16px);max-height:calc(100% - 16px); }
 body #grip, body #btn-mini { display:none; }
 #pet-stage { position:absolute;left:var(--pet-left);top:var(--pet-top);width:var(--pet-width);height:var(--pet-height); }
 #pet-canvas { position:absolute;right:calc((var(--pet-width) - var(--pet-size))/2);bottom:var(--pet-footer-height);width:var(--pet-size);height:var(--pet-size);cursor:grab;touch-action:none; }
@@ -34,8 +37,8 @@ body.pet-reduced-motion #pet-work-indicator * { animation:none; }
 @media (prefers-reduced-motion:reduce) { #pet-work-indicator * { animation:none; } }
 /* 正文信息区独立锚在角色上方；余额在脚下，两者同时可见且各自可点击。 */
 #pet-info { position:absolute;top:var(--pet-info-inset);left:8px;right:8px;display:flex;flex-direction:column;pointer-events:none; }
-/* 行数来自布局配置，按实际行高加上下内边距和边框计算高度；超出省略，全文在展开面板阅读。 */
-#pet-label { position:relative;z-index:1;flex:none;box-sizing:border-box;height:calc(var(--pet-dialogue-lines) * 1lh + 10px);padding:4px 8px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:var(--pet-dialogue-lines);overflow:hidden;white-space:pre-wrap;word-break:break-word;text-align:left;background:var(--panel);color:var(--text);border:1px solid var(--border-strong);border-radius:6px;font:11px/1.35 var(--font);cursor:pointer;pointer-events:auto; }
+/* 行数来自布局配置；保留可滚动全文，呈现层将可见区移至最新文字。 */
+#pet-label { position:relative;z-index:1;flex:none;box-sizing:border-box;height:calc(var(--pet-dialogue-lines) * 1lh + 10px);padding:4px 8px;display:block;overflow:hidden;white-space:pre-wrap;word-break:break-word;text-align:left;background:var(--panel);color:var(--text);border:1px solid var(--border-strong);border-radius:6px;font:11px/1.35 var(--font);cursor:pointer;pointer-events:auto; }
 /* 实际空闲及拖动不显示正文，不产生空白气泡或点击区域；余额仍保持在角色脚下。 */
 #pet-label[hidden],#pet-activity[hidden] { display:none; }
 #pet-menu { position:absolute;left:calc(var(--panel-left) + 8px);top:calc(var(--panel-top) + 8px);width:calc(var(--panel-width) - 16px);z-index:20;padding:14px;background:var(--panel);color:var(--text);border:1px solid var(--border-strong);border-radius:6px;max-height:calc(var(--panel-height) - 16px);overflow:auto; }

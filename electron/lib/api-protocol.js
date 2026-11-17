@@ -6,22 +6,16 @@
 const { httpFetch } = require('./http-fetch');
 const toolXml = require('./tool-xml');
 const wallet = require('./wallet');
+const mxapi = require('./mxapi');
 
 const cursorModel = require('./cursor-model');
 const codexModel = require('./codex-model');
 const claudeModel = require('./claude-model');
+const grokModel = require('./grok-model');
 
-const PROTOCOLS = ['openai', 'anthropic', 'gemini', 'cursor', 'codex', 'claudecode'];
+const PROTOCOLS = ['openai', 'anthropic', 'gemini', 'cursor', 'codex', 'claudecode', 'grok'];
 
-function normalizeProtocol(raw) {
-  const p = String(raw || 'openai').toLowerCase().trim();
-  if (p === 'claude' || p === 'anthropic') return 'anthropic';
-  if (p === 'google' || p === 'gemini') return 'gemini';
-  if (p === 'cursor') return 'cursor';
-  if (p === 'codex') return 'codex';
-  if (p === 'claudecode') return 'claudecode';
-  return 'openai';
-}
+const { normalizeProtocol } = require('./provider-protocol');
 
 function trimSlash(u) {
   return String(u || '').replace(/\/+$/, '');
@@ -107,7 +101,10 @@ function catalogEntry(id, raw) {
     id,
     priceText: price ? price.text : '',
     input: price ? price.input : null,
-    output: price ? price.output : null
+    output: price ? price.output : null,
+    // 只有目录明确声明 reasoning_effort 时才开放兼容 API 的标准档位。
+    reasoningOptions: Array.isArray(raw?.supported_parameters) && raw.supported_parameters.includes('reasoning_effort')
+      ? ['low', 'medium', 'high'].map(function reasoningOption(value) { return { value, label: value }; }) : []
   };
 }
 
@@ -219,10 +216,11 @@ async function fetchJsonQuiet(url, headers, ms) {
 
 /** 余额问不到就返回 available:false，不抛错，避免挡住模型列表 */
 async function fetchAccountBalance(modelCfg) {
-  const protocol = normalizeProtocol(modelCfg?.protocol);
+  const protocol = normalizeProtocol(modelCfg?.protocol, modelCfg?.baseUrl);
   if (protocol === 'codex') return codexModel.fetchRateLimitBalance(modelCfg);
   if (protocol === 'cursor') return cursorModel.fetchUsageBalance();
   if (protocol === 'claudecode') return { available: false };
+  if (protocol === 'grok') return { available: false };
   const host = String(modelCfg?.baseUrl || '');
   if (protocol === 'anthropic' || protocol === 'gemini') {
     return { available: false };
@@ -501,12 +499,18 @@ function authHeaders(protocol, apiKey) {
   return headers;
 }
 
-/** 拉取当前凭据可见的完整模型目录；跟随协议分页，失败时不把半份列表报为成功。 */
+/**
+ * 获取厂商模型目录；MXAPI 验证凭据后返回对应入口的官方文档目录。
+ * 其他厂商读取当前凭据可见的完整远程目录并跟随协议分页，失败时不返回半份列表。
+ */
 async function listModels(modelCfg) {
-  const protocol = normalizeProtocol(modelCfg?.protocol);
+  // MXAPI 各入口均走专用文档目录；先验证 Key，避免生图和 Nano 模板仍请求不存在的 /models。
+  if (mxapi.isMxApi(modelCfg)) return mxapi.listModels(modelCfg);
+  const protocol = normalizeProtocol(modelCfg?.protocol, modelCfg?.baseUrl);
   if (protocol === 'cursor') return cursorModel.listModels(modelCfg);
   if (protocol === 'codex') return codexModel.listModels(modelCfg);
   if (protocol === 'claudecode') return claudeModel.listModels(modelCfg);
+  if (protocol === 'grok') return grokModel.listModels(modelCfg);
   const baseUrl = modelCfg?.baseUrl;
   const apiKey = modelCfg?.apiKey;
   if (!baseUrl) throw new Error('请填写接口地址');
@@ -583,8 +587,9 @@ async function listModels(modelCfg) {
 
 async function testConnection(modelCfg) {
   if (modelCfg?.type === 'local') throw new Error('本地模型请用本地探测');
-  if (normalizeProtocol(modelCfg?.protocol) === 'codex') return codexModel.testConnection(modelCfg);
-  if (normalizeProtocol(modelCfg?.protocol) === 'claudecode') return claudeModel.testConnection(modelCfg);
+  if (normalizeProtocol(modelCfg?.protocol, modelCfg?.baseUrl) === 'codex') return codexModel.testConnection(modelCfg);
+  if (normalizeProtocol(modelCfg?.protocol, modelCfg?.baseUrl) === 'claudecode') return claudeModel.testConnection(modelCfg);
+  if (normalizeProtocol(modelCfg?.protocol, modelCfg?.baseUrl) === 'grok') return grokModel.testConnection(modelCfg);
   const listed = await listModels(modelCfg);
   if (modelCfg?.model) {
     const hit = listed.models.find((id) => id === modelCfg.model || id.endsWith(`/${modelCfg.model}`));
@@ -755,6 +760,8 @@ async function completeOpenAI({ modelCfg, messages, stream, tools, toolChoice, o
       if (parallelTools) body.parallel_tool_calls = true;
       if (toolChoice) body.tool_choice = toolChoice;
     }
+    // 用户未设置时不发送该字段，让模型使用自己的默认强度。
+    if (modelCfg.reasoningEffort) body.reasoning_effort = modelCfg.reasoningEffort;
     if (stream && withUsage) body.stream_options = { include_usage: true };
     return body;
   };
@@ -977,7 +984,7 @@ async function complete({
   onDelta = onDelta || (() => {});
   onReason = onReason || (() => {});
   onWait = onWait || (() => {});
-  const protocol = normalizeProtocol(modelCfg?.protocol);
+  const protocol = normalizeProtocol(modelCfg?.protocol, modelCfg?.baseUrl);
   if (!modelCfg?.baseUrl || !modelCfg?.model) {
     throw new Error('请填写接口地址和模型 ID');
   }
@@ -1056,6 +1063,8 @@ async function complete({
       msg = await codexModel.complete({ modelCfg, messages, onDelta: wrappedDelta, onReason: wrappedReason, signal: ctl.signal });
     } else if (protocol === 'claudecode') {
       msg = await claudeModel.complete({ modelCfg, messages, onDelta: wrappedDelta, onReason: wrappedReason, signal: ctl.signal });
+    } else if (protocol === 'grok') {
+      msg = await grokModel.complete({ modelCfg, messages, onDelta: wrappedDelta, onReason: wrappedReason, signal: ctl.signal });
     } else if (protocol === 'anthropic') {
       msg = await completeAnthropic({
         modelCfg, messages, stream, tools,

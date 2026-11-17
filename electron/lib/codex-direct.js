@@ -6,8 +6,12 @@ const path = require('path');
 const fs = require('fs');
 const diag = require('./diag');
 const codexEnv = require('./codex-env');
+const codexModel = require('./codex-model');
+const codexChatDirect = require('./codex-chat-direct');
 
 const sessions = new Map();
+// 同一会话只能有一个 SDK 写入者；队列尾在真实执行收尾后释放，不把不同会话串行化。
+const turnQueues = new Map();
 let activeRuns = 0;
 const MAX_SESSIONS = 8;
 const CODEX_TOOL_RESTRICTIONS = {
@@ -27,9 +31,11 @@ const READ_ONLY_TOOLS = new Set([
   'process_memory'
 ]);
 
-function busy() { return activeRuns > 0; }
+/** 工作 SDK、排队请求和聊天模式都算作正在执行，空闲清理不得跨过排队边界。 */
+function busy() { return activeRuns > 0 || turnQueues.size > 0 || codexChatDirect.busy(); }
 
-function closeSession(key) {
+/** 只关闭工作 SDK 会话；额度切换时保留聊天模式自己的对话上下文。 */
+function closeSdkSession(key) {
   const s = sessions.get(key);
   if (!s) return;
   sessions.delete(key);
@@ -37,11 +43,17 @@ function closeSession(key) {
   s.server.close();
 }
 
+/** 用户主动关闭会话时，两个额度通道的上下文一并解除绑定。 */
+function closeSession(key) {
+  closeSdkSession(key);
+  codexChatDirect.closeSession(key);
+}
+
 function closeIdle() {
-  if (activeRuns > 0) return 0;
+  if (busy()) return 0;
   const keys = [...sessions.keys()];
-  for (const key of keys) closeSession(key);
-  return keys.length;
+  for (const key of keys) closeSdkSession(key);
+  return keys.length + codexChatDirect.closeIdle();
 }
 
 function toolDefs(tools) {
@@ -143,7 +155,7 @@ async function createSession(key, sig, modelCfg, tools, onEvent, agiMode) {
     session.codex = codex;
     session.thread = codex.startThread({
       model: modelCfg.model && modelCfg.model !== 'default' ? String(modelCfg.model) : undefined,
-      modelReasoningEffort: 'high',
+      modelReasoningEffort: modelCfg.reasoningEffort || undefined,
       workingDirectory: cwd,
       skipGitRepoCheck: true,
       // AGI 已由用户开启自主执行，不再声明整个会话只读。
@@ -154,7 +166,7 @@ async function createSession(key, sig, modelCfg, tools, onEvent, agiMode) {
     });
     sessions.set(key, session);
     while (sessions.size > MAX_SESSIONS) closeSession(sessions.keys().next().value);
-    diag.log('codex', 'Codex 直通会话已创建', { model: modelCfg.model || 'default', reasoningEffort: 'high', cwd, tools: tools.length });
+    diag.log('codex', 'Codex 直通会话已创建', { model: modelCfg.model || 'default', reasoningEffort: modelCfg.reasoningEffort || 'default', cwd, tools: tools.length });
     onEvent({ type: 'status', text: 'Codex 直通会话已接通。' });
     return session;
   } catch (e) {
@@ -188,9 +200,102 @@ function imagesOf(content) {
   }
 }
 
-async function runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false }) {
+/**
+ * 在调用任何 Codex 工作模型之前读取服务端五小时额度。
+ * @param {object} modelCfg 当前 Codex 账号配置，API Key 请求不使用订阅配额。
+ * @returns {Promise<boolean>} 只有服务端明确显示五小时已耗尽才切聊天；查询失败记录诊断并保持原有工作路由。
+ */
+async function isWorkQuotaExhausted(modelCfg) {
+  try {
+    const snapshot = await codexModel.readRateLimitsFromAppServer(modelCfg);
+    return codexModel.fiveHourQuotaExhausted(snapshot);
+  } catch (error) {
+    diag.log('codex', '五小时额度查询失败，继续原工作路由', { message: error?.message || String(error) });
+    return false;
+  }
+}
+
+/**
+ * 等待前序请求真正收尾；排队者取消时立即返回，前序任务仍由自己的信号控制。
+ * @param {Promise<void>} previous 同一 key 的前序队列尾，只在前序执行结束后兑现。
+ * @param {AbortSignal} signal 当前等待者的取消信号，不传时直接等待前序。
+ * @returns {Promise<void>} 前序结束后兑现；取消时以 AbortError 拒绝，并移除本次监听。
+ */
+function waitForTurn(previous, signal) {
+  if (!signal) return previous;
+  return new Promise(function wait(resolve, reject) {
+    /** 仅结束当前等待者，不能让后继越过仍在运行的前序。 */
+    function cancelled() {
+      signal.removeEventListener('abort', cancelled);
+      const error = new Error('已停止');
+      error.name = 'AbortError';
+      reject(error);
+    }
+    /** 前序结束后释放取消监听，再允许当前请求进入执行。 */
+    function ready() {
+      signal.removeEventListener('abort', cancelled);
+      resolve();
+    }
+    signal.addEventListener('abort', cancelled, { once: true });
+    if (signal.aborted) cancelled();
+    previous.then(ready);
+  });
+}
+
+/**
+ * 按会话 key 串行执行 Codex 请求，防止线程双写和 MCP 工具上下文被后一次调用覆盖。
+ * @param {object} args 沿用原直通参数；不同 key 并行，同 key 按进入顺序执行，取消只作用于自身请求。
+ * @returns {Promise<object>} 原请求结果；真实失败原样传给调用方，不重投已经执行的工具。
+ * 排队者取消可以提前返回，但内部队列仍等前序真正收尾，保证后继不会抢占旧写入者。
+ */
+async function runTurn(args) {
+  const previous = turnQueues.get(args.key);
+  let release;
+  /**
+   * 保存本段队列的兑现入口，供请求退出时释放后继。
+   * @param {function():void} resolve gate 的兑现函数，保存到外层 release 后由 finally 调用。
+   * @returns {void} 不提前兑现 gate；后继仍须等待当前请求真正收尾。
+   */
+  function capture(resolve) { release = resolve; }
+  const gate = new Promise(capture);
+  /** 当前执行结束后才兑现本段队列，排队取消也不能跳过前序。 */
+  function waitForCurrent() { return gate; }
+  const tail = previous ? previous.then(waitForCurrent) : gate;
+  turnQueues.set(args.key, tail);
+  activeRuns += 1;
+  try {
+    if (previous) await waitForTurn(previous, args.signal);
+    if (args.signal?.aborted) {
+      const error = new Error('已停止');
+      error.name = 'AbortError';
+      throw error;
+    }
+    return await runSdkTurn(args);
+  } finally {
+    activeRuns -= 1;
+    release();
+    /** 仅删除仍属于自己的队列尾，前序不能移除已经登记的后继。 */
+    function forget() {
+      if (turnQueues.get(args.key) === tail) turnQueues.delete(args.key);
+    }
+    tail.then(forget);
+  }
+}
+
+/**
+ * 执行已取得会话写入权的一轮请求，配额路由、SDK 上下文与工具回传均沿用原语义。
+ * @param {object} args 由 runTurn 按 key 排队后的原始调用参数。
+ * @returns {Promise<object>} 模型正文；失败事件须等事件流结束后抛出，避免提前打断 SDK 的进程退出等待。
+ */
+async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false }) {
+  // 额度触顶的判定与 UI 切换由本地代码完成，无需等待已耗尽的模型作决定。
+  if (await isWorkQuotaExhausted(modelCfg)) {
+    closeSdkSession(key);
+    return codexChatDirect.runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode });
+  }
+  const chatSig = sig;
   // 模式改变必须重建 SDK 会话，不能复用旧的只读权限。
-  sig = `${sig}\nagi:${!!agiMode}\nreasoning:high`;
+  sig = `${sig}\nagi:${!!agiMode}\nreasoning:${modelCfg.reasoningEffort || 'default'}`;
   const specs = toolDefs(tools);
   let session = sessions.get(key);
   if (session && (fresh || session.sig !== sig)) {
@@ -203,7 +308,6 @@ async function runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, 
   let images = [];
   const prefix = session.turns ? '' : `${firstPrefix || ''}\n\n`;
   const prompt = `${prefix}${systemContext ? `【本轮 SpCode 当前规则与上下文；与旧指令冲突时以本段为准】\n${systemContext}\n\n` : ''}${turnText || ''}`.trim();
-  activeRuns += 1;
   let content = '';
   try {
     images = imagesOf(userContent);
@@ -216,30 +320,36 @@ async function runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, 
     const required = [...new Set((requiredToolNames || []).map((name) => String(name || '').trim()).filter(Boolean))];
     for (let attempt = 0; ; attempt += 1) {
       session.turns = (session.turns || 0) + 1;
+      let streamError = null;
       const { events } = await session.thread.runStreamed(nextInput, { signal });
       for await (const event of events) {
+        // 原样留存 SDK 实际返回的事件，包含公开推理摘要、消息及调用状态。
+        require('./training-recorder').note('sdk-event', { provider: 'codex', event });
         if (signal?.aborted) {
-          const err = new Error('已停止');
-          err.name = 'AbortError';
-          throw err;
+          streamError = new Error('已停止');
+          streamError.name = 'AbortError';
+          continue;
         }
+        // 终止事件不提前关闭生成器；消费到 SDK 真正退出后再交付错误，期间不再展示后续正文。
+        if (streamError) continue;
         if (event.type === 'item.started' && event.item?.type === 'mcp_tool_call') {
           onEvent({ type: 'status', text: `Codex 正在调用 ${event.item.tool}` });
         } else if (event.type === 'item.completed' && event.item?.type === 'mcp_tool_call' && event.item?.error?.message) {
           const message = String(event.item.error.message);
           if (/requires approval|approval policy.*never|需要审批|审批策略.*never/i.test(message)) {
-            throw new Error(`Codex 拒绝调用 SpCode 工具：${message}`);
+            streamError = new Error(`Codex 拒绝调用 SpCode 工具：${message}`);
           }
         } else if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
           content = String(event.item.text || '');
           // SDK 的 agent_message 是一条完整消息，不是增量片段；工具往返时后续消息应替换前文。
           onEvent({ type: 'rewrite_text', text: content });
         } else if (event.type === 'turn.failed') {
-          throw new Error(event.error?.message || 'Codex 运行失败');
+          streamError = new Error(event.error?.message || 'Codex 运行失败');
         } else if (event.type === 'error') {
-          throw new Error(event.message || 'Codex 运行失败');
+          streamError = new Error(event.message || 'Codex 运行失败');
         }
       }
+      if (streamError) throw streamError;
       if (!required.length || required.some((name) => stats.calls.includes(name))) break;
       if (attempt >= 2) throw new Error('Codex 未调用本轮要求的 SpCode 工具，无法确认任务已执行。');
       onEvent({ type: 'status', text: 'Codex 还没有调用完成任务所需的 SpCode 工具，正在继续…' });
@@ -250,10 +360,14 @@ async function runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, 
     }
     return { content, reasoning: '' };
   } catch (e) {
-    closeSession(key);
+    closeSdkSession(key);
+    // 只有尚未执行任何工具、且服务端确认五小时刚好耗尽时，才安全地重投当前任务。
+    if (!stats.calls.length && !signal?.aborted && await isWorkQuotaExhausted(modelCfg)) {
+      onEvent({ type: 'status', text: 'Codex 工作额度在本轮耗尽，自动转入官方聊天模式…' });
+      return codexChatDirect.runTurn({ key, sig: chatSig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode });
+    }
     throw e;
   } finally {
-    activeRuns = Math.max(0, activeRuns - 1);
     session.ctx = null;
     for (const file of images) { try { fs.unlinkSync(file); } catch { /* 临时图已清理 */ } }
   }

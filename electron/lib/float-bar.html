@@ -744,7 +744,7 @@
   </div>
   <!-- 正文固定在角色上方；余额独立放在角色脚下，实际空闲只隐藏正文。 -->
   <div id="pet-info">
-    <button id="pet-label" type="button" title="点击展开对话，右键换肤">在这里陪你</button>
+    <button id="pet-label" type="button" title="最新文字；右键换肤">在这里陪你</button>
   </div>
   <button id="pet-balance" type="button" title="展开账户额度与对话"><span>大脑额度</span><strong id="pet-balance-value">等待同步</strong><span aria-hidden="true">↗</span></button>
   <canvas id="pet-canvas" width="192" height="192" role="img" aria-label="桌宠"></canvas>
@@ -775,7 +775,7 @@
   <label>眼镜左右<input id="pet-glasses-offset-x" type="range" aria-label="眼镜左右位置，负数左移，正数右移" /><output id="pet-glasses-offset-x-value" for="pet-glasses-offset-x"></output></label>
   <label>眼镜上下<input id="pet-glasses-offset-y" type="range" aria-label="眼镜上下位置，负数上移，正数下移" /><output id="pet-glasses-offset-value" for="pet-glasses-offset-y"></output></label>
   <label><input id="pet-reduced" type="checkbox" />减少动态效果</label>
-  <p id="pet-hint">拖动角色移动；单击展开对话；右键更换皮肤。预览动作不会改变 AI 的实际工作状态。</p>
+  <p id="pet-hint">拖动角色移动；右键更换皮肤。Ctrl+Alt+空格独立唤起或收起输入框。预览动作不会改变 AI 的实际工作状态。</p>
   <p id="pet-error" role="alert"></p>
   <footer><button id="pet-import" type="button">导入皮肤包</button><button id="pet-hide" type="button">隐藏宠物</button></footer>
 </section>
@@ -1679,12 +1679,14 @@
   }
 
   function doHide() {
-    // 收起聊天仍保留桌宠；隐藏整个宠物由右键菜单单独执行。
+    // 只收起独立输入窗并保留草稿；不改变宠物显隐。
     window.desktopPet.call('expand', false);
   }
 
   inputEl.addEventListener('input', growInput);
   inputEl.addEventListener('keydown', function (e) {
+    // 输入法组词中的确认键不发送；只有明确的发送快捷键提交草稿。
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       doSend();
@@ -1693,6 +1695,8 @@
     if (e.key === 'Escape') {
       e.preventDefault();
       inputEl.value = '';
+      pendingAtts = [];
+      renderAtts();
       growInput();
     }
   });
@@ -1854,6 +1858,13 @@
   if (bridge && typeof bridge.onAsk === 'function') bridge.onAsk(onAsk);
   if (!bridge) addMessage('sys', '悬浮栏桥接没加载，请重启 SpCode 再试。');
 
+  /** 独立窗口显示或重新获得焦点就接收输入，不触发发送。 */
+  function focusDraft() { inputEl.focus(); }
+  if (new URLSearchParams(window.location.search).get('dialogue') === '1') {
+    window.addEventListener('focus', focusDraft);
+    window.desktopPet.onFocus(focusDraft);
+    focusDraft();
+  }
   growInput();
   applyCompactUI();
   paint();

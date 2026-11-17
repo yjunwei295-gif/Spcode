@@ -10,9 +10,13 @@ const results=[];
 function between(text,start,end){const a=text.indexOf(start),b=text.indexOf(end,a);assert(a>=0&&b>a);return text.substring(a,b);}
 /** 断言真实载荷与字节，记录可复查证据。 */
 function ok(name,value){assert.ok(value,name);results.push(name);console.log('PASS '+name);}
-/** 测试生产队列、工具边界图片以及SDK收尾后的带图续接。 */
+/**
+ * 测试生产队列、工具边界图片以及 SDK 收尾后的带图续接。
+ * @returns {Promise<object>} 包含真实图片块的工具结果，供后续本机 MCP HTTP 回归复用。
+ * VM 显式提供插话归档映射与训练转发依赖；不创建训练档案，不改变模型或图片行为断言。
+ */
 async function queueAndDirect(){
- const context={require:createRequire(agentFile),fs,path,interjectInbox:new Map(),activeInterjectKeys:new Set(['a','b']),desktopOn:function(){return true;},modelSupportsVision:function(){return true;},attachmentsToParts:async function(list){return {parts:list.map(function(){return {type:'image_url',image_url:{url}};}),extraTexts:[]};},answerImagesForModel:async function(){throw new Error('原生视觉不应调用视觉代理');}};
+ const context={require:createRequire(agentFile),fs,path,interjectInbox:new Map(),interjectArchives:new Map(),trainingArchive:{direct:function forwardDirect(provider,args){return provider.runTurn(args);}},activeInterjectKeys:new Set(['a','b']),desktopOn:function(){return true;},modelSupportsVision:function(){return true;},attachmentsToParts:async function(list){return {parts:list.map(function(){return {type:'image_url',image_url:{url}};}),extraTexts:[]};},answerImagesForModel:async function(){throw new Error('原生视觉不应调用视觉代理');}};
  vm.createContext(context);
  vm.runInContext(between(source,'function pushInterjection(','// 桌面工具只在'),context);
  ok('纯图插话可入队',context.pushInterjection('a','',[{path:imageFile,name:'参考.png'}])===true);

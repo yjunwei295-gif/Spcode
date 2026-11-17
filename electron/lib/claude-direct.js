@@ -100,6 +100,8 @@ async function runQuery(session, modelCfg, text, images, onEvent, signal) {
       })
     });
     for await (const msg of q) {
+      // 在展示层拆分和过滤前保留 SDK 返回的完整消息。
+      require('./training-recorder').note('sdk-event', { provider: 'claudecode', event: msg });
       if (msg.session_id) session.sessionId = msg.session_id;
       const d = claudeModel.streamDelta(msg);
       if (d?.text) {

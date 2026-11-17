@@ -1,8 +1,8 @@
-// 在现有小窗上切换桌宠与聊天形态，不创建第二个应用或 BrowserWindow。
+// 桌宠保持独立角色窗口；聊天与输入使用同实例的独立置顶窗口。
 'use strict';
 const fs = require('fs');
 const path = require('path');
-const { app, ipcMain, screen, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, dialog } = require('electron');
 const config = require('./desktop-pet-config.json');
 const { createLibrary } = require('./desktop-pet-skins');
 /** IPC 按实际发送页查找实例，不接受页面自行指定其他窗口编号。 */
@@ -13,14 +13,21 @@ ipcMain.handle('desktop-pet:invoke', function (event, data) {
   return methods.get(data.method)(data.payload);
 });
 
-/** 把同一窗口的尺寸变化固定在角色脚底，并管理皮肤选择和指针穿透。 */
-function attach(win, slotNo, initialBounds) {
+/** 管理独立角色窗与对话窗；角色脚底定位、皮肤和透明命中只作用于角色窗。 */
+function attach(win, slotNo, initialBounds, onDialogueReady) {
   const file = path.join(app.getPath('userData'), 'desktop-pets', 'slot-' + slotNo + '.json');
   const library = createLibrary(app.getPath('userData'));
   let settings = { skin: config.defaultSkin, scale: config.defaultScale, speed: 1, reducedMotion: false, glasses: config.glasses.defaultEnabled, glassesOffsetX: config.glasses.horizontalOffset, glassesOffsetY: config.glasses.verticalOffset, footX: initialBounds.x + initialBounds.width - config.layout.petWidth * config.defaultScale / 2, footY: initialBounds.y + initialBounds.height };
   // 旧版偏好补齐眼镜开关与两轴偏移，保留已保存的皮肤、位置和用户调整。
   if (fs.existsSync(file)) settings = Object.assign({ glasses: config.glasses.defaultEnabled, glassesOffsetX: config.glasses.horizontalOffset, glassesOffsetY: config.glasses.verticalOffset }, JSON.parse(fs.readFileSync(file, 'utf8')));
   let expanded = false;
+  // 草稿随独立页面保留，收起只隐藏窗口，不销毁或重建输入节点。
+  let dialogue = null;
+  let dialogueReady = false;
+  let pendingMenu = false;
+  let focusOnShow = true;
+  // 外观菜单在独立页，动作预览仍由角色页实际播放。
+  let preview = '';
   let dragging = null;
   let ignoring = false;
   let placement = null;
@@ -52,20 +59,67 @@ function attach(win, slotNo, initialBounds) {
     const petY = Math.round(settings.footY - ph);
     let x = petX, y = petY, width = pw, height = ph;
     placement = { petLeft: 0, petTop: 0, petWidth: pw, petHeight: ph, panelLeft: 0, panelTop: 0, panelWidth: 0, panelHeight: 0 };
-    if (expanded) {
-      const panelWidth = Math.min(config.layout.panelWidth, area.width);
-      const above = petY - area.y;
-      const below = area.y + area.height - settings.footY;
-      const upwards = above >= config.layout.panelHeight || above >= below;
-      const panelHeight = Math.min(config.layout.panelHeight, upwards ? above : below);
-      const panelX = Math.round(Math.max(area.x, Math.min(settings.footX - panelWidth / 2, area.x + area.width - panelWidth)));
-      const panelY = Math.round(upwards ? petY - panelHeight : settings.footY);
-      x = Math.min(petX, panelX); y = Math.min(petY, panelY);
-      width = Math.max(petX + pw, panelX + panelWidth) - x;
-      height = Math.max(petY + ph, panelY + panelHeight) - y;
-      placement = { petLeft: petX - x, petTop: petY - y, petWidth: pw, petHeight: ph, panelLeft: panelX - x, panelTop: panelY - y, panelWidth, panelHeight };
-    }
+    // 输入面板不再扩大角色窗口，透明命中和脚底坐标始终以宠物自身计算。
     win.setBounds({ x, y, width, height });
+  }
+  /**
+   * 输入窗首次在鼠标所在屏幕居中，与角色坐标无关。
+   * 显示器变化时按输入窗自身位置限制在工作区内，保留用户拖动后的独立位置。
+   */
+  function dialogueBounds() {
+    const bounds = dialogue ? dialogue.getBounds() : null;
+    const point = bounds ? { x: bounds.x + Math.round(bounds.width / 2), y: bounds.y + Math.round(bounds.height / 2) } : screen.getCursorScreenPoint();
+    const area = screen.getDisplayNearestPoint(point).workArea;
+    const width = Math.min(config.layout.panelWidth, area.width);
+    const height = Math.min(config.layout.panelHeight, area.height);
+    const x = bounds ? bounds.x : area.x + (area.width - width) / 2;
+    const y = bounds ? bounds.y : area.y + (area.height - height) / 2;
+    return {
+      x: Math.round(Math.max(area.x, Math.min(x, area.x + area.width - width))),
+      y: Math.round(Math.max(area.y, Math.min(y, area.y + area.height - height))),
+      width, height
+    };
+  }
+  /** 仅向已加载的对话页转发事件；首次加载由宿主回灌当前绑定会话。 */
+  function send(channel, data) {
+    if (dialogueReady) dialogue.webContents.send(channel, data);
+  }
+  /** 两个窗口共享外观及展开状态，菜单请求只发给独立对话页。 */
+  function notifyView() {
+    const data = { expanded, settings, placement, preview };
+    win.webContents.send('desktop-pet:view', data);
+    send('desktop-pet:view', Object.assign({}, data, { menu: pendingMenu }));
+    if (dialogueReady) pendingMenu = false;
+  }
+  /** 创建同实例的置顶输入窗；首次就绪后回灌历史，再将键盘焦点交给输入框。 */
+  function ensureDialogue() {
+    if (dialogue) return;
+    dialogue = new BrowserWindow(Object.assign(dialogueBounds(), {
+      title: 'SpCode 独立输入框', frame: false, transparent: true,
+      alwaysOnTop: true, skipTaskbar: true, show: false, resizable: false,
+      minimizable: false, maximizable: false, fullscreenable: false,
+      webPreferences: { preload: path.join(__dirname, '..', 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: false }
+    }));
+    dialogue.setAlwaysOnTop(true, 'screen-saver');
+    dialogue.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    const dialogueId = dialogue.webContents.id;
+    endpoints.set(dialogueId, methods);
+    dialogue.on('close', function (event) { event.preventDefault(); setExpanded(false); });
+    dialogue.on('closed', function () {
+      endpoints.delete(dialogueId);
+      dialogue = null;
+      dialogueReady = false;
+    });
+    dialogue.webContents.on('did-finish-load', function () {
+      dialogueReady = true;
+      onDialogueReady();
+      notifyView();
+      if (expanded) {
+        if (focusOnShow) { dialogue.show(); dialogue.focus(); send('desktop-pet:focus'); }
+        else dialogue.showInactive();
+      }
+    });
+    dialogue.loadFile(path.join(__dirname, 'float-bar.html'), { query: { dialogue: '1' } });
   }
   /** 保存角色脚底、皮肤和显示偏好；不改动会话或用户输入。 */
   function save() {
@@ -76,26 +130,52 @@ function attach(win, slotNo, initialBounds) {
     fs.writeFileSync(file, JSON.stringify(settings, null, 2), 'utf8');
   }
   /** 返回同一份界面状态，初始化及热换肤共用。 */
-  function payload() { return { config, settings, expanded, placement, skins: library.list() }; }
-  /** 通知页面形态变化，使用 showInactive 保持原软件键盘焦点。 */
-  function setExpanded(on) {
-    const next = on === true;
-    if (next === expanded) return;
-    expanded = next;
-    setIgnoring(false);
-    layout();
-    win.webContents.send('desktop-pet:view', { expanded, settings, placement });
-    save();
+  function payload() { return { config, settings, expanded, placement, preview, skins: library.list() }; }
+  /**
+   * 展开独立对话窗并捕获后续键盘输入；收起保留页面与草稿。
+   * focusInput 为 false 用于程序确认卡片，避免工作中抢走用户原软件的输入焦点。
+   */
+  function setExpanded(on, focusInput = true) {
+    expanded = on === true;
+    focusOnShow = focusInput;
+    if (expanded) {
+      ensureDialogue();
+      if (dialogueReady) {
+        if (focusInput) { dialogue.show(); dialogue.focus(); send('desktop-pet:focus'); }
+        else dialogue.showInactive();
+      }
+    } else if (dialogue) dialogue.hide();
+    notifyView();
   }
-  /** 只有命中实际画面才拦截鼠标，透明区域将事件交给下面的软件。 */
+  /**
+   * 只切换角色窗自身的鼠标穿透，不注册 Windows 全局鼠标钩子。
+   * Electron 的 forward 会让系统鼠标事件等待主线程；繁忙时可能拖慢整机输入。
+   * 穿透期间由角色页限频采样鼠标位置，仍按当前画面的透明像素恢复命中。
+   */
   function setIgnoring(on) {
     if (on === ignoring) return;
     ignoring = on;
-    win.setIgnoreMouseEvents(on, { forward: true });
+    win.setIgnoreMouseEvents(on, { forward: false });
   }
+  /**
+   * 返回可见角色窗内的鼠标坐标，供页面做像素命中；隐藏或拖动期间返回 null。
+   * 屏幕和窗口位置使用 DIP，再除以页面缩放比例得到 CSS 坐标；只读坐标，不接管系统输入。
+   */
+  function cursorPosition() {
+    if (!win.isVisible() || dragging) return null;
+    const point = screen.getCursorScreenPoint();
+    const bounds = win.getContentBounds();
+    const zoom = win.webContents.getZoomFactor();
+    return { clientX: (point.x - bounds.x) / zoom, clientY: (point.y - bounds.y) / zoom };
+  }
+  register('desktop-pet:cursor', cursorPosition);
   /** 形态与资源加载后页面主动请求，避免 did-finish-load 首帧竞态。 */
   register('desktop-pet:init', payload);
   register('desktop-pet:expand', function (data) { setExpanded(data === true); return expanded; });
+  /** 角色右键请求在独立对话窗显示设置，不把菜单挤进角色尺寸。 */
+  register('desktop-pet:menu', function () { pendingMenu = true; setExpanded(true); return expanded; });
+  /** 菜单预览同步到角色页，仅改变演出，不改真实任务状态。 */
+  register('desktop-pet:preview', function (state) { preview = state; notifyView(); });
   register('desktop-pet:hit', function (data) { setIgnoring(dragging ? false : data !== true); return !ignoring; });
   register('desktop-pet:drag', function (data) {
     if (data.phase === 'start') {
@@ -144,6 +224,7 @@ function attach(win, slotNo, initialBounds) {
     }
     layout();
     save();
+    notifyView();
     return payload();
   });
   register('desktop-pet:import', async function () {
@@ -154,20 +235,25 @@ function attach(win, slotNo, initialBounds) {
   });
   win.setMinimumSize(1, 1);
   layout();
-  /** 显示器热插拔或缩放变化时保持角色可见，并重新计算面板方向。 */
+  /** 显示器热插拔或缩放变化时，分别按角色和输入窗自身位置保持可见。 */
   function displayChanged() {
     layout();
-    win.webContents.send('desktop-pet:view', { expanded, settings, placement });
+    if (dialogue) dialogue.setBounds(dialogueBounds());
+    notifyView();
     save();
   }
   screen.on('display-removed', displayChanged);
   screen.on('display-metrics-changed', displayChanged);
   const pageId = win.webContents.id;
   win.on('closed', function () {
+    if (dialogue) dialogue.destroy();
     endpoints.delete(pageId);
     screen.removeListener('display-removed', displayChanged);
     screen.removeListener('display-metrics-changed', displayChanged);
   });
-  return { save, setExpanded, payload, isExpanded: function () { return expanded; } };
+  return { save, setExpanded, payload, send,
+    ownsDialogue: function (target) { return dialogue === target; },
+    isExpanded: function () { return expanded; }
+  };
 }
 module.exports = { attach };

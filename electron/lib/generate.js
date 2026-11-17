@@ -1,7 +1,9 @@
 const path = require('path');
+const fs = require('fs');
 const { httpFetch } = require('./http-fetch');
 const localLlm = require('./local-llm');
 const imageGenEngine = require('./image-gen-engine');
+const mxapi = require('./mxapi');
 
 const DEFAULTS = {
   imageGen: { size: '1024x1024', paths: ['images/generations'] },
@@ -213,19 +215,80 @@ async function tryPaths(modelCfg, paths, body, fallbackExt, signal) {
 }
 
 /**
- * 根据槽位使用本地引擎或接口生成媒体；本地参考图与生成参数完整透传。
- * @returns {{ buf: Buffer, ext: string }}
+ * 用 GPT 图片编辑接口按参考图重绘，上传真实图片字节而非仅发送本机路径。
+ * imagePath 为上游已解析的图片路径；返回生成文件与实际模型、参考图记录。
+ * 请求沿用生图接口的八分钟超时；鉴权、取消、接口错误均向上传递，不改用文生图。
  */
-async function generateMedia({ role, modelCfg, prompt, signal, modelsDir, onWait, imagePath, imageOptions = {} }) {
+async function generateGptImageEdit(modelCfg, prompt, imagePath, signal, background, size) {
+  const mimeTypes = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
+  const mime = mimeTypes[path.extname(imagePath).toLowerCase()];
+  if (!mime) throw new Error('GPT 参考图只支持 PNG、JPEG 或 WebP');
+  const bytes = await fs.promises.readFile(imagePath);
+  const form = new FormData();
+  form.append('model', modelCfg.model);
+  form.append('prompt', String(prompt).trim());
+  form.append('image[]', new Blob([bytes], { type: mime }), path.basename(imagePath));
+  form.append('n', '1');
+  form.append('size', size);
+  // 透明背景必须传接口字段；只在提示词中描述可能得到画进图片的棋盘格。
+  if (background !== undefined) form.append('background', background);
+  const headers = {};
+  if (modelCfg.apiKey) headers.Authorization = `Bearer ${modelCfg.apiKey}`;
+  const ctl = new AbortController();
+  function abortEdit() { ctl.abort(); }
+  if (signal) {
+    if (signal.aborted) ctl.abort();
+    else signal.addEventListener('abort', abortEdit, { once: true });
+  }
+  const timer = setTimeout(abortEdit, 8 * 60 * 1000);
+  try {
+    // 由 FormData 写入带 boundary 的 Content-Type，避免手写 JSON 头导致图片丢失。
+    const baseUrl = String(modelCfg.baseUrl).replace(/\/$/, '');
+    const res = await httpFetch(`${baseUrl}/images/edits`, { method: 'POST', headers, body: form, signal: ctl.signal });
+    const text = await res.text();
+    const isJson = String(res.headers.get('content-type') || '').includes('json');
+    const json = isJson && text ? JSON.parse(text) : null;
+    if (!res.ok) throw new Error(errText({ status: res.status, text, json }));
+    if (!json) throw new Error('GPT 图片编辑接口没有返回 JSON 图片数据');
+    const asset = await extractAsset(json, '.png', ctl.signal);
+    if (!asset?.buf?.length) throw new Error('GPT 图片编辑接口没有返回图片');
+    asset.generation = { model: modelCfg.model, mode: 'image-edit', imagePath, background, size };
+    return asset;
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', abortEdit);
+  }
+}
+
+/**
+ * 根据槽位生成媒体；GPT 参考图走图片编辑，MXAPI 视频透传参考图与时长，本地参数完整透传。
+ * @returns {{ buf: Buffer, ext: string, generation?: object }}
+ */
+async function generateMedia({ role, modelCfg, prompt, signal, modelsDir, onWait, onProgress, imagePath, duration, background, imageOptions = {} }) {
+  // 背景字段只接入 GPT 参考图编辑，其他路径明确拒绝，避免把透明请求悄悄丢弃。
+  if (background !== undefined && !(role === 'imageGen' && imagePath && isApiCfg(modelCfg) && /^gpt-image-/i.test(modelCfg.model))) {
+    throw new Error('background 仅支持 GPT 参考图编辑');
+  }
   if (role === 'imageGen') {
     const modelPath = localLlm.resolveGgufPath(modelCfg, modelsDir);
     const looksLocal = modelCfg?.type === 'local' || modelPath || /\.gguf$/i.test(modelCfg?.model || '');
     if (looksLocal) {
       if (!modelPath) throw new Error(localGenHint('生图'));
-      return imageGenEngine.generate({ modelPath, prompt, modelsDir, onWait, signal, imagePath, imageOptions });
+      return imageGenEngine.generate({ modelPath, prompt, modelsDir, onWait, onProgress, signal, imagePath, imageOptions });
     }
   }
-  // 本轮参数属于本地引擎协议；接口分支不能静默忽略参考图或可调参数。
+  // GPT 的参考图使用 multipart 图片编辑；尺寸映射为接口 size，拒绝本地采样参数。
+  if (role === 'imageGen' && imagePath && isApiCfg(modelCfg) && /^gpt-image-/i.test(modelCfg.model)) {
+    for (const key of Object.keys(imageOptions)) {
+      if (key !== 'width' && key !== 'height') throw new Error('GPT 图片编辑不接收本地采样参数，仅支持参考图、宽高和提示词');
+    }
+    const hasWidth = imageOptions.width !== undefined;
+    const hasHeight = imageOptions.height !== undefined;
+    if (hasWidth !== hasHeight) throw new Error('GPT 图片编辑须同时指定 width 与 height');
+    const size = hasWidth ? `${imageOptions.width}x${imageOptions.height}` : DEFAULTS.imageGen.size;
+    return generateGptImageEdit(modelCfg, prompt, imagePath, signal, background, size);
+  }
+  // 其他接口尚未接入参考图，保持明确拒绝，不退回无参考图生成。
   if (role === 'imageGen' && (imagePath || Object.keys(imageOptions).length)) {
     throw new Error('图生图及这些生成参数当前仅接入本地生图模型，请在模型组合挂本地生图模型');
   }
@@ -272,11 +335,15 @@ async function generateMedia({ role, modelCfg, prompt, signal, modelsDir, onWait
     throw lastErr || new Error('生图接口没有返回图片');
   }
   if (role === 'videoGen') {
+    // MXAPI 原生视频为异步任务，不能送进仅接受直接文件结果的通用路径。
+    if (mxapi.isMxApi(modelCfg)) return mxapi.generateVideo({ modelCfg, prompt: text, signal, onWait, imagePath, duration });
+    // 通用视频路径尚未接入参考图，明确失败，避免丢图后仍发生付费生成。
+    if (imagePath) throw new Error('此视频厂商尚未接入参考图上传，不能忽略参考图生成');
     return tryPaths(modelCfg, DEFAULTS.videoGen.paths, {
       model: modelCfg.model,
       prompt: text,
-      seconds: DEFAULTS.videoGen.seconds,
-      duration: DEFAULTS.videoGen.seconds
+      seconds: duration === undefined ? DEFAULTS.videoGen.seconds : duration,
+      duration: duration === undefined ? DEFAULTS.videoGen.seconds : duration
     }, '.mp4', signal);
   }
   if (role === 'model3d') {

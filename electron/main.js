@@ -5,6 +5,13 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
+// 在业务模块首次加载前建立稳定导出入口；热更新不会重启 Electron 进程。
+const hotReload = require('./lib/hot-reload').createHotReload({
+  root: path.join(__dirname, '..'),
+  canApply: canApplyHotReload,
+  notify: notifyHotReload,
+  afterReload: restoreHotReloadHooks
+});
 const store = require('./lib/store');
 const { mergeCatalogEdits } = require('./lib/model-catalog');
 // 每个渲染窗口保留它最后收到的目录快照，用来区分用户编辑和过期的本地副本。
@@ -31,6 +38,7 @@ const codeIndex = require('./lib/code-index');
 const codeEmbed = require('./lib/code-embed');
 const desktopHand = require('./lib/desktop-hand');
 const contextPreview = require('./lib/context-preview');
+const trainingArchive = require('./lib/training-recorder');
 // 发送前预览：只读拼一遍本轮 system 文本给预览面板，模块内不发模型请求、不写盘
 const promptPreview = require('./lib/prompt-preview');
 const { createFloatBar } = require('./lib/float-bar');
@@ -49,6 +57,16 @@ let APP_ROOT = path.join(__dirname, '..');
 /** 代码/资源根（asar 内只读即可：图标、renderer） */
 const CODE_ROOT = path.join(__dirname, '..');
 const windows = new Set();
+/** 稳定窗口身份独立于本次启动的编号；整组退出保留所有打开的窗口及各自标签清单。 */
+const windowLayouts = require('./lib/session-layout').createWindowLayouts({
+  /** 无参数；返回当前用户数据的窗口登记目录，不受源码或安装包位置变化影响。 */
+  directory: function sessionLayoutDirectory() { return path.join(app.getPath('userData'), 'window-layouts'); },
+  ownerAlive: pidAlive
+});
+/** 主窗到其持久化身份的映射；不使用进程槽位或运行时窗口编号作为磁盘身份。 */
+const layoutByWin = new WeakMap();
+/** 整体退出期间的关闭事件只释放运行资源，不能移除待恢复的窗口身份。 */
+let quitting = false;
 /** 常驻置顶悬浮对话栏（主进程持有，退出流程里 destroy） */
 let floatBar = null;
 /** 已建出来的小窗实例，广播时逐个推，单实例时也走这里 */
@@ -91,6 +109,9 @@ const abortByWin = new WeakMap();
 /** win -> Map(turnId, { resolve, reject, ask }) */
 const pendingAskByWin = new WeakMap();
 const watchByWin = new WeakMap();
+/** 每个页面已经确认加载的资源版本，以及 Agent 重建后须恢复的宿主引用。 */
+const hotReloadVersions = new WeakMap();
+let hotReloadAgentHooks = null;
 
 /** AGI 后台接单只属于开启它的窗口和会话；回执防止无效会话吞掉请求。 */
 let screenWatchOwner = null;
@@ -217,6 +238,64 @@ function sendTo(win, channel, data) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, data);
 }
 
+/** 业务更新等所有窗口轮次和桌面动作空闲，保留仍在运行的任务及会话。 */
+function canApplyHotReload() {
+  if (runningByWin.size) return false;
+  return !desktopHand.isBusy();
+}
+
+/** 将真实更新状态送到主窗；已经确认加载的界面版本不重复触发重载。 */
+function notifyHotReload(update) {
+  diag.log('hot-reload', update.message, { kind: update.kind, paths: update.paths, revision: update.revision });
+  for (const win of windows) {
+    if (update.kind === 'renderer' && (hotReloadVersions.get(win) || 0) >= update.revision) continue;
+    sendTo(win, 'app:hot-reload', update);
+  }
+}
+
+/** Agent 重建后恢复主进程提供的小窗操作引用，其他常驻服务不重建。 */
+function restoreHotReloadHooks(files) {
+  if (hotReloadAgentHooks && files.includes(path.join(__dirname, 'lib', 'agent.js'))) {
+    agent.setFloatBarHooks(hotReloadAgentHooks);
+  }
+}
+
+/** 初始化补取通知时沿用该窗口已经确认的界面版本，防止刷新循环。 */
+ipcMain.handle('app:hotReloadStatus', function hotReloadStatus(event) {
+  const update = hotReload.status();
+  const win = getWin(event);
+  if (update && update.kind === 'renderer' && (hotReloadVersions.get(win) || 0) >= update.revision) return null;
+  return update;
+});
+
+/**
+ * 渲染层保存临时快照后请求真正重载；主进程再次检查聊天与业务调用。
+ * @param {Electron.IpcMainInvokeEvent} event 发起确认的主窗口 IPC，不能替其他窗口登记版本。
+ * @param {number} revision 渲染层已经保存快照的预检版本，必须与最新可加载版本一致。
+ * @returns {{ok:boolean}} 当前确认是否接受；返回 true 后仍在下一事件循环复核版本和忙状态。
+ * IPC 应答先送达旧页面，新保存或错误会取消最终重载并通知页面清除临时快照。
+ */
+ipcMain.handle('app:hotReloadReady', function hotReloadReady(event, revision) {
+  const win = getWin(event);
+  const update = hotReload.status();
+  if (!win || !windows.has(win) || !update || update.kind !== 'renderer' || update.revision !== revision) return { ok: false };
+  if (!canApplyHotReload() || hotReload.isBusy()) return { ok: false };
+  hotReloadVersions.set(win, revision);
+  setImmediate(function reloadIdlePage() {
+    if (win.isDestroyed()) return;
+    // IPC 确认后仍可能发生保存或预检失败；只允许同一已校验版本最终进入页面重载。
+    const latest = hotReload.status();
+    if (!latest || latest.kind !== 'renderer' || latest.revision !== revision || !canApplyHotReload() || hotReload.isBusy()) {
+      hotReloadVersions.delete(win);
+      if (latest) sendTo(win, 'app:hot-reload', latest.kind === 'renderer' ? Object.assign({}, latest, { deferred: true }) : latest);
+      return;
+    }
+    win.webContents.reloadIgnoringCache();
+  });
+  return { ok: true };
+});
+
+
 /** 会话键：窗口编号 + 标签页编号。拿不到窗口编号时给空串，小窗侧会丢弃这条 */
 function makeSessionKey(win, tabId) {
   const wid = winIdByWin.get(win);
@@ -273,6 +352,11 @@ function setTurnRunning(win, turnId, on) {
   if (on) s.add(id);
   else s.delete(id);
   if (!s.size) runningByWin.delete(wid);
+  if (!on) {
+    hotReload.flush();
+    const update = hotReload.status();
+    if (update && update.kind === 'renderer') notifyHotReload(update);
+  }
 }
 
 /** 这个窗口还有没有轮次在跑（有就按插话处理，不新起一轮） */
@@ -289,6 +373,19 @@ function broadcastToFloatBars(payload) {
   for (const bar of floatBars) {
     if (bar && typeof bar.pushEvent === 'function') bar.pushEvent(payload);
   }
+}
+
+/**
+ * 销毁悬浮栏实例并从广播注册表移除，避免主进程长期持有已关闭实例的闭包。
+ * @param {object|null} bar 要释放的悬浮栏实例。
+ * @returns {void} 无返回值；重复调用安全，正常窗口关闭和应用退出共用此入口。
+ */
+function destroyFloatBarInstance(bar) {
+  if (!bar) return;
+  if (typeof bar.destroy === 'function') bar.destroy();
+  const index = floatBars.indexOf(bar);
+  if (index >= 0) floatBars.splice(index, 1);
+  if (floatBar === bar) floatBar = null;
 }
 
 /** 余额按来源主窗缓存，切换绑定时恢复该窗口的账户数据；弱引用随主窗释放。 */
@@ -492,7 +589,13 @@ function handleFloatBarAbort(a, b, c) {
   handleChatAbort(target, p.turnId);
 }
 
-function createWindow() {
+/**
+ * 创建主窗并绑定独立的持久化清单身份及本次运行编号。
+ * @param {string} layoutId 冷启动恢复的稳定身份；省略时为用户新开的窗口分配新身份。
+ * @returns {BrowserWindow} 已开始加载生产界面的窗口，关闭时同步登记是否仍需恢复。
+ */
+function createWindow(layoutId) {
+  const layout = layoutId === undefined ? windowLayouts.create() : layoutId;
   // 每个主窗一个身份编号，会话键和轮次归属都靠它分辨，窗口标题也用它
   winSeq += 1;
   const winId = winSeq;
@@ -513,11 +616,16 @@ function createWindow() {
     }
   });
   winIdByWin.set(win, winId);
+  layoutByWin.set(win, layout);
   winById.set(winId, win);
   windows.add(win);
+  // 新窗口本来就读取当前磁盘资源，无须为此前已经发布的版本再重载一次。
+  const initialHotVersion = hotReload.status();
+  if (initialHotVersion && initialHotVersion.kind === 'renderer') hotReloadVersions.set(win, initialHotVersion.revision);
   workspaceByWin.set(win, '');
   win.on('closed', () => {
     diag.log('window', '窗口已关闭');
+    windowLayouts.close(layout, quitting || windows.size === 1);
     longAliveHost.release(win);
     if (screenWatchOwner && screenWatchOwner.win === win) stopScreenRequests();
     stopWorkspaceWatch(win);
@@ -537,7 +645,7 @@ function createWindow() {
     if (boundKey.startsWith(prefix)) boundKey = '';
     broadcastSessions();
     // 主窗全关了就顺手收掉悬浮栏窗口，否则常驻小窗会让 window-all-closed 永远不触发、进程白白挂着
-    if (windows.size === 0 && floatBar) floatBar.destroy();
+    if (windows.size === 0 && floatBar) destroyFloatBarInstance(floatBar);
   });
   win.on('unresponsive', () => diag.log('window', '窗口无响应'));
   win.on('responsive', () => diag.log('window', '窗口恢复响应'));
@@ -560,13 +668,28 @@ function createWindow() {
   return win;
 }
 
+/**
+ * 冷启动或重新激活时按稳定身份恢复原窗口组。
+ * 无参数；首次启动没有登记时创建新主窗，有登记时按原顺序创建对应窗口。
+ * @returns {void} 各主窗自行加载其标签清单；登记读取失败直接报告，不用另一窗口的数据代替。
+ */
+function restoreWindows() {
+  const layouts = windowLayouts.restore();
+  if (!layouts.length) createWindow();
+  else {
+    for (const layout of layouts) createWindow(layout);
+  }
+}
+
 function getWin(e) {
   return BrowserWindow.fromWebContents(e.sender);
 }
 
+/** 返回用户设置及当前显示主题，并派生视频候选项供界面选择；不写入用户配置。 */
 function settingsWithTheme() {
   const s = store.load();
-  return { ...s, resolvedTheme: store.resolveTheme(s.theme) };
+  // 厂商派生的视频选项只给界面选择，密钥仍留在厂商配置中。
+  return { ...s, resolvedTheme: store.resolveTheme(s.theme), videoProviderModels: require('./lib/mxapi').videoModels(s.providers) };
 }
 
 function stopWorkspaceWatch(win) {
@@ -686,6 +809,8 @@ process.on('exit', (code) => diag.log('app', '主进程退出', { code }));
 
 app.on('child-process-gone', (_e, details) => diag.log('crash', '子进程退出', details));
 app.on('before-quit', () => {
+  quitting = true;
+  hotReload.close();
   diag.log('app', '收到退出请求 before-quit');
   longAliveHost.dispose();
   downloader.cancelAll();
@@ -693,7 +818,7 @@ app.on('before-quit', () => {
 });
 app.on('will-quit', () => {
   try { globalShortcut.unregisterAll(); } catch { /* 退出时忽略 */ }
-  if (floatBar) floatBar.destroy();
+  if (floatBar) destroyFloatBarInstance(floatBar);
   releaseFloatBarSlot();
   diag.log('app', '即将退出 will-quit');
 });
@@ -856,6 +981,8 @@ function registerFloatBarIpc() {
     if (!screenWatchOwner && store.load().desktopAlive) startScreenRequests(win, tabId);
     lastActiveKey = key;
     sessionsByKey.set(key, `窗口${wid} · ${title || '对话'}`);
+    // 先公布存活集合，再投递新会话状态，避免首条消息被当作已关闭会话丢弃。
+    broadcastSessions();
     // 只有主窗真的开工（active=true）才把绑定切过来；单纯切标签只更新会话清单，不抢绑定
     if (payload && payload.active === true) {
       boundKey = key;
@@ -865,8 +992,19 @@ function registerFloatBarIpc() {
       }
       pushStartReady(key);
     }
+  }
+  /** 关闭标签时释放该主窗的会话登记与开始选项；广播使桌宠同步回收历史和余额。 */
+  function forgetWindowSession(event, tabId) {
+    const win = getWin(event);
+    const key = makeSessionKey(win, String(tabId));
+    sessionsByKey.delete(key);
+    canStartByKey.delete(key);
+    if (boundKey === key) boundKey = '';
+    if (lastActiveKey === key) lastActiveKey = '';
+    if (lastTabIdByWin.get(win) === String(tabId)) lastTabIdByWin.delete(win);
     broadcastSessions();
   }
+  ipcMain.on('floatbar:forget-session', forgetWindowSession);
   ipcMain.on('floatbar:bind-from-window', noteBindFromWindow);
   ipcMain.handle('floatbar:bind-from-window', (e, payload) => {
     noteBindFromWindow(e, payload);
@@ -1054,6 +1192,21 @@ function claudeInUse(s) {
   ));
 }
 
+function grokInUse(s) {
+  const models = s.models || [];
+  const isGrokModel = (m) => {
+    if (!m || m.type === 'local') return false;
+    const p = (s.providers || []).find((x) => x && x.id === m.providerId);
+    return !!p && apiProtocol.normalizeProtocol(p.protocol) === 'grok';
+  };
+  if (isGrokModel(models.find((m) => m && m.id === s.currentModelId))) return true;
+  return assembly.slotsOf(s).some((slot) => slot && (
+    apiProtocol.normalizeProtocol(slot.protocol) === 'grok'
+    || isGrokModel(models.find((m) => m && m.id === slot.apiId))
+  ));
+}
+
+
 // 配了 Cursor 厂商就在后台预热 SDK，省掉第一次调用的冷启动；等主窗先起来再跑
 function warmUpCursor() {
   try {
@@ -1080,6 +1233,7 @@ function syncCursorDirect() {
     else require('./lib/cursor-direct').closeIdle();
     if (!codexInUse(s)) require('./lib/codex-direct').closeIdle();
     if (!claudeInUse(s)) require('./lib/claude-direct').closeIdle();
+    if (!grokInUse(s)) require('./lib/grok-direct').closeIdle();
   } catch (e) {
     diag.log('cursor', 'Cursor 直通会话整理失败', { message: e && e.message });
   }
@@ -1101,16 +1255,15 @@ app.whenReady().then(async () => {
   // 小窗 IPC 必须赶在建主窗之前登记：主窗一开工就会回报绑定/开工状态，晚登记会漏掉首批消息。
   // 这些通道只用到模块级的表（floatBars / sessionsByKey / winIdByWin 等），不依赖 mySlot、floatBar、shortcutOk
   registerFloatBarIpc();
-  createWindow();
+  restoreWindows();
   warmUpCursor();
-  // 先注册快捷键：是否成功决定小窗要不要留「隐藏」入口，所以要在建小窗之前知道
+  // 全局快捷键直接控制屏幕上的独立输入框，不依赖宠物可见。
   try {
     shortcutOk = globalShortcut.register('CommandOrControl+Alt+Space', function () {
-      if (floatBar) floatBar.toggle();
-      // 快捷键也能改小窗状态，切换完成后补一次广播，主窗那颗「小窗」开关跟着同步
-      if (floatBar) broadcastFloatBarVisibility(floatBarVisibleNow());
+      // 全局快捷键只控制独立输入窗，不改变宠物和主窗「小窗」按钮的状态。
+      if (floatBar) floatBar.toggleInput();
     });
-    if (!shortcutOk) diag.log('floatbar', '全局快捷键 Ctrl+Alt+Space 注册失败，可能已被别的程序占用，小窗不再提供隐藏入口');
+    if (!shortcutOk) diag.log('floatbar', '独立输入框快捷键 Ctrl+Alt+Space 注册失败，可能已被别的程序占用');
   } catch (e) {
     shortcutOk = false;
     diag.log('floatbar', '全局快捷键注册异常', { message: e && e.message });
@@ -1118,36 +1271,40 @@ app.whenReady().then(async () => {
   mySlot = claimFloatBarSlot();
   diag.log('floatbar', `本进程占用悬浮栏槽位 slot-${mySlot}`, { pid: process.pid });
   // 常驻置顶悬浮栏：回调都是主进程已有的逻辑，窗口自己收在 lib/float-bar.js 里
-  floatBar = createFloatBar({
-    slotIndex: mySlot,
-    // 主窗有常备的「小窗」按钮可以随时唤出小窗，所以热键是否注册成功不再决定隐藏入口的有无
-    canHide: true,
-    // 第三位是小窗带来的图片附件清单，原样交给 handleFloatBarSend 去过滤和截断
-    onSend: function (key, text, attachments) { handleFloatBarSend({ key: String(key || ''), text: String(text == null ? '' : text), attachments: attachments }); },
-    onAnswer: function (a, b, c) { handleFloatBarAnswer(a, b, c); },
-    onAbort: function (a, b, c) { handleFloatBarAbort(a, b, c); },
-    // 小窗点「开始」：key 定位会话，value 是用户点的那颗方案字母或勾选项数组，
-    // note 是开工选项下面填的补充说明（空串 = 没填），三个一起透传给 startFromFloatBar
-    onStart: function (key, value, note) {
-      // 兼容两种回调形态：键与值分两个参数传，或整份载荷当一个对象传
-      // value 一律原样往下传：空串是单颗「开始」，数组是多选「一起开工」，
-      // note 同样原样往下传，对象形态里带了就用对象里的，没带就用分参数那一路的
-      // 这里不做任何 String()/join()，一转就把数组压坏了，后面再也分不出勾了哪几项
-      if (key && typeof key === 'object') {
-        const raw = key;
-        const rawKey = raw.key == null ? raw.sessionKey : raw.key;
-        const rawValue = raw.value == null ? value : raw.value;
-        const rawNote = raw.note == null ? note : raw.note;
-        if (floatBarStartHandler) floatBarStartHandler(rawKey, rawValue, rawNote);
-        return;
-      }
-      if (floatBarStartHandler) floatBarStartHandler(key, value, note);
-    },
-    onBind: function (key) { if (floatBarBindHandler) floatBarBindHandler(key); },
-    // 小窗自己收起（点关闭/隐藏）后补一次广播：hide 由 lib/float-bar.js 内部完成，这里只同步主窗那颗开关
-    onHide: function () { broadcastFloatBarVisibility(floatBarVisibleNow()); }
-  });
-  floatBars.push(floatBar);
+  /** 创建当前进程的悬浮栏；macOS 全部窗口关闭后重新激活时复用同一初始化路径。 */
+  function createPrimaryFloatBar() {
+    floatBar = createFloatBar({
+      slotIndex: mySlot,
+      // 主窗有常备的「小窗」按钮可以随时唤出小窗，所以热键是否注册成功不再决定隐藏入口的有无
+      canHide: true,
+      // 第三位是小窗带来的图片附件清单，原样交给 handleFloatBarSend 去过滤和截断
+      onSend: function (key, text, attachments) { handleFloatBarSend({ key: String(key || ''), text: String(text == null ? '' : text), attachments: attachments }); },
+      onAnswer: function (a, b, c) { handleFloatBarAnswer(a, b, c); },
+      onAbort: function (a, b, c) { handleFloatBarAbort(a, b, c); },
+      // 小窗点「开始」：key 定位会话，value 是用户点的那颗方案字母或勾选项数组，
+      // note 是开工选项下面填的补充说明（空串 = 没填），三个一起透传给 startFromFloatBar
+      onStart: function (key, value, note) {
+        // 兼容两种回调形态：键与值分两个参数传，或整份载荷当一个对象传
+        // value 一律原样往下传：空串是单颗「开始」，数组是多选「一起开工」，
+        // note 同样原样往下传，对象形态里带了就用对象里的，没带就用分参数那一路的
+        // 这里不做任何 String()/join()，一转就把数组压坏了，后面再也分不出勾了哪几项
+        if (key && typeof key === 'object') {
+          const raw = key;
+          const rawKey = raw.key == null ? raw.sessionKey : raw.key;
+          const rawValue = raw.value == null ? value : raw.value;
+          const rawNote = raw.note == null ? note : raw.note;
+          if (floatBarStartHandler) floatBarStartHandler(rawKey, rawValue, rawNote);
+          return;
+        }
+        if (floatBarStartHandler) floatBarStartHandler(key, value, note);
+      },
+      onBind: function (key) { if (floatBarBindHandler) floatBarBindHandler(key); },
+      // 小窗自己收起（点关闭/隐藏）后补一次广播：hide 由 lib/float-bar.js 内部完成，这里只同步主窗那颗开关
+      onHide: function () { broadcastFloatBarVisibility(floatBarVisibleNow()); }
+    });
+    floatBars.push(floatBar);
+  }
+  createPrimaryFloatBar();
   // ===== AGI 小窗挪位接口（工具 float_bar_move）=====
   // floatBars 是普通数组（见文件顶部声明），元素就是 lib/float-bar.js 建出来的小窗实例，
   // 实例上已有 isVisible() / ownsWindow() 等方法，挪位由实例自己的 moveToPlace(place) 完成。
@@ -1246,10 +1403,11 @@ app.whenReady().then(async () => {
   // 交给 agent 模块；版本不一致（拿不到 setFloatBarHooks）时静默跳过，不影响小窗本身。
   // 两个回调都用具名函数表达式传，方便在栈里认出是谁调的。
   if (agent && typeof agent.setFloatBarHooks === 'function') {
-    agent.setFloatBarHooks({
+    hotReloadAgentHooks = {
       move: function move(place) { return moveFloatBarsToPlace(place); },
       rects: function rects() { return floatBarRects(); }
-    });
+    };
+    agent.setFloatBarHooks(hotReloadAgentHooks);
   } else {
     diag.log('floatbar', 'agent 模块没有 setFloatBarHooks，AGI 挪小窗能力未注册');
   }
@@ -1257,8 +1415,21 @@ app.whenReady().then(async () => {
   broadcastSessions();
   startClipboardWatch();
   if (store.load().desktopAlive) desktopHand.setAlive(true);
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  // 源码版与发布版均监听程序代码和界面；发布配置使用真实文件目录，避免把 asar 虚拟路径交给 fs.watch。
+  // 外置技能/规则仍读取 APP_ROOT，程序资源仍读取 CODE_ROOT，两类更新沿用同一空闲加载流程。
+  const hotReloadDirectories = [
+    { path: path.join(APP_ROOT, 'skills'), kind: 'data' },
+    { path: path.join(APP_ROOT, 'rules'), kind: 'data' },
+    path.join(CODE_ROOT, 'electron'),
+    path.join(CODE_ROOT, 'renderer'),
+    path.join(CODE_ROOT, 'package.json')
+  ];
+  hotReload.start(hotReloadDirectories);
+  app.on('activate', function activateWindows() {
+    if (BrowserWindow.getAllWindows().length !== 0) return;
+    restoreWindows();
+    createPrimaryFloatBar();
+    broadcastSessions();
   });
 });
 
@@ -1281,7 +1452,12 @@ function modelsDirOf(s) {
   return localLlm.ensureDir(dir);
 }
 
-ipcMain.handle('app:state', async (e) => {
+/**
+ * 返回请求窗口的设置、工作区及稳定标签清单键。
+ * @param {Electron.IpcMainInvokeEvent} e 界面请求事件，用发送者定位对应主窗。
+ * @returns {Promise<object>} 带当前窗口清单键的设置快照；不从运行编号猜测其他窗口的标签。
+ */
+ipcMain.handle('app:state', async function appState(e) {
   const win = getWin(e);
   const s = settingsWithTheme();
   modelCatalogBySender.set(e.sender, structuredClone({ models: s.models, providers: s.providers }));
@@ -1290,10 +1466,25 @@ ipcMain.handle('app:state', async (e) => {
     ...s,
     modelsDir,
     workspace: workspaceByWin.get(win) || '',
+    // 清单绑定跨重启保留的窗口身份，运行编号和多开进程槽位变化不会读到其他窗口的清单。
+    sessionLayoutKey: `spcode:open-tabs:${layoutByWin.get(win)}`,
     appRoot: APP_ROOT,
     localFiles: listLocalFilesEnriched(modelsDir),
     assemblyKey: assembly.assemblyKey(s)
   };
+});
+
+/**
+ * 保存界面请求的自动保存开关。
+ * @param {Electron.IpcMainInvokeEvent} event 请求来源，由Electron传入，不改变其他窗口的内存状态。
+ * @param {boolean} enabled 用户在界面选择的开关值。
+ * @returns {boolean} 返回实际写入设置的值；标签与会话内容由调用方在开启后使用原保存入口落盘。
+ */
+ipcMain.handle('app:autoSave', function setAutoSave(event, enabled) {
+  const settings = store.load();
+  settings.autoSave = enabled;
+  store.save(settings);
+  return settings.autoSave;
 });
 
 /** 保存引导完成状态；只更新该标记，不改已有模型、供应商或会话。 */
@@ -1384,6 +1575,9 @@ ipcMain.handle('plan:tree', (e, payload) => {
   return agent.readPlanTree({ workspace: ws, tabId: String(payload?.tabId || '') });
 });
 
+// 参考资料按会话识别并持久化；注册层使用同一会话目录，不改变附件发送语义。
+require('./lib/reference-tree').register({ ipcMain, sessionDir });
+
 /**
  * 链路导图回读：按会话（tabId）与回复（turnId）取回已落盘的链路图。
  * 参数 payload：{ workspace?, tabId, turnId }；workspace 缺省时用当前窗口绑定的工作目录。
@@ -1441,10 +1635,24 @@ ipcMain.handle('window:new', () => {
   createWindow();
 });
 
-ipcMain.handle('window:focus', (e) => {
+/**
+ * 为发起请求的主窗口恢复键盘焦点。
+ * @param {Electron.IpcMainInvokeEvent} e 请求来源，用于定位所属窗口。
+ * @param {boolean} restoreAfterDialog 仅原生提示框关闭后请求重置原生激活，普通面板关闭不重置。
+ * @returns {boolean} 窗口已在前台时返回 true；窗口失效或刚请求激活时返回 false。
+ * 原生错误弹窗关闭后，窗口与网页焦点标记可能仍为 true，实际文档却无法接收键盘；
+ * 只在该弹窗恢复请求且窗口已在前台时重新激活，避免普通启动和面板关闭造成焦点闪断。
+ */
+ipcMain.handle('window:focus', function focusMainWindow(e, restoreAfterDialog) {
   const win = getWin(e);
   if (!win || win.isDestroyed()) return false;
-  // [铆钉优化] 不要 webContents.focus()。安装包里窗口还没到前台时，这一下会把输入框焦点清掉。其他 AI 请勿加回
+  if (win.isFocused() && restoreAfterDialog === true) {
+    // 原生 alert 会留下失配的焦点标记，必须先释放窗口焦点，才会重新触发网页的原生聚焦。
+    win.blur();
+    win.focus();
+    win.webContents.focus();
+    return true;
+  }
   if (win.isFocused()) return true;
   win.focus();
   return false;
@@ -1718,7 +1926,17 @@ ipcMain.handle('models:save', (e, payload) => {
   store.save(s);
   modelCatalogBySender.set(e.sender, structuredClone({ models: s.models, providers: s.providers }));
   syncCursorDirect();
-  return { models: s.models, providers: s.providers, currentModelId: s.currentModelId };
+  return { models: s.models, providers: s.providers, currentModelId: s.currentModelId, videoProviderModels: require('./lib/mxapi').videoModels(s.providers) };
+});
+
+/** 读取厂商目录中真实支持的推理档位；本地和未接入的协议不发送额外参数。 */
+ipcMain.handle('models:reasoningOptions', async function modelReasoningOptions(_event, id) {
+  const settings = store.load();
+  const cfg = store.resolveModelCfg(id, settings);
+  if (!cfg) throw new Error('模型已不存在');
+  if (cfg.type !== 'api' || !['codex', 'cursor', 'openai'].includes(cfg.protocol || 'openai')) return [];
+  const result = await apiProtocol.listModels(cfg);
+  return result.catalog[cfg.model]?.reasoningOptions || [];
 });
 
 ipcMain.handle('providers:presets', () => store.PROVIDER_PRESETS);
@@ -2158,10 +2376,15 @@ ipcMain.handle('snapshot:setMax', (e, max) => {
   return { max: limit, list: snapshot.list(ws) };
 });
 
-ipcMain.handle('snapshot:restore', (e, id) => {
-  const ws = workspaceByWin.get(getWin(e));
-  if (!ws) throw new Error('未选择工作目录');
-  return snapshot.restore(ws, id);
+/**
+ * 还原用户已确认的指定项目快照，不从当前前台窗口推断快照归属。
+ * @param {object} _e IPC 发送事件；项目由确认动作捕获的 payload.workspace 明确指定。
+ * @param {{id: string, workspace: string}} payload 快照编号与所属工作区。
+ * @returns {object} snapshot.restore 的实际处理结果；缺少工作区或处理失败继续向调用方报告。
+ */
+ipcMain.handle('snapshot:restore', function restoreOwnedSnapshot(_e, payload) {
+  if (!payload.workspace) throw new Error('未选择工作目录');
+  return snapshot.restore(payload.workspace, payload.id);
 });
 
 ipcMain.handle('snapshot:undo', (e, id) => {
@@ -2603,6 +2826,7 @@ function handleChatAnswer(win, payload) {
   // [铆钉优化] 多个标签页同时在等回答时，只按本轮编号交付，不猜「最后一个」，免得答案串到别的标签页。其他 AI 请勿加回兜底
   const pending = id ? asks.get(id) : (asks.size === 1 ? [...asks.values()][0] : null);
   if (!pending) return false;
+  if (pending.archive) pending.archive.record('user-answer', { answer });
   for (const [k, v] of asks) {
     if (v === pending) asks.delete(k);
   }
@@ -2678,6 +2902,14 @@ ipcMain.handle('chat:send', async (e, payload) => {
   // 这一轮挂在哪个窗口的哪个标签页上：渲染层没上报 tabId 时用该窗口上次上报的标签页兜底，
   // 否则事件键会变成「窗口N:」，与小窗的绑定键对不上，不新增协议字段
   const tabId = resolveTurnTabId(win, payload);
+  // 内部开关严格为 true 才采集；关闭时不创建目录，不写任何训练档案。
+  let archive = null;
+  if (!app.isPackaged && s.trainingDataEnabled === true) {
+    archive = trainingArchive.create(s.trainingDataDir, tabId, turnId, {
+      workspace: ws, windowId: winIdByWin.get(win), model: trainingArchive.modelIdentity(modelCfg), request: payload
+    });
+    await archive.flush();
+  }
   if (turnId) {
     abortMap(win).set(turnId, ctl);
     turnOwner.set(turnId, { win, tabId });
@@ -2689,8 +2921,11 @@ ipcMain.handle('chat:send', async (e, payload) => {
   const order = store.load().skillOrder || [];
   const skills = agent.listSkills(APP_ROOT, ws, order);
   const allSkills = skillsLib.listDetailed(path.join(APP_ROOT, 'skills'), ws, order);
-  /** 聊天事件维持原出口，动作专用元数据只转给桌宠，避免重复插入消息。 */
+  let turnOutcome = 'success';
+  /** 聊天事件维持原出口，训练状态同时保留未抛异常的错误事件。 */
   function onEvent(ev) {
+    if (ev.type === 'error') turnOutcome = 'error';
+    if (archive) archive.record('event', ev);
     if (!ev.activityOnly) sendTo(win, 'chat:event', turnId ? { ...ev, turnId } : ev);
     forwardTurnEventToFloatBar(ev, turnId);
   }
@@ -2742,15 +2977,15 @@ ipcMain.handle('chat:send', async (e, payload) => {
       onAbort();
       return;
     }
-    pendingAskMap(win).set(turnId, { resolve, reject, ask });
+    pendingAskMap(win).set(turnId, { resolve, reject, ask, archive });
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
   });
   setTurnRunning(win, turnId, true);
   // 轮次状态按会话发送，其他标签页运行不会影响本会话的结束展示。
-  let turnOutcome = 'success';
   broadcastToFloatBars({ kind: 'turn-start', turnId, sessionKey: makeSessionKey(win, tabId) });
   try {
-    const result = await contextPreview.run(turnId, () => agent.runTurn({
+    /** 上下文预览与训练采集共享同一轮异步边界。 */
+    function executeAgent() { return agent.runTurn({
       workspace: ws,
       appRoot: APP_ROOT,
       modelCfg,
@@ -2776,10 +3011,15 @@ ipcMain.handle('chat:send', async (e, payload) => {
       maxAgentRounds: payload.maxAgentRounds,
       unlimitedRounds: !!payload.unlimitedRounds,
       interjectKey: makeSessionKey(win, resolveTurnTabId(win, payload)),
-    }));
+      turnId,
+    }); }
+    function executeWithArchive() { return trainingArchive.run(archive, executeAgent); }
+    const result = await contextPreview.run(turnId, executeWithArchive);
+    if (archive) archive.record('turn-result', result);
     return result;
   } catch (err) {
     turnOutcome = ctl.signal.aborted || err.name === 'AbortError' ? 'stopped' : 'error';
+    if (archive) archive.record('turn-error', trainingArchive.errorData(err));
     diag.log('agent', '本轮失败', { message: err && err.message });
     const msg = /No sequences left/i.test(String(err && err.message))
       ? '本地模型上下文占满了。请新开一个对话再试，或把过长的历史清掉。'
@@ -2797,6 +3037,8 @@ ipcMain.handle('chat:send', async (e, payload) => {
     if (!turnIsRunning(win)) {
       broadcastToFloatBars({ kind: 'idle', turnId, sessionKey: makeSessionKey(win, tabId) });
     }
+    // 返回界面前确认全部事件落盘；写入失败明确报错，不冒充采集成功。
+    if (archive) await archive.finish(turnOutcome);
   }
 });
 

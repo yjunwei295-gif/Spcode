@@ -50,6 +50,8 @@ async function open({workspace,manifest,owner,theme}){
   for(const ctx of contexts.values()){
     if(ctx.workspace===workspace&&ctx.item.manifest===item.manifest){
       ctx.item=item;
+      // 再次打开同一作品时继承主窗当前主题，包括独立的锐线赛璐璐主题。
+      ctx.theme=theme;
       await reload(ctx);
       ctx.win.webContents.send('artifact:updated',stateOf(ctx));
       ctx.win.show();ctx.win.focus();return ctx;
@@ -72,21 +74,36 @@ async function open({workspace,manifest,owner,theme}){
   const recordFile=path.join(workspace,item.manifest);
   fs.watchFile(source,{interval:SOURCE_WATCH_INTERVAL_MS,persistent:false},sourceChanged);
   fs.watchFile(recordFile,{interval:SOURCE_WATCH_INTERVAL_MS,persistent:false},sourceChanged);
-  function closed(){
+  let cleaned=false;
+  /**
+   * 释放作品窗口及其文件监听、导出任务和上下文登记。
+   * @returns {void} 无返回值；重复调用不会重复关闭资源。
+   */
+  function cleanup(){
+    if(cleaned)return;
+    cleaned=true;
     fs.unwatchFile(source,sourceChanged);
     fs.unwatchFile(recordFile,sourceChanged);
     if(ctx.exporting)ctx.exporting.abort();
     if(!view.webContents.isDestroyed())view.webContents.close();
     contexts.delete(ctx.id);
   }
+  function closed(){cleanup();}
   win.on('closed',closed);
-  await win.loadFile(path.join(__dirname,'../../renderer/artifact.html'));
-  // 可见窗口先显示再等待绘制帧；隐藏的普通子视图不会提交 RAF，反过来等待会卡住打开。
-  win.show();
-  ctx.ready=loadPage(ctx);
-  await ctx.ready;
-  view.setBackgroundColor('#00000000');
-  return ctx;
+  try{
+    await win.loadFile(path.join(__dirname,'../../renderer/artifact.html'));
+    // 可见窗口先显示再等待绘制帧；隐藏的普通子视图不会提交 RAF，反过来等待会卡住打开。
+    win.show();
+    ctx.ready=loadPage(ctx);
+    await ctx.ready;
+    view.setBackgroundColor('#00000000');
+    return ctx;
+  }catch(error){
+    // 首次加载失败时不会可靠触发 closed，必须主动解除监听并销毁窗口，避免孤儿 context 留在全局表中。
+    cleanup();
+    if(!win.isDestroyed())win.destroy();
+    throw error;
+  }
 }
 
 /** 只接受作品工具栏自己的 IPC；作品 WebContentsView 没有这份 preload。 */
