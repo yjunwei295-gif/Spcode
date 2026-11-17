@@ -13,6 +13,11 @@ const hotReload = require('./lib/hot-reload').createHotReload({
   afterReload: restoreHotReloadHooks
 });
 const store = require('./lib/store');
+const externalLinks = require('./lib/external-links');
+/** 所有应用窗口创建时接入系统浏览器；隐藏渲染器仍可保留自己拒绝新窗的处理。 */
+app.on('web-contents-created', function bindDefaultBrowser(_event, contents) {
+  externalLinks.bindExternalLinks(contents);
+});
 const { mergeCatalogEdits } = require('./lib/model-catalog');
 // 每个渲染窗口保留它最后收到的目录快照，用来区分用户编辑和过期的本地副本。
 const modelCatalogBySender = new WeakMap();
@@ -1821,6 +1826,19 @@ ipcMain.handle('workspace:read', async (e, rel) => {
     };
   }
   return readForPreview(ws || path.dirname(abs), rel || '');
+});
+
+/**
+ * 用系统默认程序启动文件树选中的本地文件。
+ * 相对路径沿用发送窗口的项目归属，附加目录使用树内的绝对路径；系统拒绝时原样返回错误。
+ */
+ipcMain.handle('shell:openFile', async function openWorkspaceFile(event, rel) {
+  const ws = workspaceByWin.get(getWin(event)) || '';
+  if (!ws && !isAbsPath(rel)) throw new Error('未打开项目');
+  const abs = resolveRead(ws, extraRoots(APP_ROOT, ws), rel);
+  const error = await shell.openPath(abs);
+  if (error) throw new Error(error);
+  return true;
 });
 
 ipcMain.handle('shell:showInFolder', (e, rel) => {

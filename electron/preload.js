@@ -119,6 +119,8 @@ const api = {
   listFiles: (query, extraFolders) => ipcRenderer.invoke('workspace:files', { query, extraFolders }),
   listChildren: (rel, root, absolute) => ipcRenderer.invoke('workspace:children', { rel, root, absolute }),
   readWorkspaceFile: (rel) => ipcRenderer.invoke('workspace:read', rel),
+  /** 请求系统启动文件树选中的文件；相对路径按所属窗口项目解析，失败保持 Promise 拒绝。 */
+  openWorkspaceFile: function openWorkspaceFile(rel) { return ipcRenderer.invoke('shell:openFile', rel); },
   showInFolder: (rel) => ipcRenderer.invoke('shell:showInFolder', rel),
   filePreview: (abs) => ipcRenderer.invoke('file:preview', abs),
   // 作品清单与预览只使用当前主窗绑定的项目。

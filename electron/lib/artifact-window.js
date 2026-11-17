@@ -63,7 +63,8 @@ async function open({workspace,manifest,owner,theme}){
   function denyPermission(_contents,_permission,callback){callback(false);}
   isolated.setPermissionRequestHandler(denyPermission);
   const view=new WebContentsView({webPreferences:{session:isolated,nodeIntegration:false,contextIsolation:true,sandbox:true,backgroundThrottling:false}});
-  function denyWindow(){return {action:'deny'};}
+  /** 可见作品的网页链接交给系统浏览器，其余新窗继续保持原有拒绝策略。 */
+  function denyWindow(details){require('./external-links').openExternalPopup(details);return {action:'deny'};}
   view.webContents.setWindowOpenHandler(denyWindow);
   // 首帧提交后再设置透明背景，避免空白的透明子视图在显示前停止绘制。
   win.contentView.addChildView(view);

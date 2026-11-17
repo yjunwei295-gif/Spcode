@@ -4039,7 +4039,22 @@ function closeCodePreview() {
 }
 
 /**
- * 在侧栏只读预览文件；本地链接与资源树共用同一入口。
+ * 打开文件树选中的文件，可启动格式交给系统，其他文件继续只读预览。
+ * @param {string} rel 文件树保留的项目相对路径或附加目录绝对路径。
+ * @returns {Promise<void>} 系统打开或预览完成后兑现；系统启动失败原样上报，不回退成详情。
+ * 此入口仅用于文件树普通点击，Ctrl 引用和聊天本地文件链接保持各自原有行为。
+ */
+async function openTreeFile(rel) {
+  const extension = rel.slice(rel.lastIndexOf('.')).toLowerCase();
+  if (['.html', '.htm', '.bat', '.cmd', '.exe'].includes(extension)) {
+    await api.openWorkspaceFile(rel);
+    return;
+  }
+  await openCodePreview(rel);
+}
+
+/**
+ * 在侧栏只读预览文件；聊天本地链接及文件树的非启动格式共用此入口。
  * 图片、视频、文档及文本展示内容，二进制展示元信息；读取失败保留实际错误，不执行文件。
  */
 async function openCodePreview(rel) {
@@ -7817,7 +7832,8 @@ function bind() {
     side.classList.toggle('hidden', !state.sidebar);
     if (!state.sidebar) focusComposer();
   };
-  $('tree-body').onclick = async (e) => {
+  /** 文件树普通点击按文件类型打开，Ctrl 点击仍只添加上下文引用。 */
+  $('tree-body').onclick = async function onTreeClick(e) {
     const rm = e.target.closest('[data-rm-folder]');
     if (rm) {
       e.preventDefault();
@@ -7848,7 +7864,7 @@ function bind() {
     if (file) {
       const rel = decodeURIComponent(file);
       if (e.ctrlKey) addContextPath(rel);
-      else await openCodePreview(rel);
+      else await openTreeFile(rel);
     }
   };
   $('tree-body').oncontextmenu = (e) => {

@@ -68,7 +68,7 @@ async function main() {
   fs.writeFileSync(path.join(output, imageRel), png.toPNG());
   const binary = path.join(output, binaryRel);
   const executable = appRoot === root
-    ? path.join(root, 'generated/release-input-memory-20261111/win-unpacked/SimpleCode.exe')
+    ? path.join(root, require('../package.json').build.directories.output, 'win-unpacked', 'SimpleCode.exe')
     : path.join(path.dirname(path.dirname(appRoot)), 'SimpleCode.exe');
   const meta = workspaceApi.readForPreview(root, executable);
   check(meta.kind === 'binary' && meta.size === fs.statSync(executable).size && !('content' in meta), '真实大型 EXE 只返回元信息，不传送完整二进制内容');
@@ -80,7 +80,7 @@ async function main() {
   const start = fixture.indexOf('function fullPageSetup() {');
   const end = fixture.indexOf('\n/**', start);
   assert.ok(start >= 0 && end > start);
-  const setup = fixture.substring(start, end) + '\nfullPageSetup();const originalState=simple.getState;simple.getState=async function(){const s=await originalState();s.workspace=' + JSON.stringify(output) + ';return s;};simple.readWorkspaceFile=fileFixture.read;simple.showInFolder=fileFixture.reveal;window.findFileLink=function(label){for(const a of document.querySelectorAll("#messages a")){if(a.textContent===label)return a;}throw Error("链接不存在："+label);};';
+  const setup = fixture.substring(start, end) + '\nfullPageSetup();simple.onHotReload=function onHotReload(){return function unsubscribe(){};};simple.hotReloadStatus=async function hotReloadStatus(){return null;};simple.hotReloadReady=async function hotReloadReady(){return false;};const originalState=simple.getState;simple.getState=async function(){const s=await originalState();s.workspace=' + JSON.stringify(output) + ';return s;};simple.readWorkspaceFile=fileFixture.read;simple.showInFolder=fileFixture.reveal;window.findFileLink=function(label){for(const a of document.querySelectorAll("#messages a")){if(a.textContent===label)return a;}throw Error("链接不存在："+label);};';
   await win.loadURL('about:blank');
   win.webContents.debugger.attach('1.3');
   await win.webContents.debugger.sendCommand('Page.enable');
