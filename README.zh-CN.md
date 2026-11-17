@@ -4,7 +4,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) · [下载 Windows 安装包](https://github.com/yjunwei295-gif/Spcode/releases/latest) · [中文逐步操作手册](docs/user-guide.zh-CN.md) · [Detailed English user guide](docs/user-guide.en.md)
 
-当前版本：**1.0.5，Windows 10/11 x64**。安装包包含应用运行时，普通用户无需安装 Node.js；模型账号、API 额度、本地模型权重需要另行配置。
+当前版本：**1.0.6，Windows 10/11 x64**。安装包包含应用运行时，普通用户无需安装 Node.js；模型账号、API 额度、本地模型权重需要另行配置。
 
 ## 这个软件到底是做什么的？
 
@@ -48,6 +48,13 @@ SimpleCode 把聊天窗口与电脑上的项目目录连接起来。你说清需
 | 桌宠 | 任务状态、聊天、换肤、缩放与眼镜双轴微调 | 点击“宠物”，在外观菜单设置 |
 | 工作流定制 | 技能、规则、人设、历史、快照、里程碑 | 在应用内配置并检查默认内容 |
 
+## 1.0.6 更新内容
+
+- 文件树中的 HTML/HTM、BAT/CMD 和 EXE 交给系统默认程序打开；其他文件继续预览，Ctrl 点击仍只添加上下文。
+- 主窗口和作品页面中的网页链接交给系统默认浏览器，保留应用当前页面。
+
+验收范围见 [1.0.6 验证记录](docs/release-1.0.6-verification.md)。
+
 ## 1.0.5 更新内容
 
 - **重开恢复会话**：完整退出再打开后恢复标签顺序、当前标签和草稿，各窗口分别保存清单。
@@ -86,18 +93,14 @@ SimpleCode 把聊天窗口与电脑上的项目目录连接起来。你说清需
 
 1. 打开 [Releases](https://github.com/yjunwei295-gif/Spcode/releases/latest)。
 2. 如果附件折叠，展开 **Assets**。
-3. 下载 **`SimpleCode-Setup-1.0.5.exe`**；“Source code”压缩包是源码，不是安装程序。
+3. 下载 **`SimpleCode-Setup-1.0.6.exe`**；“Source code”压缩包是源码，不是安装程序。
 4. 更新前完整退出旧程序，包括仍在运行的桌宠实例。
 5. 运行安装程序，按向导选择安装位置；更新时使用原安装目录。
 6. 从快捷方式启动 **SimpleCode**。
 7. 右上角可切换 **中文 / EN**。部分新面板仍保留中文，英文手册已注明对应原文。
 8. 配好模型后，再发送项目任务。
 
-安装包约 670 MiB，不包含模型权重；发布附件同时提供免安装的便携版。1.0.5 安装包 SHA256：
-
-```text
-b119dfea6beb84fe33c8477badd9912ea8cbc3e32a22bd66a638bd80cfc7d1b0
-```
+安装包约 670 MiB，不包含模型权重；发布附件同时提供免安装的便携版。两种 EXE 的 SHA256 见 [SHA256SUMS.txt](https://github.com/yjunwei295-gif/Spcode/releases/download/v1.0.6/SHA256SUMS.txt)。
 
 首次安装的每一步及预期画面见[安装与首次启动](docs/user-guide.zh-CN.md#s2)。
 

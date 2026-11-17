@@ -4,7 +4,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) · [Download Windows installer](https://github.com/yjunwei295-gif/Spcode/releases/latest) · [Detailed English user guide](docs/user-guide.en.md) · [中文逐步操作手册](docs/user-guide.zh-CN.md)
 
-Current release: **1.0.5 · Windows 10/11 x64**. The installer includes the application runtime. You do not need Node.js to use the installer. AI accounts, API credits and local model weights are configured separately.
+Current release: **1.0.6 · Windows 10/11 x64**. The installer includes the application runtime. You do not need Node.js to use the installer. AI accounts, API credits and local model weights are configured separately.
 
 ## What is this application for?
 
@@ -48,6 +48,13 @@ For example, after opening a game project, you can ask: “Find why the camera j
 | Desktop pet | Task activity, expandable chat, skins, scale and glasses X/Y adjustment | Use the Pet button; choose appearance settings |
 | Personal workflow | Skills, rules, persona, chat history, snapshots and milestones | Configure these in the app; review the defaults |
 
+## New in 1.0.6
+
+- Open HTML/HTM, BAT/CMD and EXE files from the file tree with their system default applications. Other files still use the existing preview; Ctrl-click still adds context.
+- Open web links from the main window and artifact pages in the system default browser while keeping the application page intact.
+
+See the [1.0.6 verification record](docs/release-1.0.6-verification.md).
+
 ## New in 1.0.5
 
 - **Session restoration:** preserve open tabs, their order, the active tab and drafts across a full exit and restart, with separate layouts for each window.
@@ -86,18 +93,14 @@ Read the [complete English guide](docs/user-guide.en.md) for each feature's actu
 
 1. Open [Releases](https://github.com/yjunwei295-gif/Spcode/releases/latest).
 2. Expand **Assets** if necessary.
-3. Download **`SimpleCode-Setup-1.0.5.exe`** for the installer. GitHub's “Source code” archives are not installers.
+3. Download **`SimpleCode-Setup-1.0.6.exe`** for the installer. GitHub's “Source code” archives are not installers.
 4. Fully exit an older running instance before installing an update.
 5. Run the installer and select the destination when asked. For an update, use the existing installation directory.
 6. Start **SimpleCode** from the shortcut.
 7. Click **EN** at the upper right for English. Some newer panels still contain Chinese labels; the English guide gives the original labels alongside their meanings.
 8. Configure a model before sending your first project request.
 
-The installer is approximately 670 MiB. Model weights are not included. A portable executable is also available in the release assets. The 1.0.5 installer SHA256 is:
-
-```text
-b119dfea6beb84fe33c8477badd9912ea8cbc3e32a22bd66a638bd80cfc7d1b0
-```
+The installer is approximately 670 MiB. Model weights are not included. A portable executable is also available in the release assets. Check both executables against [SHA256SUMS.txt](https://github.com/yjunwei295-gif/Spcode/releases/download/v1.0.6/SHA256SUMS.txt).
 
 For every individual click, field and expected result, follow [Installation and first run](docs/user-guide.en.md#s2).
 
