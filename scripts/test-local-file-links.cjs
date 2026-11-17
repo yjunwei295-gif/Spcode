@@ -80,6 +80,7 @@ async function main() {
   const start = fixture.indexOf('function fullPageSetup() {');
   const end = fixture.indexOf('\n/**', start);
   assert.ok(start >= 0 && end > start);
+  // 本测试不发送热更新通知；补齐当前页面所需的订阅、状态和确认接口，不伪造可重载版本。
   const setup = fixture.substring(start, end) + '\nfullPageSetup();simple.onHotReload=function onHotReload(){return function unsubscribe(){};};simple.hotReloadStatus=async function hotReloadStatus(){return null;};simple.hotReloadReady=async function hotReloadReady(){return false;};const originalState=simple.getState;simple.getState=async function(){const s=await originalState();s.workspace=' + JSON.stringify(output) + ';return s;};simple.readWorkspaceFile=fileFixture.read;simple.showInFolder=fileFixture.reveal;window.findFileLink=function(label){for(const a of document.querySelectorAll("#messages a")){if(a.textContent===label)return a;}throw Error("链接不存在："+label);};';
   await win.loadURL('about:blank');
   win.webContents.debugger.attach('1.3');

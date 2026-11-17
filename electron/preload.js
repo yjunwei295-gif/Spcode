@@ -119,7 +119,10 @@ const api = {
   listFiles: (query, extraFolders) => ipcRenderer.invoke('workspace:files', { query, extraFolders }),
   listChildren: (rel, root, absolute) => ipcRenderer.invoke('workspace:children', { rel, root, absolute }),
   readWorkspaceFile: (rel) => ipcRenderer.invoke('workspace:read', rel),
-  /** 请求系统启动文件树选中的文件；相对路径按所属窗口项目解析，失败保持 Promise 拒绝。 */
+  /**
+   * 请求系统启动文件树选中的文件，相对路径按所属窗口项目解析。
+   * @returns {Promise<true>} 系统成功打开文件时兑现为 true；失败保持 Promise 拒绝。
+   */
   openWorkspaceFile: function openWorkspaceFile(rel) { return ipcRenderer.invoke('shell:openFile', rel); },
   showInFolder: (rel) => ipcRenderer.invoke('shell:showInFolder', rel),
   filePreview: (abs) => ipcRenderer.invoke('file:preview', abs),

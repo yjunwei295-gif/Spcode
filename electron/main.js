@@ -1831,6 +1831,7 @@ ipcMain.handle('workspace:read', async (e, rel) => {
 /**
  * 用系统默认程序启动文件树选中的本地文件。
  * 相对路径沿用发送窗口的项目归属，附加目录使用树内的绝对路径；系统拒绝时原样返回错误。
+ * @returns {Promise<true>} 系统成功打开文件时兑现为 true；路径解析或系统启动失败时拒绝。
  */
 ipcMain.handle('shell:openFile', async function openWorkspaceFile(event, rel) {
   const ws = workspaceByWin.get(getWin(event)) || '';

@@ -172,6 +172,10 @@ async function main() {
   check(report.urls[before] === 'mailto:fixture@example.invalid?subject=test', '原有邮件链接交给系统邮件程序');
   const resourceCount = report.urls.length;
   await page('fetch(' + JSON.stringify(baseUrl + '/fetch-resource') + ').then(function received(response){return response.text();})');
+  /**
+   * 只读检查本机服务器是否收到主页面的网络资源请求，供等待条件使用。
+   * @returns {boolean} 已记录 /fetch-resource 请求时返回 true，否则返回 false。
+   */
   function resourceLoaded() { return report.requests.includes('/fetch-resource'); }
   await waitFor(resourceLoaded, '页面网络资源加载');
   check(report.urls.length === resourceCount, '网页子资源仍在原页面加载，不误唤起浏览器');
@@ -183,6 +187,10 @@ async function main() {
   await verifyWebRoutes(ctx.view.webContents, '作品页面');
   const frameUrls = report.urls.length;
   await ctx.view.webContents.executeJavaScript('(function(){const frame=document.createElement("iframe");frame.src=' + JSON.stringify(baseUrl + '/frame-resource') + ';document.body.appendChild(frame);return true;})()');
+  /**
+   * 只读检查本机服务器是否收到作品 iframe 的子页面请求，供等待条件使用。
+   * @returns {boolean} 已记录 /frame-resource 请求时返回 true，否则返回 false。
+   */
   function frameLoaded() { return report.requests.includes('/frame-resource'); }
   await waitFor(frameLoaded, '作品子页面加载');
   check(report.urls.length === frameUrls, '作品 iframe 子页面仍在内部加载，不误转系统浏览器');
