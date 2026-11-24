@@ -215,6 +215,17 @@ async function listWindows() {
 }
 
 /**
+ * 在 Windows 窗口清单中按句柄定位录屏目标，保留被遮挡的窗口和本进程窗口。
+ * @param {string} hwnd 已校验的十进制原生窗口句柄。
+ * @returns {Promise<object|undefined>} 找到时返回原始标题及最小化状态；窗口不存在时返回 undefined，查询错误直接上报。
+ */
+async function windowForCapture(hwnd) {
+  const result = await winInput({ op: 'windows' });
+  if (!result.ok) throw new Error(result.message);
+  return result.windows.find(function matches(window) { return window.hwnd === hwnd; });
+}
+
+/**
  * 读取真正前台窗口的身份、客户区和所属显示器的物理屏幕边界。
  * 客户区与 monitor 均保留 Win32 坐标，不做 DIP 转换；裁剪端通过显示器原点定位截图，
  * 再按物理屏幕尺寸与实际缩略图尺寸换算像素，避免混用不同 DPI 屏幕的逻辑坐标；查询失败直接抛出。
@@ -613,6 +624,10 @@ function nameSightFile(abs, visionText) {
   return next;
 }
 
+/**
+ * 保存眼睛实际要看的屏幕像素，使用当前目标显示器。
+ * @returns {Promise<object>} 成功时返回 PNG 路径和显示器原点。AGI 未开启或采集失败时返回原因。
+ */
 async function captureScreen() {
   const denied = gate();
   if (denied) return { ok: false, message: denied };
@@ -623,24 +638,11 @@ async function captureScreen() {
   try { shot = await screenText.captureDisplay(displayForCapture(), 2048); }
   catch (err) { return { ok: false, message: err && err.message ? err.message : '没有截到屏幕' }; }
   const dir = sightDir();
-  const abs = path.join(dir, `${stamp()}-画面.png`);
+  // 同秒内的不同截图各自留存，避免看图时读到另一次调用的文件。
+  const abs = path.join(dir, `${stamp()}-画面-${require('node:crypto').randomUUID()}.png`);
   fs.writeFileSync(abs, shot.image.toPNG());
   pruneSight(dir);
-  // 同一块屏幕顺带做一次文字识别，让看图结果和可点击坐标对得上同一帧
-  let frame = null;
-  try { frame = await screenText.observe({ force: true }); } catch (err) {
-    return { ok: false, message: `本地 OCR 识别失败：${err && err.message ? err.message : err}` };
-  }
-  return {
-    ok: true,
-    path: abs,
-    width: shot.dipWidth,
-    height: shot.dipHeight,
-    originX: shot.originX,
-    originY: shot.originY,
-    frameId: frame ? frame.id : '',
-    text: frame ? screenText.formatBlock(frame) : '【屏幕文字】本地 OCR 未能返回识别结果。'
-  };
+  return { ok: true, path: abs, originX: shot.originX, originY: shot.originY };
 }
 
 function importClipboardImage() {
@@ -657,7 +659,7 @@ function importClipboardImage() {
 }
 
 module.exports = {
-  isAlive, isBusy, setAlive, hold, release, noteLook, currentFrame, listWindows, scanControls, foregroundWindow, readRuntimeState, runtimeEpoch,
+  isAlive, isBusy, setAlive, hold, release, noteLook, currentFrame, listWindows, windowForCapture, scanControls, foregroundWindow, readRuntimeState, runtimeEpoch,
   assessRisk, allowRiskyThisTurn, controlLabel, TYPE_ZH,
   clickAt, dragStroke, scrollAt, typeText, tapKeys, windowList, windowFocus, uiAct,
   captureScreen, importClipboardImage, nameSightFile

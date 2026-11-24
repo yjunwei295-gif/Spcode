@@ -16,6 +16,8 @@ const root = path.resolve(__dirname, '..');
 const output = fs.mkdtempSync(path.join(root, 'generated', 'runtime-native-'));
 app.setPath('userData', path.join(output, 'user-data'));
 let checks = 0;
+/** 统一关闭原生帮助进程和测试夹具，首条回包尚未到达时也可以由看门狗调用。 */
+let stopNative;
 const failures = [];
 process.on('unhandledRejection', unhandled);
 /** 异步错误必须令验收失败。 */
@@ -57,6 +59,11 @@ function fixture() {
   function errorText(chunk) { stderr += chunk; }
   function failed(error) { while (waiters.length) waiters.shift().reject(error); }
   function exited(code) { failed(new Error('Fixture exited ' + code + ': ' + stderr)); }
+  /**
+   * 按换行组装原生夹具的 JSON 回包，将未收齐的一行留到下一次读取。
+   * @param {Buffer} chunk 本次标准输出数据块，可以包含零条或多条完整回包。
+   * @returns {void} 向等待者交付回包或错误，尚无等待者时暂存完整回包。
+   */
   function receive(chunk) {
     buffer += chunk.toString('utf8');
     let end;
@@ -86,15 +93,32 @@ async function main() {
   desktop.setAlive(true);
   const agent = loadAgent(desktop);
   const sample = fixture();
-  const data = await sample.ready;
-  const owner = { readOnly: false };
-  const events = [];
-  function event(value) { events.push(value); }
-  async function run(args, signal) {
-    return JSON.parse(await agent.executeRuntimeTest(root, owner, 'runtime_state', args, event, [], signal, {}));
-  }
-  const target = { pid: data.pid, hwnd: data.hwnd };
+  /** 关闭生产原生帮助进程并向实际 PowerShell 夹具发送终止请求。 */
+  stopNative = function stopNativeResources() {
+    desktop.setAlive(false);
+    sample.child.kill();
+  };
+  await verify(desktop, agent, sample);
+  app.quit();
+}
+
+/**
+ * 核对生产工具返回的窗口、控件、内存状态及实际等待。
+ * @param {object} desktop 真实桌面模块，验收末段会关闭 AGI。
+ * @param {object} agent 带测试入口的生产 Agent。
+ * @param {object} sample 原生夹具，先等待它返回窗口及内存位置。
+ * @returns {Promise<void>} 断言通过后保存原生结果，任何错误传回主流程统一清理。
+ */
+async function verify(desktop, agent, sample) {
   try {
+    const data = await sample.ready;
+    const owner = { readOnly: false };
+    const events = [];
+    function event(value) { events.push(value); }
+    async function run(args, signal) {
+      return JSON.parse(await agent.executeRuntimeTest(root, owner, 'runtime_state', args, event, [], signal, {}));
+    }
+    const target = { pid: data.pid, hwnd: data.hwnd };
     check(agent.toolsSpec().some(isRuntime), 'AGI 开启时普通模型和 MCP 共用工具注册');
     const windows = await run({ action: 'snapshot', source: 'windows', target: { pid: data.pid } });
     fs.writeFileSync(path.join(output, 'window-diagnostic.json'), JSON.stringify({ fixture: data, windows }, null, 2));
@@ -134,9 +158,20 @@ async function main() {
     check(waited.status === 'matched' && waited.polls >= 2 && waited.record.value[0] === 80, '一次 Agent 调用等待真实内存137变80');
     const evidence = fs.readFileSync(path.join(root, waited.evidencePath), 'utf8');
     check(evidence.includes('"value":[137]') && evidence.includes('"value":[80]'), '真实内存前后采样原文落盘');
-    const timed = await run({ ...memoryQuery, action: 'wait', timeoutMs: 250, intervalMs: 100,
-      condition: { key: 'integer', field: 'value', operator: 'eq', value: [81] } });
-    check(timed.status === 'timeout' && events[events.length - 1].outcome === 'error', '真实等待超时明确返回且 Agent 不报成功');
+    const timeoutQuery = { ...memoryQuery, action: 'wait', timeoutMs: 250, intervalMs: 100,
+      condition: { key: 'integer', field: 'value', operator: 'eq', value: [81] } };
+    const timed = await run(timeoutQuery);
+    const outcome = events[events.length - 1].outcome;
+    check(timed.status === 'timeout' && outcome === 'error', '真实等待超时明确返回且 Agent 不报成功');
+    // 运行观察没有命令退出码。验收提示应引用实际采样值，便于用户直接核对。
+    const selfTest = require('../electron/lib/agi-self-test');
+    const snap = { selfTestAuthorized: true };
+    const receipt = selfTest.begin(root, snap, [], 'runtime_state', timeoutQuery);
+    selfTest.record(snap, receipt, outcome === 'success', JSON.stringify(timed));
+    const review = selfTest.status(root, [], snap);
+    assert.equal(review.ready, false);
+    assert.match(review.detail, /等待条件超时，末次采样 integer\.value=\[80\]/);
+    check(true, review.detail);
     await assert.rejects(function badPid() { return run({ ...controls, action: 'snapshot', target: { pid: process.pid, hwnd: data.hwnd } }); }, /identity/i);
     check(true, '窗口属于其它进程时拒绝读取');
     await assert.rejects(function duplicate() { return run({ source: 'controls', action: 'snapshot', target,
@@ -178,18 +213,20 @@ async function main() {
     fs.writeFileSync(path.join(output, 'results.json'), JSON.stringify(result, null, 2));
     console.log(JSON.stringify(result));
   } finally {
-    desktop.setAlive(false);
-    sample.child.kill();
+    stopNative();
   }
-  app.quit();
 }
 /** 只检查当前工具名称。 */
 function isRuntime(spec) { return spec.function.name === 'runtime_state'; }
 /** OCR 模块只在真正加载引擎时出现，导入屏幕工具模块不算启动识别。 */
 function isOcr(file) { return file.includes('node_modules') && file.includes('tesseract.js'); }
 const watchdog = setTimeout(timeout, 45000);
-/** 测试超时返回失败，不遗留后台进程。 */
-function timeout() { console.error('Native verification timeout'); app.exit(1); }
+/** 超时时请求终止已启动的原生帮助进程和夹具，然后以状态码 1 退出 Electron。 */
+function timeout() {
+  stopNative?.();
+  console.error('Native verification timeout');
+  app.exit(1);
+}
 main().then(done, failed);
 /** 所有原生资源释放后清除测试看门狗。 */
 function done() { clearTimeout(watchdog); }

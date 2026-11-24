@@ -32,15 +32,25 @@ function sendJson(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
-async function readJson(req) {
+/**
+ * 读取本机工具桥的 JSON 请求。
+ * @param {import('http').IncomingMessage} req 已验证会话令牌的 HTTP 请求。
+ * @param {boolean} commandRequest 当前轮已开放运行命令，且发送方标记了命令请求。
+ * @returns {Promise<object>} 请求正文；命令正文大小不限，其他请求按原有上限处理。
+ */
+async function readJson(req, commandRequest) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 8 * 1024 * 1024) throw new Error('request too large');
+    if (!commandRequest && size > 8 * 1024 * 1024) throw new Error('request too large');
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+  const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+  if (commandRequest && (body.method !== 'tools/call' || body.params?.name !== 'run_command')) {
+    throw new Error('invalid command request');
+  }
+  return body;
 }
 
 /** 本进程 HTTP 桥：stdio MCP 子进程把 tools/list、tools/call 转回来 */
@@ -52,8 +62,10 @@ function startBridge(session) {
     }
     if (req.headers.authorization !== `Bearer ${token}`) return sendJson(res, 401, { error: 'unauthorized' });
     try {
-      const body = await readJson(req);
       if (req.method !== 'POST' || req.url !== '/mcp') return sendJson(res, 404, { error: 'not found' });
+      const commandRequest = req.headers['x-spcode-command'] === '1'
+        && toolDefs(session.ctx?.tools).some(function allowsCommand(tool) { return tool.name === 'run_command'; });
+      const body = await readJson(req, commandRequest);
       if (body.method === 'tools/list') {
         return sendJson(res, 200, {
           tools: toolDefs(session.ctx?.tools).map((tool) => ({
@@ -329,7 +341,7 @@ async function createSession(key, sig, modelCfg, tools, onEvent) {
 
 async function runTurn({
   key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent,
-  tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false
+  tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false, shouldYield
 }) {
   await grokModel.ensureLogin(modelCfg, { interactive: true });
   sig = `${sig}\nagi:${!!agiMode}`;
@@ -377,7 +389,8 @@ async function runTurn({
 
       const content = session._streamContent || '';
       const reasoning = session._streamReason || '';
-      if (!required.length || required.some((name) => stats.calls.includes(name))) {
+      // 优先投递停止或范围变更，跳过旧任务的必调工具重试。
+      if (shouldYield?.() || !required.length || required.some((name) => stats.calls.includes(name))) {
         return { content, reasoning };
       }
       if (attempt >= 2) throw new Error('Grok 未调用本轮要求的 SpCode 工具，无法确认任务已执行。');

@@ -16,6 +16,11 @@ function harness(samples) {
   let count = 0;
   let alive = true;
   const events = [];
+  /**
+   * 按顺序取得受控样本，耗尽后重复读取最后一条，模拟状态保持不变。
+   * @param {object} query 观察请求，source 用于标明采样来源。
+   * @returns {Promise<object>} 带读取时间的独立样本，错误样本直接拒绝。
+   */
   async function read(query) {
     const sample = samples[Math.min(count++, samples.length - 1)];
     if (sample instanceof Error) throw sample;
@@ -62,6 +67,14 @@ async function main() {
   const typed = harness([{ records: { status: { enabled: 'true' } } }]);
   const timed = await typed.observer.run({ ...waitArgs, timeoutMs: 120 }, null, typed.audit);
   check(timed.status === 'timeout' && timed.polls === 2, '严格类型比较且超时不冒充成功');
+  const selfTest = require('../electron/lib/agi-self-test');
+  const snap = { selfTestAuthorized: true };
+  const receipt = selfTest.begin('', snap, [], 'runtime_state', waitArgs);
+  selfTest.record(snap, receipt, false, JSON.stringify(timed));
+  const review = selfTest.status('', [], snap);
+  assert.equal(review.ready, false);
+  assert.match(review.detail, /等待条件超时，末次采样 status\.enabled="true"/);
+  check(true, review.detail);
   const replacement = harness([{ records: {} }, { identity: 'fixture:2', records: {} }]);
   await rejects(function identity() { return replacement.observer.run(waitArgs, null, replacement.audit); }, /身份/, '进程身份改变立即停止');
   const failure = harness([new Error('native failure')]);

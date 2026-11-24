@@ -193,7 +193,9 @@ async function getSession(key, sig, fresh) {
 /**
  * 执行一轮聊天模式的本地工具编排。
  * @param {object} args 与 Codex SDK 直通相同的上下文、授权工具、执行器和事件回调。
- * @returns {Promise<{content: string, reasoning: string}>} 已完成工具往返后的最终回答。
+ * @param {Function} [args.onInterjectionDelivered] 当前用户消息收到非空模型回复后确认该批插话；取消时不确认。
+ * @param {Function} [args.shouldYield] 查询是否有新插话，交接时跳过当前回复申请的后续动作。
+ * @returns {Promise<{content: string, reasoning: string}>} 工具往返后的最终回答，或交还控制权时的空结果。
  */
 async function performTurn(args) {
   const { key, sig, fresh, firstPrefix, systemContext, turnText, userContent, tools,
@@ -233,11 +235,19 @@ async function performTurn(args) {
   try {
     onEvent({ type: 'status', text: 'Codex 五小时额度已耗尽，官方聊天模式继续执行…' });
     let reply = await exchange(session, first ? firstMessage : `【用户新一轮任务】\n${turnText || ''}`, signal);
+    let confirmDelivery = args.onInterjectionDelivered;
     const called = new Set();
     let malformed = 0;
     let missedRequired = 0;
     while (true) {
       checkAbort(signal);
+      // 先确认这一批已收到模型回复，再把晚到的插话交回宿主续接。
+      if (confirmDelivery && reply.trim()) {
+        confirmDelivery();
+        confirmDelivery = null;
+      }
+      // 调整范围后由宿主送入新指令，当前申请单和缺工具催办到此结束。
+      if (args.shouldYield?.()) return { content: '', reasoning: '' };
       let action;
       try {
         action = parseAction(reply);

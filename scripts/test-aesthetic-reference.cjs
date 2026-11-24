@@ -307,6 +307,18 @@ async function verifyAdapterBoundaries(api, pair, store) {
   await assert.rejects(api.prepareAestheticImages(nine, codexModel, '比较', {}), /无法看图/);
   const stillNative = await api.prepareAestheticImages(eight, codexModel, '比较', {});
   check(stillNative.parts.length === eight.length * 2, '无视觉槽位时 Grok 和 Codex 超量图片明确失败，八张以内的原生 Codex 不受影响');
+  const assembly = require('../electron/lib/assembly');
+  const originalVision = assembly.visionFrom;
+  /** 指定 Codex 直通眼睛，沿用上面绑定的真实 SDK 适配器。 */
+  function codexVision() { return { model: 'gpt-6', protocol: 'codex', reasoningEffort: 'low' }; }
+  assembly.visionFrom = codexVision;
+  expectedCodexImages = pair;
+  const directEye = await api.prepareAestheticImages(pair, grokModel, '比较两个实际主题', {});
+  check(codexRuns === 3 && directEye.parts.length === 0 && directEye.text.includes('看图模型对比结果'),
+    '文本评委的 Codex 直通眼睛实际收到两张原图并返回可交付的看图说明');
+  await assert.rejects(api.prepareAestheticImages(nine, grokModel, '比较九张', {}), /Codex 看图请求超过八张/);
+  check(codexRuns === 3, 'Codex 直通眼睛拒绝超限联合比较，没有把截断批次发给 SDK');
+  assembly.visionFrom = originalVision;
   expectedBridgeImages = null;
   store.load = originalLoad;
   codex.complete = originalCodex;

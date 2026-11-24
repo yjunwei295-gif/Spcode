@@ -112,6 +112,87 @@ function saveJson(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
 }
+// 每个项目缓存一份绝对目录清单，遍历子树时只比较路径，不反复读配置。
+const ignoredFolderCache = new Map();
+
+/** 将同一工作区的不同斜杠和 Windows 路径大小写归到同一份内存设置。 */
+function folderCacheKey(workspace) {
+  const normalized = path.resolve(workspace);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+/** 将忽略清单存放在地图缓存目录旁，删除或重绘地图后仍能沿用扫描范围。 */
+function ignoredFoldersFile(workspace) {
+  return path.join(userDataDir(), "project-map", hashPath(workspace) + ".folders.json");
+}
+
+/** 读取当前项目忽略的目录；配置存相对项目的路径，匹配和选择器使用绝对路径。 */
+function getIgnoredFolders(workspace) {
+  if (!workspace) return [];
+  const key = folderCacheKey(workspace);
+  if (!ignoredFolderCache.has(key)) {
+    const saved = loadJson(ignoredFoldersFile(workspace), []);
+    const folders = [];
+    for (const entry of saved) folders.push(path.resolve(workspace, entry));
+    ignoredFolderCache.set(key, folders);
+  }
+  return ignoredFolderCache.get(key);
+}
+
+/** 用当前平台的路径边界判断目录本身及其后代，保留同名前缀的兄弟目录。 */
+function isMapPathIgnored(workspace, abs) {
+  for (const folder of getIgnoredFolders(workspace)) {
+    const rel = path.relative(folder, abs);
+    if (rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel)) return true;
+  }
+  return false;
+}
+
+/** 保存单个目录的添加或移除，保留其他窗口已保存的选择；添加后立即从旧地图移出整个子树。 */
+function changeIgnoredFolder(workspace, folder, ignored, extra) {
+  const abs = path.resolve(workspace, folder);
+  const folders = getIgnoredFolders(workspace).slice();
+  const at = folders.findIndex(function sameFolder(entry) { return path.relative(entry, abs) === ""; });
+  if ((at >= 0) === ignored) return folders;
+  if (ignored) {
+    if (![workspace, ...extra].some(function inRoot(root) { return isInside(root, abs); })) {
+      throw new Error("请选择当前项目或附加目录中的文件夹");
+    }
+    folders.push(abs);
+  } else {
+    folders.splice(at, 1);
+  }
+  const entries = folders.map(function relativeFolder(dir) { return path.relative(workspace, dir) || "."; });
+  saveJson(ignoredFoldersFile(workspace), entries);
+  ignoredFolderCache.set(folderCacheKey(workspace), folders);
+  // 正在绘制的任务可能已经收集了旧清单，不能让它覆盖刚生效的范围。
+  abortIndex(workspace);
+  if (ignored) pruneIgnoredNodes(workspace);
+  return folders;
+}
+
+/** 只遍历已有地图记录，批量移除忽略的节点、引用和目录，不为清理旧图扫描磁盘子树。 */
+function pruneIgnoredNodes(workspace) {
+  const map = loadMapCached(workspace);
+  if (!map) return;
+  const removed = new Set();
+  for (const node of map.nodes) {
+    if (isMapPathIgnored(workspace, node.abs)) removed.add(node.id);
+  }
+  if (!removed.size) return;
+  invalidateDependentSummaries(map, removed);
+  map.nodes = map.nodes.filter(function keepNode(node) { return !removed.has(node.id); });
+  for (const node of map.nodes) {
+    node.deps = (node.deps || []).filter(function keepDep(id) { return !removed.has(id); });
+  }
+  map.edges = map.edges.filter(function keepEdge(edge) { return !removed.has(edge.from) && !removed.has(edge.to); });
+  map.dirs = mapDirectories(map.nodes);
+  map.updatedAt = Date.now();
+  saveJson(jsonPath(workspace), map);
+  invalidateMapCache(workspace);
+  writeMarkdown(mdPath(workspace), map);
+}
+
 function parseIgnoreLines(text) {
   return String(text || "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
 }
@@ -168,7 +249,7 @@ function indexRoots(workspace, extra) {
     if (!dir) return;
     const abs = path.resolve(dir);
     const key = abs.replace(/\\/g, "/").toLowerCase();
-    if (seen.has(key)) return;
+    if (seen.has(key) || isMapPathIgnored(workspace, abs)) return;
     try { if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) return; } catch { return; }
     seen.add(key);
     roots.push(abs);
@@ -254,6 +335,7 @@ function mapLimitText(mapData) {
 }
 /**
  * 遍历索引根目录，收集可收录的文件（只读磁盘，不写任何文件）。
+ * @param {string} workspace 拥有忽略目录设置的工作区，附加根沿用同一清单。
  * @param {string[]} roots 索引根目录列表
  * @param {AbortSignal} [signal] 中止信号，中止时抛 "stopped"
  * @param {object} [stats] 可选的截断记账对象（通常来自 createScanStats()）。传入后本函数把原先静默丢弃
@@ -264,7 +346,7 @@ function mapLimitText(mapData) {
  *   （syncMap 的增量对齐只需要补漏，不需要截断信息）。
  * @returns {{abs: string, size: number}[]} 收录文件列表；返回结构不因 stats 改变
  */
-function collectFiles(roots, signal, stats) {
+function collectFiles(workspace, roots, signal, stats) {
   const files = [];
   // 允许调用方传入空对象或不完整对象，缺的计数在这里补齐
   if (stats) {
@@ -303,7 +385,10 @@ function collectFiles(roots, signal, stats) {
       if (isForeignAiSkill(abs, own)) continue;
       const rel = path.relative(root, abs).replace(/\\/g, "/");
       if (isIgnored(rel, ent.isDirectory(), rules)) continue;
-      if (ent.isDirectory()) { walk(root, abs, rules, depth + 1); continue; }
+      if (ent.isDirectory()) {
+        if (!isMapPathIgnored(workspace, abs)) walk(root, abs, rules, depth + 1);
+        continue;
+      }
       if (!ent.isFile() || !isIndexableFile(ent.name)) continue;
       try {
         const st = fs.statSync(abs);
@@ -320,6 +405,7 @@ function collectFiles(roots, signal, stats) {
       } catch {}
     }
   }
+  // indexRoots 已在读取根目录属性前排除了被忽略的根。
   for (const root of roots) walk(root, root, loadIgnoreRules(root), 0);
   return files;
 }
@@ -388,12 +474,14 @@ function resolveDepTarget(workspace, dir, dep, fileIndex) {
     // HTML 里的路径常写成裸相对路径（src="app.js"），不像 JS 那样要求 ./
     if (/^(?:https?:|\/\/|data:|#)/i.test(spec)) return null;
     const p = path.resolve(dir, spec.split(/[?#]/)[0]);
+    if (isMapPathIgnored(workspace, p)) return null;
     try { if (fs.statSync(p).isFile()) return p; } catch { /* 落到按名查找 */ }
     return resolveByName(fileIndex, dir, path.basename(spec.split(/[?#]/)[0]));
   }
   if (dep.kind === "include") {
     // 先按相对路径试，再退回按文件名找
     const rel = path.resolve(dir, spec);
+    if (isMapPathIgnored(workspace, rel)) return null;
     try { if (fs.existsSync(rel) && fs.statSync(rel).isFile()) return rel; } catch { /* 落到按名查找 */ }
     return resolveByName(fileIndex, dir, path.basename(spec));
   }
@@ -861,6 +949,7 @@ function resolveDepToFile(workspace, dir, dep) {
     path.join(base, "index.js"), path.join(base, "index.ts"), path.join(base, "index.tsx")
   ];
   for (const c of cands) {
+    if (isMapPathIgnored(workspace, c)) continue;
     try { if (fs.existsSync(c) && fs.statSync(c).isFile()) return c; } catch {}
   }
   return null;
@@ -929,6 +1018,15 @@ function getMap(workspace) {
   for (const node of map.nodes) ensureSymbolSpans(node);
   return map;
 }
+/** 从保留的模块路径生成目录树清单，建图和清理旧图共用同一套目录层级。 */
+function mapDirectories(nodes) {
+  const dirSet = new Set();
+  for (const n of nodes) {
+    const parts = n.path.split("/");
+    for (let i = 1; i < parts.length; i++) dirSet.add(parts.slice(0, i).join("/"));
+  }
+  return Array.from(dirSet);
+}
 async function scanWorkspace(workspace, extra, signal) {
   const roots = indexRoots(workspace, extra);
   const excludes = loadExcludes(workspace);
@@ -937,7 +1035,7 @@ async function scanWorkspace(workspace, extra, signal) {
   fs.mkdirSync(dir, { recursive: true });
   // stats 收集本次扫描的截断情况（文件数/层级/单文件体积），随地图根 limit 字段一起落盘
   const stats = createScanStats();
-  const files = collectFiles(roots, signal, stats);
+  const files = collectFiles(workspace, roots, signal, stats);
   const fileIndex = buildFileIndex(files);
   const total = files.length || 1;
   const nodes = [];
@@ -971,11 +1069,6 @@ async function scanWorkspace(workspace, extra, signal) {
     if (processed % 32 === 0) await yieldTick();
   }
   const edges = classifyEdges(nodes, identsById, includesById);
-  const dirSet = new Set();
-  for (const n of nodes) {
-    const parts = n.path.split("/");
-    for (let i = 1; i < parts.length; i++) dirSet.add(parts.slice(0, i).join("/"));
-  }
   // 截断信息挂在根上（buildMap 直接把这个对象落盘）：limit 缺失即老地图，读取方按"无截断信息"处理，不误报成截断
   return {
     version: MAP_VERSION,
@@ -984,7 +1077,7 @@ async function scanWorkspace(workspace, extra, signal) {
     generatedAt: Date.now(),
     nodes,
     edges,
-    dirs: Array.from(dirSet),
+    dirs: mapDirectories(nodes),
     // 本次扫描的收录上限与实际结果：files 为实际收录数，dropped 为三类静默丢弃的计数+明细
     limit: {
       maxFiles: MAX_FILES,
@@ -1030,6 +1123,7 @@ function writeMarkdown(file, mapData) {
 async function buildMap(workspace, extra, opts, signal) {
   opts = opts || {};
   const scanned = await scanWorkspace(workspace, extra, signal);
+  if (signal && signal.aborted) throw new Error("stopped");
   // 重绘按源码内容和依赖校验旧摘要；只改时间戳也能复用，依赖变化则失效。
   const prev = loadJson(jsonPath(workspace), null);
   if (prev && Array.isArray(prev.nodes)) {
@@ -1552,7 +1646,7 @@ function topMatches(workspace, extra, mapData, query, opts) {
 function mapFiles(workspace, extra) {
   if (!workspace) return null;
   const mapData = loadMapCached(workspace);
-  if (!mapData || !Array.isArray(mapData.nodes) || !mapData.nodes.length) return null;
+  if (!mapData || !Array.isArray(mapData.nodes)) return null;
   ensureFresh(workspace, extra || [], mapData);
   return mapData.nodes
     .filter((n) => n.abs && !isForeignAiSkill(n.abs))
@@ -1741,7 +1835,9 @@ function invalidateDependentSummaries(mapData, id) {
   };
   for (const n of mapData.nodes) for (const dep of n.deps || []) add(n.id, dep);
   for (const e of mapData.edges || []) add(e.from, e.to);
-  const seen = new Set([id]), todo = [id];
+  // 批量移除一个目录时共用反向依赖表，避免为每个被移除模块重新遍历全图。
+  const seen = id instanceof Set ? new Set(id) : new Set([id]);
+  const todo = [...seen];
   const byId = new Map(mapData.nodes.map((n) => [n.id, n]));
   while (todo.length) for (const caller of reverse.get(todo.pop()) || []) {
     if (seen.has(caller)) continue;
@@ -1936,6 +2032,7 @@ function applyDirtyFiles(workspace, extra, mapData, files) {
   const excludes = new Set(loadExcludes(workspace));
   let changed = 0;
   for (const abs of files) {
+    if (isMapPathIgnored(workspace, abs)) continue;
     let st = null;
     try { st = fs.statSync(abs); } catch { st = null; }
     if (st && st.isDirectory()) {
@@ -1996,7 +2093,7 @@ function syncMap(workspace, extra, mapData) {
   const excludes = new Set(loadExcludes(workspace));
   const have = new Set(mapData.nodes.map((n) => path.normalize(n.abs || "").toLowerCase()));
   let added = 0;
-  for (const f of collectFiles(indexRoots(workspace, extra || []))) {
+  for (const f of collectFiles(workspace, indexRoots(workspace, extra || []))) {
     if (have.has(path.normalize(f.abs).toLowerCase())) continue;
     if (addNodeFromFile(workspace, extra || [], mapData, f.abs, excludes)) {
       have.add(path.normalize(f.abs).toLowerCase());
@@ -2017,7 +2114,7 @@ function syncMap(workspace, extra, mapData) {
 }
 // 写文件后调用：已有节点就刷新，新文件就补一个节点；没有地图时不做任何事（不触发全量扫描）
 function upsertFile(workspace, abs, extra) {
-  if (!workspace || !abs) return false;
+  if (!workspace || !abs || isMapPathIgnored(workspace, abs)) return false;
   const mapData = loadMapCached(workspace);
   if (!mapData || !Array.isArray(mapData.nodes)) return false;
   const target = path.normalize(abs);
@@ -2306,7 +2403,12 @@ async function summarizeIncludes(workspace, includes, modelCfg, signal) {
   }
 }
 
-// 点开一个节点时只归纳这一个文件，把作用和关键值补进弹窗
+/**
+ * 根据当前项目的单个地图节点生成或复用方法说明，供节点弹窗与批量归纳调用。
+ * workspace 和 id 定位源码，modelCfg 指定归纳模型，signal 可中止任务。
+ * 返回归纳结果或未完成原因。空文件或无符号文件会直接尝试写回空方法列表。
+ * 模型返回后，若节点已从最新地图移除，则返回 stale。节点仍在且源码与依赖摘要均未变化时，才尝试写回模型结果。
+ */
 async function summarizeOne(workspace, id, modelCfg, signal) {
   if (!workspace || !id) return { ok: false, reason: "no-id" };
   if (!modelCfg) return { ok: false, reason: "no-model" };
@@ -2342,13 +2444,15 @@ async function summarizeOne(workspace, id, modelCfg, signal) {
     }
     const cache = summaryCache.open(path.join(mapDir(workspace), 'summary-cache'), n.id, inputKey);
     const raw = await summarizeFileMethods(modelCfg, { path: n.path, ext: n.ext, text: text, symbols: n.symbols }, signal, cache);
+    // 等待归纳时用户可能忽略整个目录。先查最新地图，再补行号或校验源码，避免重读已移除的文件。
+    const latestMap = loadJson(jsonPath(workspace), null);
+    const latest = latestMap?.nodes?.find((item) => item.id === id);
+    if (!latest) return { ok: false, reason: "stale" };
     n.methodsMtime = n.mtime;
     n.methods = nodeMethods(Object.assign({}, n, { methods: raw }));
     let st = null;
     try { st = fs.statSync(n.abs); } catch { st = null; }
-    const latestMap = loadJson(jsonPath(workspace), null);
-    const latest = latestMap?.nodes?.find((item) => item.id === id);
-    if (!st || !latest || summaryCache.hash(fs.readFileSync(n.abs, 'utf8')) !== n.contentHash || summaryCache.dependencyHash(latestMap, latest) !== depsHash) return { ok: false, reason: "stale" };
+    if (!st || summaryCache.hash(fs.readFileSync(n.abs, 'utf8')) !== n.contentHash || summaryCache.dependencyHash(latestMap, latest) !== depsHash) return { ok: false, reason: "stale" };
     n.mtime = fileStamp(st);
     n.size = st.size;
     n.ctime = st.ctimeMs;
@@ -2409,7 +2513,7 @@ function gotoDefinition(workspace, extra, symbol) {
 
 module.exports = {
   ensureIndex, kickIndex, abortIndex, deleteIndex, getStatus, onStatus, search, buildPromptBlock, getMap, mapFiles, upsertFile, removeFile, gotoDefinition,
-  noteDiskChange, noteWatching,
+  noteDiskChange, noteWatching, getIgnoredFolders, changeIgnoredFolder, isMapPathIgnored,
   mapLimitText,
   hashPath, fileKey, sameWorkspace, isIgnored, parseIgnoreLines, jsonPath, mdPath,
   getExcludes: loadExcludes, setExcludes: saveExcludes,

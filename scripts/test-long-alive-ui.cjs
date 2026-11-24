@@ -54,7 +54,8 @@ async function main() {
     if (payload.message === '长时存活失败') faults.push(payload.detail);
   });
   ipcMain.handle('chat:send', async function chat(event, payload) {
-    check(host.authorize(win, payload.longAliveRunId, payload.turnId), '真实主进程确认自动轮次权限');
+    check(host.authorize(win, payload.longAliveRunId, payload.turnId) === '只核对本地任务，禁止发布',
+      '真实主进程核对自动轮次权限并返回面板保存的原始目标');
     requests++;
     return { text: '已完成第 ' + requests + ' 次本地检查；下次继续核对待办。', changes: [] };
   });
@@ -97,7 +98,7 @@ async function main() {
   `;
   const noopNames = ['renderQueue','renderChips','renderTabs','renderMessages','scrollMessagesToBottom',
     'syncSendBtn','armStallWatch','logSummaryTrace','revealRest','clearStallWatch','finishTypewriter',
-    'flushLivePaint','stopTypewriter','renderSidebar'];
+    'flushLivePaint','stopTypewriter','renderSidebar','retryHotReload'];
   let noops = '';
   for (const name of noopNames) noops += 'function ' + name + '() {}\n';
   ipcMain.handle('snapshot:list', function snapshots() { return []; });

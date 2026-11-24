@@ -576,24 +576,53 @@ function prune(workspace, maxOverride) {
   }
 }
 
-function restore(workspace, snapshotId) {
+/**
+ * 将快照中选定文件的工作区状态恢复到改动前。
+ * @param {string} workspace 快照所属的项目目录。
+ * @param {string} snapshotId 历史快照编号。
+ * @param {string} [relPath] 单个文件的项目相对路径，省略时沿用整份还原。
+ * @returns {{snapshotId: string, restored: Array<{path: string, action: string}>}} 快照编号及还原结果条目。已不存在的新建文件不计入结果。
+ * 整份还原沿用旧行为，遇到新建文件的原路径已变成目录时保留目录，仍记录 delete-created。单文件还原遇到该情况会报错。
+ * 单文件必须在快照清单内，缺少备份时报告失败。还原不改写快照，后续仍可选择其余文件。
+ */
+function restore(workspace, snapshotId, relPath) {
   const dir = snapDir(workspace, snapshotId);
   const manifestPath = path.join(dir, 'manifest.json');
   if (!fs.existsSync(manifestPath)) throw new Error('快照不存在');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const singleFile = relPath !== undefined;
+  let changes = manifest.changes || [];
+  if (singleFile) {
+    const selectedPath = relParts(relPath).join('/');
+    let selected;
+    for (const change of changes) {
+      if (relParts(change.path).join('/') !== selectedPath) continue;
+      selected = change;
+      break;
+    }
+    if (!selected) throw new Error('这份快照里没有该文件');
+    changes = [selected];
+  }
+
   const restored = [];
-  for (const change of manifest.changes || []) {
+  for (const change of changes) {
     const parts = relParts(change.path);
-    if (!parts.length) continue;
     const abs = path.resolve(workspace, ...parts);
-    if (!isInside(workspace, abs)) continue;
+    if (!parts.length || !isInside(workspace, abs)) {
+      if (singleFile) throw new Error('路径超出工作目录');
+      continue;
+    }
     const backup = nestedUnder(path.join(dir, 'files'), change.path);
     if (change.existed) {
-      if (!fs.existsSync(backup)) continue;
+      if (!fs.existsSync(backup)) {
+        if (singleFile) throw new Error(`没有改前备份：${change.path}`);
+        continue;
+      }
       copyFileSafe(backup, abs);
       restored.push({ path: change.path, action: 'restore' });
     } else if (fs.existsSync(abs)) {
       if (fs.statSync(abs).isFile()) fs.unlinkSync(abs);
+      else if (singleFile) throw new Error(`目标已不是文件：${change.path}`);
       restored.push({ path: change.path, action: 'delete-created' });
     }
   }

@@ -121,10 +121,14 @@ function registerLongAlive(env) {
   env.ipcMain.handle('long-alive:context', function context(event, rows) {
     return entryOf(env.getWin(event)).controller.setContext(rows);
   });
-  /** 模型调用前再次核对投递，阻止停止后迟到的界面请求执行。 */
+  /**
+   * 核对窗口和轮次是否仍获授权，并返回主进程保存的长期目标。
+   * @returns {string|null} 当前投递的目标；任务已停止、投递过期或轮次不符时返回 null。
+   */
   function authorize(win, runId, turnId) {
     const entry = entries.get(win);
-    return !!entry && entry.controller.authorized(runId, turnId);
+    if (!entry || !entry.controller.authorized(runId, turnId)) return null;
+    return entry.controller.snapshot().goal;
   }
   return { release, dispose, stopForAbort, authorize };
 }

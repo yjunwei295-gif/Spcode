@@ -52,6 +52,31 @@ async function choose(theme) {
   const selector = '[data-act="theme-' + theme + '"]';
   await page('document.querySelector(' + JSON.stringify(selector) + ').click()');
 }
+/**
+ * 保存隔离窗口的实际 Chromium 画面。
+ * @param {string} name 验收目录内的 PNG 文件名。
+ * @returns {Promise<void>} 成功时写出 PNG 并记一条断言；截图为空时验收失败。
+ */
+async function captureReference(name) {
+  // DOM 切换完成后需等新画面渲染，避免把前一张有效截图误认为当前界面。
+  await page(`(async function waitReferencePaint() {
+    await document.fonts.ready;
+    await new Promise(function waitFrame(resolve) {
+      requestAnimationFrame(function afterLayout() { requestAnimationFrame(resolve); });
+    });
+    return true;
+  })()`);
+  const file = JSON.stringify(path.join(output, name));
+  const captured = await evaluate(`(async function captureThemeFrame() {
+    const e = ${electron};
+    const w = ${find};
+    const image = await w.webContents.capturePage(undefined, { stayAwake: true });
+    if (image.isEmpty()) return false;
+    process.getBuiltinModule('fs').writeFileSync(${file}, image.toPNG());
+    return true;
+  })()`);
+  check(captured, name + ' 截图非空');
+}
 /** 完整验证新主题与原有主题可以往返切换。 */
 async function main() {
   const address = await new Promise(function start(resolve, reject) {
@@ -99,8 +124,14 @@ async function main() {
   check(true, '设置切换与重新加载后恢复新主题');
   const modulePath = JSON.stringify(path.join(root, 'electron/lib/house-style.js'));
   check(await evaluate('(function(){const r=process.getBuiltinModule("module").createRequire(' + modulePath + ');const h=r(' + modulePath + ');return h.currentTheme()==="cel"&&h.promptBlock(false).includes("锐线赛璐璐");})()'), '生成界面提示继承新主题');
-  const shot = JSON.stringify(path.join(output, 'cel-welcome.png'));
-  await evaluate('(async function(){const e=' + electron + ';const w=' + find + ';const image=await w.webContents.capturePage();process.getBuiltinModule("fs").writeFileSync(' + shot + ',image.toPNG());return true;})()');
+  // 只显示本次隔离窗口并解除后台限帧；重载后可见文案先于绘制帧就绪。
+  await evaluate(`(function showReferenceWindow() {
+    const e = ${electron};
+    const w = ${find};
+    w.webContents.backgroundThrottling = false;
+    w.showInactive();
+  })()`);
+  await captureReference('cel-welcome.png');
   // 截图夹具只填充 DOM，不保存会话、不调用模型；覆盖消息与深色操作区的布局。
   await page(`document.getElementById('view-welcome').classList.add('hidden');
     document.getElementById('view-chat').classList.remove('hidden');
@@ -111,8 +142,7 @@ async function main() {
     document.getElementById('messages').innerHTML='<div class="msg user"><div class="role">你</div><div class="bubble">保留开始界面的狂野风格，让对话页面更舒服。</div></div><div class="msg assistant"><div class="role">SimpleCode · 设计核对</div><div class="bubble md"><p>消息区保持清晰阅读，红黑锐线集中在标签和输入操作区。</p><p>主题菜单、设置保存、原主题切换均已验证。</p></div></div>';
     document.getElementById('btn-model').innerHTML='<span class="model-roster-chip">测试模型 <span class="model-role-tag">大脑</span></span><span class="model-roster-chip">代码模型 <span class="model-role-tag">代码</span></span>';
     document.getElementById('input').value='继续完成 MXAPI 接入。';`);
-  const chatShot = JSON.stringify(path.join(output, 'cel-chat.png'));
-  await evaluate('(async function(){const e=' + electron + ';const w=' + find + ';const image=await w.webContents.capturePage();process.getBuiltinModule("fs").writeFileSync(' + chatShot + ',image.toPNG());return true;})()');
+  await captureReference('cel-chat.png');
   check(await page('document.getElementById("btn-send").getBoundingClientRect().right<=document.documentElement.clientWidth && getComputedStyle(document.querySelector(".msg .bubble")).boxShadow==="none"'), '对话页发送按钮可见，正文不叠厚重边框投影');
   fs.writeFileSync(path.join(output, 'results.json'), JSON.stringify({ passed, styles, userData }, null, 2));
   console.log('RESULT ' + JSON.stringify({ checks: passed.length, output }));

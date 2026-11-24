@@ -6,6 +6,7 @@
   <title>SimpleCode</title>
   <link rel="icon" href="../icons.png" type="image/png" />
   <link rel="stylesheet" href="./styles.css" />
+  <link rel="stylesheet" href="./agi-workbench.css" />
   <link rel="stylesheet" href="./artifact.css" />
   <link rel="stylesheet" href="./image-canvas.css" />
 </head>
@@ -187,11 +188,36 @@
             </div>
           </aside>
           </div>
+          <!-- 工作台只展示当前会话的子代理，和项目标签、输入栏各自独立。 -->
+          <section id="agi-workbench" class="agi-workbench" aria-labelledby="agi-workbench-title" hidden>
+            <header class="agi-workbench-head">
+              <strong id="agi-workbench-title" data-i18n="agiParallelTitle">子代理工作台</strong>
+              <span data-workbench-count role="status"></span>
+            </header>
+            <div class="agi-workbench-desktop" data-workbench-desktop hidden>
+              <span data-i18n="agiWorkbenchDesktopResource">桌面前台</span>
+              <strong></strong>
+              <span data-workbench-waiting></span>
+            </div>
+            <div class="agi-workbench-content">
+              <ul class="agi-workbench-grid" data-workbench-tasks></ul>
+              <section class="agi-workbench-results" data-workbench-results aria-labelledby="agi-workbench-results-title" hidden>
+                <h3 id="agi-workbench-results-title" data-i18n="agiWorkbenchReceipts">任务回执</h3>
+                <ul data-workbench-receipts></ul>
+              </section>
+            </div>
+          </section>
           <div class="composer-wrap" id="composer-wrap">
             <div class="composer" id="composer">
               <div class="chips" id="chips"></div>
               <div class="queue hidden" id="queue"></div>
-              <textarea id="input" rows="3" data-i18n-placeholder="inputPlaceholder" placeholder="规划、构建，输入 / 使用技能，输入 @ 引用上下文..."></textarea>
+              <!-- 灰字独立于真实输入；只有用户接受预测时才写入 textarea。 -->
+              <div class="composer-input">
+                <textarea id="input" rows="3" aria-label="输入需求" aria-describedby="input-prediction-hint"></textarea>
+                <div id="input-prediction" class="composer-prediction" aria-hidden="true" hidden><div class="composer-prediction-text"><span class="composer-prediction-prefix"></span><span class="composer-prediction-suffix"></span></div></div>
+              </div>
+              <!-- 补全手势只随可用灰字显示，不属于输入正文；空框与已输入文字使用各自的快捷键。 -->
+              <div id="input-prediction-hint" class="composer-prediction-hint" role="status" hidden></div>
               <div class="composer-bar">
                 <div class="left">
                   <!-- 三排制左组：模型胶囊（.select-wrap.model-roster-wrap）仍在 DOM 首位，靠 CSS 让它独占第 1 排；
@@ -268,6 +294,8 @@
       </button>
       <span id="status-model"></span>
       <span id="status-theme"></span>
+      <!-- 源码只由用户主动重载；跨进程保留全部窗口的标签和草稿。 -->
+      <button type="button" id="btn-reload" class="status-reload-btn" title="保留全部窗口的标签和草稿，空闲后重启加载最新代码">手动重载</button>
     </footer>
   </div>
 

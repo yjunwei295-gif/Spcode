@@ -16,8 +16,12 @@ const renderer = path.join(output, 'renderer');
 const userData = path.join(output, 'user-data');
 const report = { output, passed: [], paths: [], urls: [], requests: [], errors: [] };
 const WAIT_MS = 20000;
+// 为读屏和鼠标操作留出时间，同时在命令工具结束前保留失败报告。
+const DESKTOP_CLICK_WAIT_MS = 45000;
 const POLL_MS = 30;
-let win, server, baseUrl, live = false, failOpen = false, finished = false;
+// 仅在桌面验收时显示测试窗口，等待工具在真实聊天锚点上点击。
+const desktopClick = process.argv.includes('--desktop-click');
+let win, server, baseUrl, live = false, failOpen = false, finished = false, showChatFixture = false;
 const actualOpenPath = shell.openPath.bind(shell);
 const actualOpenExternal = shell.openExternal.bind(shell);
 
@@ -36,7 +40,7 @@ const ready = 'await receiveHotReload(await api.hotReloadStatus());';
 const position = source.indexOf(ready);
 assert.ok(position >= 0 && position === source.lastIndexOf(ready));
 // 仅在临时副本加入观察口；生产点击处理、preload、主进程 IPC 和路径解析均不替换。
-fs.writeFileSync(appFile, source.substring(0, position + ready.length) + '\nwindow.__systemOpenReady=true;' + source.substring(position + ready.length) + '\nwindow.__systemOpenTest={state,activeSession,newTab,loadFileTree,openTreeFile};\n', 'utf8');
+fs.writeFileSync(appFile, source.substring(0, position + ready.length) + '\nwindow.__systemOpenReady=true;' + source.substring(position + ready.length) + '\nwindow.__systemOpenTest={state,activeSession,newTab,loadFileTree,openLocalFile,renderMessages,showChat};\n', 'utf8');
 const originalLoadFile = BrowserWindow.prototype.loadFile;
 /** 只将测试主界面定向到增加观察口的副本，其他生产窗口使用原页面。 */
 BrowserWindow.prototype.loadFile = function loadObserved(file, options) {
@@ -63,7 +67,8 @@ app.on('browser-window-created', observe);
 function observe(_event, window) {
   window.hide();
   window.on('show', hide);
-  function hide() { window.hide(); }
+  /** 除了桌面点击阶段的主窗口，其余验收窗口都在后台执行。 */
+  function hide() { if (window !== win || !showChatFixture) window.hide(); }
   if (!win) win = window;
   window.webContents.on('console-message', recordError);
   function recordError(event) { if (event.level === 'error') report.errors.push(event.message); }
@@ -72,9 +77,9 @@ function observe(_event, window) {
 function check(value, label) { assert.ok(value, label); report.passed.push(label); console.log('PASS ' + label); }
 /** 在真实生产主页面执行只针对隔离测试的观察表达式。 */
 function page(expression) { return win.webContents.executeJavaScript(expression); }
-/** 等待明确条件，超时失败；不把固定延时当作动作成功。 */
-async function waitFor(predicate, label) {
-  const deadline = Date.now() + WAIT_MS;
+/** 等待明确条件；超过指定毫秒数时，以对应场景名报告失败。 */
+async function waitFor(predicate, label, timeoutMs = WAIT_MS) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await predicate()) return;
     await new Promise(delay);
@@ -85,6 +90,15 @@ async function waitFor(predicate, label) {
 /** 对文件树真实按钮发送普通或 Ctrl 点击，保留编码后的原路径。 */
 async function clickTree(file, ctrl) {
   await page('(function(){const encoded=' + JSON.stringify(encodeURIComponent(file)) + ';const row=document.querySelector("[data-tree-file=\\\""+encoded+"\\\"]");if(!row)throw Error("树节点不存在："+encoded);row.dispatchEvent(new MouseEvent("click",{bubbles:true,cancelable:true,ctrlKey:' + Boolean(ctrl) + '}));return true;})()');
+}
+/**
+ * 点击由聊天渲染器生成的文件锚点。
+ * @param {string} file 消息中的原始文件路径。
+ * @returns {Promise<void>} 点击已送达；系统结果由后续断言单独核对。
+ */
+async function clickChatFile(file) {
+  const selector = '#messages a[data-preview-file="' + encodeURIComponent(file) + '"]';
+  await page('document.querySelector(' + JSON.stringify(selector) + ').click();true');
 }
 /** 点击真实网页锚点，覆盖新窗和当前页导航，不直接调用被测路由函数。 */
 async function clickWeb(contents, url, target) {
@@ -161,7 +175,7 @@ async function main() {
   await waitFor(previewed, '普通文档预览');
   check(report.paths.length === count, '普通文件继续预览，不调用系统启动');
   failOpen = true;
-  const failure = await page('(async function(){try{await window.__systemOpenTest.openTreeFile(' + JSON.stringify(launchNames[4]) + ');return "未拒绝";}catch(error){return error.message;}})()');
+  const failure = await page('(async function(){try{await window.__systemOpenTest.openLocalFile(' + JSON.stringify(launchNames[4]) + ');return "未拒绝";}catch(error){return error.message;}})()');
   failOpen = false;
   check(failure.includes('测试系统启动失败') && await page('document.querySelector("#preview-body h1")?.textContent==="普通文件仍然预览"'), '系统启动失败真实拒绝且不回退到详情');
   await verifyWebRoutes(win.webContents, '主窗口');
@@ -195,17 +209,66 @@ async function main() {
   await waitFor(frameLoaded, '作品子页面加载');
   check(report.urls.length === frameUrls, '作品 iframe 子页面仍在内部加载，不误转系统浏览器');
   ctx.win.close();
+  // 用聊天正文核对相对 CMD、绝对 HTML 和交付消息中使用的 EXE 标签。
+  const chatHtml = path.join(workspace, launchNames[0]);
+  const chatExe = path.join(workspace, launchNames[4]);
+  const markdown = '[打开命令](<' + launchNames[3] + '>)\n\n[打开页面](<' + chatHtml + '>)\n\n[新版程序](<' + chatExe + '>)';
+  const message = { role: 'assistant', text: markdown, changes: [{ path: launchNames[3] }] };
+  await page('(function(){const t=window.__systemOpenTest;t.activeSession().messages.push(' + JSON.stringify(message) + ');t.renderMessages();return true;})()');
+  // 记录正文锚点的输入，用于核对每次点击只向系统提交一次打开请求。
+  await page('window.__chatFileClicks=[];document.getElementById("messages").addEventListener("click",function recordFileClick(event){const link=event.target.closest("a[data-preview-file]");if(link)window.__chatFileClicks.push({label:link.textContent,trusted:event.isTrusted,button:event.button,detail:event.detail});},true);true');
+  const launchCount = report.paths.length;
+  const previewPath = await page('document.getElementById("preview-path").textContent');
+  const chatUrl = win.webContents.getURL();
   live = true;
-  for (const pair of [[launchNames[2], 'bat-started.txt'], [launchNames[3], 'cmd-started.txt'], [launchNames[4], 'exe-started.txt']]) {
-    await clickTree(pair[0], false);
-    function markerWritten() { return fs.existsSync(path.join(workspace, pair[1])); }
-    await waitFor(markerWritten, pair[0] + '真实启动标记');
-    check(true, path.extname(pair[0]) + '实际由系统启动并写入受控标记');
-  }
-  await clickTree(launchNames[0], false);
+  await clickChatFile(launchNames[3]);
+  /** 等待对话里的 CMD 实际执行并创建标记。 */
+  function cmdStarted() { return fs.existsSync(path.join(workspace, 'cmd-started.txt')); }
+  await waitFor(cmdStarted, '对话 CMD 真实启动标记');
+  check(report.paths[launchCount] === path.join(workspace, launchNames[3]), '对话里的相对 CMD 实际执行并写入标记');
+  await clickChatFile(chatHtml);
+  /** 等待默认浏览器访问 HTML 中的本机地址。 */
   function htmlOpened() { return report.requests.includes('/local-html'); }
-  await waitFor(htmlOpened, '默认浏览器打开本地 HTML');
-  check(true, 'HTML 实际通过系统默认浏览器打开并访问本机验证页');
+  await waitFor(htmlOpened, '默认浏览器打开对话里的 HTML');
+  check(report.paths.length === launchCount + 2 && report.paths[launchCount + 1] === chatHtml, '对话里的绝对 HTML 仅打开一次，默认浏览器访问本机验证页');
+  check(win.webContents.getURL() === chatUrl && await page('document.getElementById("preview-path").textContent') === previewPath, '聊天文件锚点保留当前会话和已有侧栏预览');
+
+  await page('document.querySelector("#messages [data-expand-files]").click();document.querySelector("#messages .file-card [data-preview-file]").click();true');
+  /** 等待文件变更卡片刷新为脚本的只读内容。 */
+  async function cardPreviewed() { return await page('document.getElementById("preview-body").textContent.includes("cmd-started.txt")'); }
+  await waitFor(cardPreviewed, '变更卡片只读预览');
+  check(report.paths.length === launchCount + 2, '变更卡片继续只读预览，不启动脚本');
+
+  const exeIndex = report.paths.length;
+  if (desktopClick) {
+    const selector = '#messages a[data-preview-file="' + encodeURIComponent(chatExe) + '"]';
+    await page('(function(){window.__systemOpenTest.showChat();document.querySelector(' + JSON.stringify(selector) + ').scrollIntoView({block:"center"});return true;})()');
+    showChatFixture = true;
+    win.setTitle('SpCode 对话标签鼠标验收');
+    // 单击前将隔离验收窗口放在桌面前方，避免普通窗口覆盖聊天气泡。
+    win.setAlwaysOnTop(true);
+    win.show();
+    console.log('DESKTOP_CLICK_READY ' + win.getTitle());
+  } else {
+    await clickChatFile(chatExe);
+  }
+  /** 等待「新版程序」实际运行，进程在自身目录写入本次验收标记。 */
+  function exeStarted() { return fs.existsSync(path.join(workspace, 'exe-started.txt')); }
+  await waitFor(exeStarted, '新版程序真实启动标记', desktopClick ? DESKTOP_CLICK_WAIT_MS : WAIT_MS);
+  report.chatClicks = await page('window.__chatFileClicks');
+  if (desktopClick) {
+    const exeClick = report.chatClicks.find(function isExeClick(click) { return click.label === '新版程序'; });
+    check(exeClick && exeClick.trusted && exeClick.button === 0 && exeClick.detail === 1, '新版程序标签收到真实鼠标左键单击');
+    win.hide();
+  }
+  check(report.paths.length === exeIndex + 1 && report.paths[exeIndex] === chatExe, '新版程序标签仅启动指定 EXE 一次，并写入受控标记');
+  check(win.webContents.getURL() === chatUrl, '启动新版程序后聊天仍在原页面');
+
+  await clickTree(launchNames[2], false);
+  /** 等待测试 BAT 实际运行并写入本次验收标记。 */
+  function batStarted() { return fs.existsSync(path.join(workspace, 'bat-started.txt')); }
+  await waitFor(batStarted, 'BAT 真实启动标记');
+  check(true, 'BAT 实际由系统启动并写入受控标记');
   const pageUrl = win.webContents.getURL();
   const windows = BrowserWindow.getAllWindows().length;
   await clickWeb(win.webContents, baseUrl + '/external-live?a=1&b=2', '_blank');

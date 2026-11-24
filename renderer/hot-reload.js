@@ -1,9 +1,9 @@
 /**
- * 将源码更新通知排到界面空闲后执行，保留单次页面重载所需的临时快照。
+ * 将已请求的重载排到界面空闲后执行，保留单次页面重载所需的临时快照。
  * 所有窗口、存储和 IPC 操作由调用方注入；模块本身不写会话文件、不取消正在执行的任务。
  * @param {object} options 宿主回调集合；isBusy() 同步返回是否有未完成任务；saveSnapshot(revision)
- * 同步保存指定版本的一次性快照，clearSnapshot() 同步清除取消的快照；ready(revision) 返回
- * Promise<{ok:boolean}>，只有主进程确认可重载才返回 ok=true；refreshMetadata(update) 异步刷新资料；
+ * 同步保存并返回指定版本的一次性快照，clearSnapshot() 同步清除取消的快照；ready(revision, snapshot, update) 返回
+ * Promise<{ok:boolean}>，只有主进程接受当前采集阶段才返回 ok=true；restart 经双阶段全窗确认后自动重启，refreshMetadata(update) 异步刷新资料；
  * showStatus(message, failed) 同步更新状态提示，reportError(message, detail) 同步记录诊断。
  * 各回调不得自行触发另一次页面重载；快照、确认与初始化的执行顺序由本控制器管理。
  * @returns {{receive: function(object): Promise<void>, retry: function(): Promise<void>, initialize: function(number): Promise<void>}}
@@ -37,12 +37,12 @@ export function createHotReloadController(options) {
     const confirmationVersion = cancellationVersion;
     applying = true;
     try {
-      options.saveSnapshot(update.revision);
-      const result = await options.ready(update.revision);
+      const snapshot = options.saveSnapshot(update.revision);
+      const result = await options.ready(update.revision, snapshot, update);
       if (confirmationVersion === cancellationVersion && pending === update) {
         if (result.ok) {
           accepted = true;
-          options.showStatus('正在加载更新后的界面…', false);
+          options.showStatus(update.kind === 'restart' ? '窗口状态已就绪，正在准备加载新代码…' : '正在加载更新后的界面…', false);
         } else {
           options.clearSnapshot();
           options.showStatus('更新已排队，等待软件空闲后加载', false);
@@ -72,14 +72,15 @@ export function createHotReloadController(options) {
   }
 
   /**
-   * 接收有序的更新通知；业务模块更新刷新资料，预检通过的界面版本才请求真正重载。
+   * 接收有序通知；资料变更只刷新元数据，已请求的 renderer/restart 重载在空闲后恢复界面状态。
    * @param {object} update 主进程产生的 kind/revision/paths/message；旧版本普通通知忽略。
    * @returns {Promise<void>} 新保存或错误撤销旧候选和快照，重复有效版本仅按空闲条件重试。
    */
   async function receive(update) {
-    if (update && update.kind === 'renderer' && pending && update.revision === pending.revision) {
+    if (update && (update.kind === 'renderer' || update.kind === 'restart') && pending && update.revision === pending.revision) {
       // 主进程第二次空闲检查可以取消已接受的重载；撤销的是过期快照，不改变任何源码或会话文件。
       if (update.deferred === true) {
+        pending = update;
         accepted = false;
         cancellationVersion++;
         try {
@@ -96,11 +97,11 @@ export function createHotReloadController(options) {
     }
     if (!update || update.revision <= receivedRevision) return;
     receivedRevision = update.revision;
-    if (update.kind === 'renderer') {
+    if (update.kind === 'renderer' || update.kind === 'restart') {
       if (pending || accepted) cancelPending();
       pending = update;
       failedRevision = null;
-      options.showStatus('界面更新已排队，空闲后自动加载', false);
+      options.showStatus(update.kind === 'restart' ? '已请求手动重载，全部窗口空闲后重启并恢复状态' : '已请求界面重载，空闲后加载', false);
       await retry();
       return;
     }
@@ -112,7 +113,7 @@ export function createHotReloadController(options) {
       await refreshMetadata(update);
       return;
     }
-    if (update.kind === 'validating' || update.kind === 'restart' || update.kind === 'error') {
+    if (update.kind === 'validating' || update.kind === 'error') {
       cancelPending();
       if (update.kind === 'validating') {
         options.showStatus(update.message, false);

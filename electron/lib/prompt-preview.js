@@ -268,14 +268,14 @@ function build(ctx) {
     system,
     // 内部模块预览复用实际构建器；派单、差异和路径相关技术约束在调用时追加。
     modules: {
-      code: buildModulePrompt('code', { rules, skill }),
-      summary: buildModulePrompt('summary', { rules, skill }),
-      planning: buildModulePrompt('planning', { rules, skill })
+      code: buildModulePrompt('code', { rules, skill, agi: agiNow }),
+      summary: buildModulePrompt('summary', { rules, skill, agi: agiNow }),
+      planning: buildModulePrompt('planning', { rules, skill, agi: agiNow })
     },
     editable: {
       persona,
       rules: rules.map((r) => ({ name: r.name, body: r.body })),
-      skill: skill ? { id: skill.id, name: skill.name, body: skill.body } : null,
+      skill: skill ? { id: skill.id, name: skill.name, body: skillsLib.skillTextForMode(skill.body, agiNow) } : null,
       summary: String(contextSummary || '')
     },
     // 这些内容发送时才现场产生，预览里看不到，面板会按这些说明标注

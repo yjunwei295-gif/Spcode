@@ -33,7 +33,8 @@ function installSessionHandlers() {
   const start = mainSource.indexOf('const sessionMetaCache = new Map();');
   const end = mainSource.indexOf("ipcMain.handle('sessions:rename'", start);
   assert.ok(start >= 0 && end > start);
-  vm.runInNewContext(mainSource.substring(start, end), { fs, path, ipcMain: { handle }, sessionDir, require: dependency, console });
+  vm.runInNewContext(mainSource.substring(start, end), { fs, path, ipcMain: { handle }, sessionDir, require: dependency, console,
+    distillSubmittedRequirements: require('../electron/lib/composer-requirements').distillSubmittedRequirements });
   ipcMain.handle('history-test-save', handlers['sessions:save']);
   ipcMain.handle('history-test-load', handlers['sessions:load']);
   ipcMain.handle('history-test-draft', handlers['sessions:saveComposer']);
@@ -44,11 +45,10 @@ function installSessionHandlers() {
 async function main() {
   await app.whenReady();
   installSessionHandlers();
-  const keyStart = source.indexOf("  $('input').addEventListener('keydown', (e) => {");
-  const keyEnd = source.indexOf("\n  document.addEventListener('paste',", keyStart);
-  const floatStart = source.indexOf('if (api.onFloatUserMessage) {');
+  const keyBinding = source.indexOf("$('input').addEventListener('keydown', handleComposerKeydown);");
+  const floatStart = source.indexOf('// 悬浮窗需求按绑定标签入队');
   const floatEnd = source.indexOf('// 小窗里点了别的标签', floatStart);
-  assert.ok(keyStart >= 0 && keyEnd > keyStart && floatStart >= 0 && floatEnd > floatStart);
+  assert.ok(keyBinding >= 0 && floatStart >= 0 && floatEnd > floatStart);
   const win = new BrowserWindow({ show: false, webPreferences: { nodeIntegration: true, contextIsolation: false } });
   try {
     await win.loadURL('data:text/html,<textarea id="input"></textarea><div id="slash-menu" class="hidden"></div><div id="at-menu" class="hidden"></div><div id="messages"></div>');
@@ -60,6 +60,7 @@ async function main() {
       let interjectResolve;
       let hasModel = true;
       let floatMessage;
+      let composerPrediction = null;
       const writes = [];
       const payloads = [];
       const SAVE_THINK_STEPS = 60;
@@ -104,13 +105,17 @@ async function main() {
       ${functionSource('async function persistMessages(tab)')}
       ${functionSource('function settleDeadTurns(messages)')}
       ${functionSource('function hydrateTab(data, fallbackWs)')}
+      ${functionSource('function refreshComposerPrediction(cancelPending = false)')}
+      ${functionSource('function refreshComposerRequirements()')}
+      ${functionSource('function composerPredictionBlocked()')}
       ${functionSource('function onInput()')}
       ${functionSource('function submittedTextHistory(tab)')}
       ${functionSource('function recordSubmittedText(tab, text)')}
-      ${functionSource('function receiveFloatInterjection(payload)')}
+      ${functionSource('async function receiveFloatRequest(payload)')}
       ${functionSource('function recallSubmittedText(event)')}
       ${functionSource('async function send(options = {})')}
-      ${source.substring(keyStart, keyEnd)}
+      ${functionSource('function handleComposerKeydown(event)')}
+      $('input').addEventListener('keydown', handleComposerKeydown);
       ${source.substring(floatStart, floatEnd)}
       const passes = [];
       function check(value, name) { if (!value) throw new Error(name); passes.push(name); }
@@ -161,16 +166,14 @@ async function main() {
       $('at-menu').classList.remove('hidden');
       check(!up() && !down(), 'reference menu keeps arrow navigation');
       $('at-menu').classList.add('hidden');
-      $('input').value = '第三条插话';
-      const interjecting = send();
-      check(a.submittedTextHistory.join('|') === '第一条已提交|' + queued + '|第三条插话' && $('input').value === '', 'interjection appended before async acknowledgement');
+      $('input').value = '第三条整合需求';
+      await send();
+      check(a.submittedTextHistory.join('|') === '第一条已提交|' + queued + '|第三条整合需求' && $('input').value === '', 'integrated submission appended when queued');
       await flushSaves();
       const pendingDisk = await ipcRenderer.invoke('history-test-load', 'a');
-      check(pendingDisk.submittedTextHistory[2] === '第三条插话' && pendingDisk.composer === null, 'unacknowledged interjection is already saved without old draft');
-      interjectResolve({ ok: true });
-      await interjecting;
-      check(up() && $('input').value === '第三条插话' && up() && $('input').value === queued && up() && $('input').value === '第一条已提交', 'up traverses interjection, queued and normal records in order');
-      check(a.messages[0].text.includes('第三条插话') && $('messages').textContent.includes('第三条插话'), 'accepted interjection remains visible after repaint');
+      check(pendingDisk.submittedTextHistory[2] === '第三条整合需求' && pendingDisk.composer === null, 'queued submission is saved without its consumed draft');
+      check(up() && $('input').value === '第三条整合需求' && up() && $('input').value === queued && up() && $('input').value === '第一条已提交', 'up traverses integrated, queued and normal records in order');
+      check(a.queue[2].integrate && a.messages.length === 0, 'integrated request stays in the queue during the current reply');
       $('input').value = '';
       state.activeTab = 'b';
       check(!up(), 'another empty tab cannot recall first tab');
@@ -186,40 +189,34 @@ async function main() {
       check(up() && $('input').value === '尚未处理的队列正文' && up() && $('input').value === '旧插话原文' && up() && $('input').value === '已存用户原文', 'legacy migration includes interjections and queue, excluding assistant and attachment names');
       $('input').value = '';
       state.activeTab = 'a';
-      check(up() && $('input').value === '第三条插话', 'switching back retains own submission list');
+      check(up() && $('input').value === '第三条整合需求', 'switching back retains own submission list');
       hasModel = false;
       $('input').value = '没有模型时未提交';
       await send();
       check(a.submittedTextHistory.length === 3, 'rejected send does not append history');
       hasModel = true;
-      $('input').value = '延迟回执插话';
-      const delayed = send();
+      $('input').value = '等待整合的需求';
+      await send();
       $('input').value = '随后输入的新草稿';
       state.attachments = [{ path: 'new.png', name: '新附件' }];
       state.activeTab = 'b';
-      interjectResolve({ ok: true });
-      await delayed;
-      check($('input').value === '随后输入的新草稿' && state.attachments[0].path === 'new.png', 'delayed acknowledgement preserves new draft and attachments');
-      check(a.submittedTextHistory[3] === '延迟回执插话' && b.submittedTextHistory.length === 0, 'tab switch during acknowledgement records original conversation only');
-      floatMessage({ tabId: 'a', text: '小窗已投递插话', interjection: true });
-      check(a.submittedTextHistory[4] === '小窗已投递插话' && b.submittedTextHistory.length === 0, 'real float callback records bound tab while another tab is active');
-      check($('input').value === '随后输入的新草稿' && state.attachments[0].path === 'new.png', 'float interjection registration preserves active composer');
+      check(a.submittedTextHistory[3] === '等待整合的需求' && b.submittedTextHistory.length === 0, 'queued submission is recorded only in its original conversation');
+      await floatMessage({ tabId: 'a', text: '小窗已整合需求', attachments: [], images: [] });
+      check(a.submittedTextHistory[4] === '小窗已整合需求' && b.submittedTextHistory.length === 0 && a.queue.at(-1).integrate, 'float callback queues only for its bound tab while another tab is active');
+      check($('input').value === '随后输入的新草稿' && state.attachments[0].path === 'new.png', 'float submission preserves the active composer');
       state.activeTab = 'a';
       state.attachments = [];
       state.contextPaths = ['original-reference'];
       $('input').value = '排队插话';
-      const failing = send();
-      $('input').value = '失败回执前的新草稿';
+      await send();
+      $('input').value = '提交后的新草稿';
       state.attachments = [{ path: 'later.png', name: '后续附件' }];
       state.contextPaths = ['later-reference'];
-      a.sending = false;
-      a.draining = false;
-      interjectResolve({ ok: false });
-      await failing;
       const queuedItem = a.queue[a.queue.length - 1];
-      check(queuedItem.text === '排队插话' && queuedItem.attachments.length === 0 && queuedItem.contextPaths[0] === 'original-reference', 'failed interjection queues exact snapshot');
-      check($('input').value === '失败回执前的新草稿' && state.attachments[0].path === 'later.png' && state.contextPaths[0] === 'later-reference', 'failed acknowledgement preserves new composer');
-      check(processed === 2 && a.submittedTextHistory.filter(function same(text) { return text === '排队插话'; }).length === 1, 'fallback queue starts without duplicate history entry');
+      check(queuedItem.integrate && queuedItem.text === '排队插话' && queuedItem.attachments.length === 0 && queuedItem.contextPaths[0] === 'original-reference', 'queued submission retains the original snapshot');
+      check($('input').value === '提交后的新草稿' && state.attachments[0].path === 'later.png' && state.contextPaths[0] === 'later-reference', 'later draft keeps its own snapshot');
+      check(processed === 1 && a.submittedTextHistory.filter(function same(text) { return text === '排队插话'; }).length === 1, 'current task keeps running and submission is recorded only once');
+      a.sending = false;
       state.attachments = [];
       state.contextPaths = [];
       $('input').value = '排队插话';

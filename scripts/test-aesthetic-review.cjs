@@ -233,6 +233,47 @@ async function main() {
     }
     if (mode === 'partial-subjects') check(!result.passed && result.report.includes('未成功查看被审成果 other.html'), '多个成果不能共用未关联的画面证据');
   }
+  const shotDir = path.join(dir, 'captured');
+  const recordedFrames = [
+    { path: path.join(shotDir, 'first.png'), title: '实际预览', timeMs: 120, question: '城堡' },
+    { path: path.join(shotDir, 'second.png'), title: '实际预览', timeMs: 140, question: '太空站' }
+  ];
+  const viewSources = [];
+  /** 记录真实工具将每个编号解析到指定文件，返回用于传输断言的测试像素。 */
+  async function recordedView(workspace, args, candidates) {
+    assert.equal(workspace, shotDir);
+    viewSources.push(args.source);
+    return fixtureView(workspace, args, candidates);
+  }
+  referenceTools.viewImage = recordedView;
+  for (mode of ['recorded-themes', 'unrelated-recording-subject']) {
+    /** 请求同一成果的两套主题画面；成果路径不匹配时应在读文件前拒绝。 */
+    async function requestRecordedThemes(options) {
+      const last = options.messages.at(-1);
+      if (typeof last.content === 'string') {
+        assert.match(last.content, /录屏帧1.*城堡/u);
+        assert.match(last.content, /录屏帧2.*太空站/u);
+        assert.ok(!last.content.includes(shotDir));
+        const subject = mode === 'recorded-themes' ? 'page.html' : 'other.html';
+        return { tool_calls: [
+          toolCall('view_review_image', { source: '录屏帧1', subject }, 'castle'),
+          toolCall('view_review_image', { source: '录屏帧2', subject }, 'orbit')
+        ] };
+      }
+      assert.equal(last.content.filter(function image(part) { return part.type === 'image_url'; }).length, 2);
+      return { content: '【审美投票】通过\n【挑刺】\n无' };
+    }
+    viewSources.length = 0;
+    const result = await review.review({ models: okModels, changes: [{ path: 'page.html' }], workspace: dir, recordedFrames,
+      systemPrompt: review.criticInstruction(), completeFn: requestRecordedThemes, prepareImages: fixturePrepare });
+    if (mode === 'recorded-themes') {
+      check(result.passed && viewSources.filter(function castle(name) { return name === 'first.png'; }).length === 2
+        && viewSources.filter(function orbit(name) { return name === 'second.png'; }).length === 2,
+      '每位评委都能查看同一成果的两个实际录屏编号');
+    } else {
+      check(!result.passed && viewSources.length === 0, '未关联当前成果的录屏编号不会读取源文件');
+    }
+  }
   referenceTools.searchImages = originalSearch;
   referenceTools.viewImage = originalView;
   fs.rmSync(dir, { recursive: true, force: true });

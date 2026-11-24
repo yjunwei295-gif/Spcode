@@ -155,7 +155,12 @@ async function renderer() {
   const sandbox = { state, console, Set, Map, Date,
     api: {
       longAliveAccept: async function accept() { return true; },
-      longAliveFinish: async function finish(result) { finished++; check(result.messages.length === 2, '归档只包含当前自动轮'); },
+      /** 归档前先核对生产渲染函数提交的结果，失败时保留实际报错。 */
+      longAliveFinish: async function finish(result) {
+        assert.equal(result.outcome, 'success', result.error);
+        finished++;
+        check(result.messages.length === 2, '归档只包含当前自动轮');
+      },
       chatSend: async function chat(payload) {
         calls++;
         assert.equal(payload.history.length, 2);
@@ -185,7 +190,7 @@ async function renderer() {
   };
   for (const name of ['renderQueue','renderChips','renderTabs','renderMessages','scrollMessagesToBottom',
     'syncSendBtn','armStallWatch','logSummaryTrace','revealRest','clearStallWatch','finishTypewriter',
-    'flushLivePaint','stopTypewriter','renderSidebar','persistTab']) sandbox[name] = function noop() {};
+    'flushLivePaint','stopTypewriter','renderSidebar','persistTab','retryHotReload']) sandbox[name] = function noop() {};
   sandbox.markTurnFailed = function failed(_message, error) { throw error; };
   vm.createContext(sandbox);
   vm.runInContext(send + resident, sandbox);

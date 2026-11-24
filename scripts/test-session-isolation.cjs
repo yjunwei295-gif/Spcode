@@ -60,6 +60,8 @@ function harness() {
   };
   const context = {
     state, console, Date, Map, Set, composerTimer: null, revealingMsgs: new Set(),
+    // 本夹具不创建预测界面，仍执行真实刷新入口的未挂载生命周期分支。
+    composerPrediction: null,
     $: function element(id) { return id === 'input' ? input : messages; },
     t: function translate(key) { return key; },
     uid: function identifier() { sequence += 1; return 'turn-' + sequence; },
@@ -103,9 +105,9 @@ function harness() {
   };
   vm.createContext(context);
   const names = ['activeSession', 'isActiveTab', 'isTabSending', 'tabQueue', 'findTabByTurnId',
-    'collectComposer', 'rememberComposer', 'clearComposer', 'persistTab', 'persistSession',
+    'collectComposer', 'refreshComposerPrediction', 'refreshComposerRequirements', 'rememberComposer', 'clearComposer', 'persistTab', 'persistSession',
     'hydrateTab', 'switchToTab', 'openHistorySession', 'stopTypewriter', 'finishTypewriter',
-    'abortTab', 'beginRefillResend', 'isStopError', 'sendOne', 'processQueue', 'send'];
+    'abortTab', 'beginRefillResend', 'isStopError', 'sendOne', 'takeQueuedTask', 'processQueue', 'send'];
   for (const name of names) vm.runInContext(production(name), context);
   return { context, state, input, writes, requests, events, cancellations, loads };
 }
@@ -203,11 +205,11 @@ async function overrideOwnership() {
 }
 
 /**
- * 在 A 的重发确认等待期间切到 B，核对确认、取消以及空闲/排队/插话三条路径的载荷归属。
+ * 在 A 的重发确认等待期间切到 B，核对确认、取消以及空闲、排队与带预览的排队三条路径的载荷归属。
  * @returns {Promise<void>} 所有确认分支完成后兑现；执行真实 send 和队列函数，模型与快照恢复仅记录参数。
  */
 async function resendConfirmationOwnership() {
-  for (const mode of ['idle', 'queued', 'interject']) {
+  for (const mode of ['idle', 'queued', 'queued-image']) {
     for (const choice of ['keep', 'revert', 'new', 'cancel']) {
       const h = harness();
       const a = addTab(h, 'a');
@@ -226,13 +228,11 @@ async function resendConfirmationOwnership() {
       h.state.refillFromIndex = 1;
       h.input.value = 'A确认前提交的正文';
       h.state.contextPaths = ['reference-a'];
-      h.state.attachments = [{ path: 'attachment-a', name: 'A附件', preview: mode === 'interject' ? 'image-a' : undefined }];
+      h.state.attachments = [{ path: 'attachment-a', name: 'A附件', preview: mode === 'queued-image' ? 'image-a' : undefined }];
       h.context.skillStack = selectedSkills;
       h.context.refreshAfterRestore = noop;
       const confirmation = deferred();
-      const interjections = [];
       h.context.confirmSubmitFromPrevious = confirm;
-      h.context.api.chatInterject = interject;
       vm.runInContext(production('refillHasTail'), h.context);
       const sending = h.context.send();
       check(mode + '/' + choice + '确认前未提交也未消费A输入', h.requests.length === 0 && a.queue.length === 0 && h.input.value === 'A确认前提交的正文');
@@ -248,24 +248,20 @@ async function resendConfirmationOwnership() {
       await sending;
       check(mode + '/' + choice + '确认返回保留B正文附件引用编辑锚点及保存计时器', h.state.activeTab === b.id && h.input.value === 'B确认期间的新草稿' && h.state.attachments[0].path === 'attachment-b' && h.state.contextPaths[0] === 'reference-b' && b.refillFromIndex === 1 && b.refillRevertFiles && h.state.refillFromIndex === 1 && h.state.refillRevertFiles && h.context.composerTimer === 55 && b.messages.length === 2);
       if (choice === 'cancel') {
-        check(mode + '取消原确认不提交A且保留A草稿', h.requests.length === 0 && a.queue.length === 0 && interjections.length === 0 && a.composer.text === 'A确认前提交的正文' && a.refillFromIndex === 1);
+        check(mode + '取消原确认不提交A且保留A草稿', h.requests.length === 0 && a.queue.length === 0 && a.composer.text === 'A确认前提交的正文' && a.refillFromIndex === 1);
         continue;
       }
-      const submitted = mode === 'idle' ? h.requests[0] : mode === 'queued' ? a.queue[0] : interjections[0];
+      const submitted = mode === 'idle' ? h.requests[0] : a.queue[0];
       check(mode + '/' + choice + '只提交A确认前的正文与附件', submitted.text === 'A确认前提交的正文' && submitted.attachments[0].path === 'attachment-a' && a.composer === null);
-      if (mode !== 'interject') {
-        check(mode + '/' + choice + '模型技能引用保持A归属', submitted.modelId === 'model-a' && submitted.skillIds[0] === 'skill-a' && submitted.contextPaths[0] === 'reference-a');
-      } else {
-        check(mode + '/' + choice + '插话只投递原会话', submitted.tabId === a.id);
-      }
+      check(mode + '/' + choice + '模型技能引用保持A归属', submitted.modelId === 'model-a' && submitted.skillIds[0] === 'skill-a' && submitted.contextPaths[0] === 'reference-a');
+      if (mode !== 'idle') check(mode + '/' + choice + '只有另起需求可整合', submitted.integrate === (choice === 'new'));
+      if (mode === 'queued-image') check(mode + '/' + choice + '保留原图预览', submitted.attachments[0].preview === 'image-a');
       check(mode + '/' + choice + '未恢复B快照', !h.events.some(isForeignRestore));
 
       /** 返回当前标签技能；无参数，返回独立ID数组，不修改状态。 */
       function selectedSkills() { return [h.state.activeTab === a.id ? 'skill-a' : 'skill-b']; }
       /** 延迟原会话确认；无参数，返回受控Promise，不改变输入或导航。 */
       function confirm() { return confirmation.promise; }
-      /** 记录真实插话载荷；payload为提交对象，返回成功回执，不启动模型。 */
-      async function interject(payload) { interjections.push(payload); return { ok: true }; }
       /** event为快照操作记录；返回是否错误引用B，不修改记录。 */
       function isForeignRestore(event) { return event[0] === 'restore' && event[1].workspace === 'owner-b'; }
     }
@@ -499,7 +495,16 @@ async function snapshotWorkspaceOwnership() {
   assert.ok(begin >= 0 && end > begin);
   vm.runInNewContext(main.substring(begin, end), {
     ipcMain: { handle: function register(name, handler) { handlers.set(name, handler); } },
-    snapshot: { restore: function record(workspace, id) { restored.push({ workspace, id }); return { ok: true }; } },
+    snapshot: {
+      /**
+       * 记录快照还原 IPC 的参数，供测试核对，不操作项目文件。
+       * @param {string} workspace IPC 指定的快照所属项目目录。
+       * @param {string} id IPC 指定的快照编号。
+       * @param {string} [filePath] 单文件还原的项目相对路径，整份还原时为 undefined。
+       * @returns {{ok: boolean}} 固定返回成功回执。
+       */
+      restore: function record(workspace, id, filePath) { restored.push({ workspace, id, filePath }); return { ok: true }; }
+    },
     workspaceByWin: { get: function wrongOwner() { throw new Error('不应读取前台项目'); } }
   });
   const electron = {
@@ -520,6 +525,7 @@ async function snapshotWorkspaceOwnership() {
   h.state.activeTab = b.id;
   h.state.workspace = b.workspace;
   h.context.api.restoreSnapshot = bridge.restoreSnapshot;
+  h.context.api.restoreSnapshotFile = bridge.restoreSnapshotFile;
   h.context.refreshAfterRestore = noop;
   await h.context.beginRefillResend(a);
   check('后台A已确认的快照处理跨preload和IPC仍使用A项目', restored[0].workspace === 'owner-a' && restored[0].id === 'a-snapshot');
@@ -536,9 +542,15 @@ async function snapshotWorkspaceOwnership() {
   h.context.restore = 'clicked-snapshot';
   h.context.openModal = noop;
   h.context.t = function translate(key) { return key; };
+  h.context.escapeHtml = String;
   const button = { getAttribute: function id() { return 'clicked-snapshot'; }, textContent: '' };
   h.context.e = { target: { closest: function target() { return button; } } };
-  for (const entry of [{ name: 'sidebarClick', code: sideCode }, { name: 'messageClick', code: messageCode }]) {
+  const selectedPath = '子目录/目标.js';
+  const entries = [
+    { name: 'sidebarClick', code: sideCode, selection: { path: selectedPath } },
+    { name: 'messageClick', code: messageCode, selection: {} }
+  ];
+  for (const entry of entries) {
     const confirmed = deferred();
     h.state.activeTab = a.id;
     h.state.workspace = a.workspace;
@@ -547,12 +559,14 @@ async function snapshotWorkspaceOwnership() {
     const clicking = h.context[entry.name]();
     h.state.activeTab = b.id;
     h.state.workspace = b.workspace;
-    confirmed.resolve(true);
+    confirmed.resolve(entry.selection);
     await clicking;
   }
   check('侧栏和消息点击确认期间切项目仍保留原快照项目', restored.length === 3 && restored[1].workspace === 'owner-a' && restored[2].workspace === 'owner-a');
+  check('历史快照单文件通过专用 IPC 保留路径，消息和重发仍为整份', restored[1].filePath === selectedPath && restored[0].filePath === undefined && restored[2].filePath === undefined);
   await assert.rejects(bridge.restoreSnapshot({ id: 'missing-owner' }), /未选择工作目录/);
-  check('快照IPC缺少明确所属项目时失败且不回落前台项目', restored.length === 3);
+  await assert.rejects(bridge.restoreSnapshotFile({ id: 'missing-path', workspace: 'owner-a' }), /未选择要还原的文件/);
+  check('快照 IPC 缺少项目或单文件路径时不执行文件操作', restored.length === 3);
 }
 
 /** 顺序执行并汇总行为回归；任一断言失败向进程返回非零退出码。 */

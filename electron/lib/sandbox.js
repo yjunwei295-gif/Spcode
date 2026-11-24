@@ -7,6 +7,14 @@ const { isInside, safeJoin } = require('./workspace');
 
 const DEFAULT_TIMEOUT_MS = 60 * 1000;
 const MAX_OUTPUT = 80_000;
+// cmd.exe 对完整进程命令行的系统上限，仅用于选择 PowerShell 脚本的传输方式。
+const CMD_LINE_LIMIT = 8191;
+// 子进程的参数只携带固定启动代码，脚本正文通过 UTF-8 标准输入传入。
+const POWERSHELL_STDIN_BOOTSTRAP =
+  '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ' +
+  '. ([ScriptBlock]::Create(' +
+  '[IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.Encoding]::UTF8).ReadToEnd() +' +
+  " [Environment]::NewLine + 'if (-not $?) { exit 1 }'))";
 // 进程已经退出、但管道被孙进程握着时，最多再等这么久就把本次命令收尾。
 // 正常命令的 close 会在这之前到来；start 拉起的 Chrome 则永远等不到 close。
 const EXIT_DRAIN_MS = 250;
@@ -80,10 +88,14 @@ function isReadonlyCommand(command) {
   return parts.every((p) => ro.test(p) || cdOnly.test(p));
 }
 
+/**
+ * 检查待执行命令是否触发沙盒拦截规则。
+ * @param {string} command 待检查的命令文本。
+ * @returns {string} 空命令或命中规则时返回拦截原因，允许执行时返回空字符串。
+ */
 function denyReason(command) {
   const cmd = String(command || '');
   if (!cmd.trim()) return '命令为空';
-  if (cmd.length > 4000) return '命令过长';
   for (const re of DENY_PATTERNS) {
     if (re.test(cmd)) return `沙盒拒绝执行高危命令（匹配：${re}）`;
   }
@@ -147,8 +159,23 @@ function releaseStdio(child) {
 }
 
 /**
- * @param {{ command: string, workspace: string, cwd?: string, timeoutMs?: number, signal?: AbortSignal }} opts
- * @returns {Promise<{ code: number|null, stdout: string, stderr: string, cwd: string, timedOut: boolean, blocked?: string }>}
+ * 取出需要从标准输入执行的 Windows PowerShell 脚本。
+ * @param {string} command 已通过沙盒规则的命令。长脚本使用完整的 powershell -NoProfile -Command "脚本正文" 形式。
+ * @returns {string|null} 返回脚本原文，其他命令返回 null 并沿用原有启动方式。
+ */
+function powershellScriptFromCommand(command) {
+  if (process.platform !== 'win32') return null;
+  // Node 为 Windows 的 shell 启动补上 cmd 路径、/d /s /c 和外层引号，一并计入系统上限。
+  const cmdOverhead = (process.env.ComSpec || 'cmd.exe').length + ' /d /s /c ""'.length;
+  if (command.length + cmdOverhead < CMD_LINE_LIMIT && !command.includes('\n') && !command.includes('\r')) return null;
+  const wrapped = /^powershell(?:\.exe)?[ \t]+-NoProfile[ \t]+-Command[ \t]+"([\s\S]*)"$/i.exec(command);
+  return wrapped ? wrapped[1] : null;
+}
+
+/**
+ * 在工作区执行已通过沙盒规则的命令，收集输出并处理超时或取消。
+ * @param {{ command: string, workspace: string, cwd?: string, timeoutMs?: number, signal?: AbortSignal }} opts 命令、工作区、可选相对目录及执行控制。
+ * @returns {Promise<{ code: number|null, stdout: string, stderr: string, cwd: string, timedOut: boolean, blocked?: string }>} 返回真实退出状态和输出或拦截原因。
  */
 function runSandboxed(opts) {
   const command = String(opts.command || '').trim();
@@ -194,16 +221,15 @@ function runSandboxed(opts) {
       return;
     }
 
-    const shell = process.platform === 'win32';
-    const child = spawn(command, {
-      cwd,
-      env: sanitizeEnv(),
-      shell,
-      windowsHide: true
-    });
+    const script = powershellScriptFromCommand(command);
+    const spawnOptions = { cwd, env: sanitizeEnv(), windowsHide: true };
+    const child = script === null
+      ? spawn(command, { ...spawnOptions, shell: process.platform === 'win32' })
+      : spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', POWERSHELL_STDIN_BOOTSTRAP], spawnOptions);
 
     let stdout = '';
     let stderr = '';
+    let inputError = null;
     let timedOut = false;
     let settled = false;
     let drainTimer = null;
@@ -265,10 +291,11 @@ function runSandboxed(opts) {
     const settle = (code) => {
       collect();
       let err = stderr;
+      if (inputError) err = `${err ? `${err}\n` : ''}发送 PowerShell 脚本失败：${inputError.message}`;
       if (timedOut) err = `${err ? `${err}\n` : ''}命令超时（${Math.round(timeoutMs / 1000)} 秒），已强制结束`;
       if (signal?.aborted) err = `${err ? `${err}\n` : ''}已停止`;
       finish({
-        code: timedOut || signal?.aborted ? null : code,
+        code: timedOut || signal?.aborted || (inputError && code === 0) ? null : code,
         stdout,
         stderr: err,
         cwd,
@@ -302,6 +329,12 @@ function runSandboxed(opts) {
     child.on('close', (code) => {
       settle(code);
     });
+    if (script !== null) {
+      /** 记录脚本传输失败，供进程退出时与真实退出码、输出一起返回。 */
+      function recordInputError(error) { inputError = error; }
+      child.stdin.on('error', recordInputError);
+      child.stdin.end(script, 'utf8');
+    }
   });
 }
 

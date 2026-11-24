@@ -129,7 +129,7 @@ async function runQuery(session, modelCfg, text, images, onEvent, signal) {
   }
 }
 
-async function runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false }) {
+async function runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false, shouldYield }) {
   sig = `${sig}\nagi:${!!agiMode}`;
   const specs = toolDefs(tools);
   let session = sessions.get(key);
@@ -157,7 +157,8 @@ async function runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, 
     for (let attempt = 0; ; attempt += 1) {
       session.turns += 1;
       const out = await runQuery(session, modelCfg, text, images, onEvent, signal);
-      if (!required.length || required.some((name) => stats.calls.includes(name))) return out;
+      // 新指令到达后交回宿主，旧任务不再催工具。
+      if (shouldYield?.() || !required.length || required.some((name) => stats.calls.includes(name))) return out;
       if (attempt >= 2) throw new Error('Claude 未调用本轮要求的 SpCode 工具，无法确认任务已执行。');
       onEvent({ type: 'rewrite_text', text: '' });
       onEvent({ type: 'status', text: 'Claude 还没有调用完成任务所需的 SpCode 工具，正在继续…' });

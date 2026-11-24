@@ -32,6 +32,36 @@ function parseSkillMeta(body) {
   return out;
 }
 
+/**
+ * 按本轮模式展开技能正文或目录简介中成对的普通模式专用标记。
+ * @param {string} text 原始技能文字，区块可跨行或嵌在一句简介中。
+ * @param {boolean} agi AGI 隐去区块，普通模式展示区块正文。
+ * @param {boolean} keepLines 按源码行读取或查找时保留隐藏区块的换行，行号仍对应磁盘文件。
+ * @returns {string} 供模型阅读的文字，技能编辑器和磁盘保留原文。
+ */
+function skillTextForMode(text, agi, keepLines = false) {
+  function visibleBlock(block, body) {
+    if (!agi) return body;
+    return keepLines ? body.replace(/[^\r\n]/g, '') : '';
+  }
+  return String(text || '').replace(/<!--normal-only-->([\s\S]*?)<!--\/normal-only-->/g, visibleBlock);
+}
+
+/**
+ * 从已展开的技能正文提取目录简介。
+ * @param {string} body 当前模式可见的正文。优先使用 YAML 简介，其次使用首行标题。
+ * @param {string} name 技能名，正文没有可用描述时作为目录名展示。
+ * @returns {string} 供目录使用的单条描述。
+ */
+function describeSkill(body, name) {
+  const meta = parseSkillMeta(body);
+  const first = body.split(/\r?\n/).find(function descriptionLine(line) {
+    const s = line.trim();
+    return s && s !== '---' && !/^[A-Za-z_][\w-]*\s*:/.test(s) && s !== '>' && s !== '>-';
+  }) || '';
+  return (meta.description || meta.desc || '').trim() || first.replace(/^#\s*/, '').trim() || name;
+}
+
 function readSkillDir(dir, scope) {
   if (!dir || !fs.existsSync(dir)) return [];
   const items = [];
@@ -48,15 +78,10 @@ function readSkillDir(dir, scope) {
     if (!md || !fs.existsSync(md)) continue;
     const body = fs.readFileSync(md, 'utf8');
     const name = ent.isDirectory() ? ent.name : path.basename(ent.name, '.md');
-    const meta = parseSkillMeta(body);
-    const first = body.split(/\r?\n/).find((l) => {
-      const s = l.trim();
-      return s && s !== '---' && !/^[A-Za-z_][\w-]*\s*:/.test(s) && s !== '>' && s !== '>-';
-    }) || '';
-    const desc = (meta.description || meta.desc || '').trim()
-      || first.replace(/^#\s*/, '').trim()
-      || name;
-    items.push({ id: name, name, desc, body, file: md, scope });
+    // 分别从当前模式的原文提取简介。先展开标记，避免跨行描述或首行标题泄露隐藏段。
+    const desc = describeSkill(skillTextForMode(body, false), name);
+    const agiDesc = body.includes('<!--normal-only-->') ? describeSkill(skillTextForMode(body, true), name) : desc;
+    items.push({ id: name, name, desc, agiDesc, body, file: md, scope });
   }
   return items;
 }
@@ -257,6 +282,6 @@ function savePersona(appRoot, body) {
 }
 
 module.exports = {
-  loadAll, listDetailed, saveSkill, deleteSkill, parseSkillMeta,
+  loadAll, listDetailed, saveSkill, deleteSkill, parseSkillMeta, skillTextForMode,
   loadRules, saveRule, deleteRule, loadPersona, savePersona
 };

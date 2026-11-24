@@ -4,7 +4,7 @@
   var READ = ['read_file', 'list_dir', 'process_memory'];
   var SEARCH = ['search_text', 'semantic_search', 'map_lookup', 'goto_definition'];
   var WRITE = ['write_file', 'edit_file', 'create_dir', 'delete_file'];
-  var DESKTOP = ['screen_read', 'screen_look', 'clipboard_look', 'mouse_click', 'mouse_drag', 'mouse_scroll', 'keyboard_key', 'keyboard_type', 'window_focus', 'window_list', 'ui_act', 'float_bar_move'];
+  var DESKTOP = ['screen_read', 'screen_look', 'screen_record', 'clipboard_look', 'mouse_click', 'mouse_drag', 'mouse_scroll', 'keyboard_key', 'keyboard_type', 'window_focus', 'window_list', 'ui_act', 'float_bar_move'];
   var MEDIA = ['generate_media', 'render_code_audio', 'render_code_video', 'analyze_audio', 'present_artifact', 'export_artifact'];
   /** 根据工具标识归类；命令用途只认上游显式提供的 activity。 */
   function activity(name, explicit) {

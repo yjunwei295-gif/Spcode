@@ -97,6 +97,55 @@ function evaluate(expression) {
 /** 给异步页面加载让出事件循环，不操纵用户前台焦点。 */
 function wait(ms) { return new Promise(function delayed(resolve) { setTimeout(resolve, ms); }); }
 
+/** 在桌宠渲染进程测量气泡的可见行数和距最新文本的滚动距离，单位为 CSS 像素。 */
+function readPetLayout() {
+  const label = document.getElementById('pet-label');
+  const style = getComputedStyle(label);
+  const contentHeight = label.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+  return {
+    inspect: typeof window.desktopPetInspect,
+    x: !!document.getElementById('pet-glasses-offset-x'), y: !!document.getElementById('pet-glasses-offset-y'),
+    balance: !!document.getElementById('pet-balance'), text: label.textContent,
+    contentHeight, lineHeight: parseFloat(style.lineHeight), overflow: style.overflowY,
+    scrollTop: label.scrollTop, bottomGap: label.scrollHeight - label.clientHeight - label.scrollTop
+  };
+}
+
+/**
+ * 向隔离 EXE 的桌宠发送正常的轮次与回复事件，等待真实气泡呈现长文本。
+ * @param {string} electron 现有测试连接里取得 Electron 模块的表达式。
+ * @returns {Promise<object>} 包含呈现后的几何和滚动位置。总超时沿用发布验证的看门狗。
+ */
+async function samplePet(electron) {
+  const windowExpr = electron + '.BrowserWindow.getAllWindows().find(function(w){return w.webContents.getURL().endsWith("/float-bar.html");})';
+  const inspect = 'window.desktopPetInspect?.()';
+  // 通过主界面的正式 IPC 绑定测试会话；空会话会重新请求历史，把尚未登记的消息清掉。
+  const bind = 'window.simple.floatBind("release-bubble","发布验证",true)';
+  await evaluate(electron + '.BrowserWindow.getAllWindows().find(function(w){return w.webContents.getURL().includes("/index.html");}).webContents.executeJavaScript(' + JSON.stringify(bind) + ')');
+  // 角色窗默认隐藏；先显示隔离实例，确保皮肤解码与首帧有机会完成。
+  const startedAt = Date.now();
+  let state;
+  do {
+    await wait(100);
+    state = await evaluate('(async function(){const w=' + windowExpr + ';if(!w)return null;if(!w.isVisible())w.showInactive();return w.webContents.executeJavaScript(' + JSON.stringify(inspect) + ');})()');
+    assert.ok(!state?.errors, '桌宠初始化出错：' + state?.errors);
+    assert.ok(Date.now() - startedAt < 15000, '等待角色窗初始化超时：' + JSON.stringify(state));
+  } while (!state?.skin || !state.key?.endsWith(':release-bubble'));
+  const text = ['第一行', '第二行', '第三行', '第四行', '第五行', '最新一行'].join('\n');
+  const turn = { sessionKey: state.key, turnId: 'release-bubble' };
+  const started = { ...turn, kind: 'turn-start' };
+  const reply = { ...turn, kind: 'ai', text };
+  await evaluate('(function(){const w=' + windowExpr + ';w.webContents.send("floatbar:event",' + JSON.stringify(started) + ');w.webContents.send("floatbar:event",' + JSON.stringify(reply) + ');return true;})()');
+  const measure = '(' + readPetLayout.toString() + ')()';
+  let layout;
+  do {
+    await wait(100);
+    layout = await evaluate(windowExpr + '.webContents.executeJavaScript(' + JSON.stringify(measure) + ')');
+    assert.ok(Date.now() - startedAt < 30000, '桌宠未收到测试回复：' + JSON.stringify(layout));
+  } while (layout.text !== text);
+  return layout;
+}
+
 /** 核对真实安装目录 EXE 的主进程、preload、账户 IPC 和新增桌宠控件。 */
 async function main() {
   const files = verifyApplicationFiles();
@@ -123,9 +172,12 @@ async function main() {
   const pageCode = '(async function(){const s=await window.simple.getState();return {build:window.__APP_BUILD,save:typeof window.simple.saveLocalImageGeneration,quota:typeof window.simple.reportAccountQuota,options:s.localImageGeneration,body:document.body.innerText.length};})()';
   const page = await evaluate('(async function(){const e=' + electron + ';const w=e.BrowserWindow.getAllWindows().find(function(w){return w.webContents.getURL().includes("/index.html");});return w.webContents.executeJavaScript(' + JSON.stringify(pageCode) + ');})()');
   check(page.save === 'function' && page.quota === 'function' && page.body > 0 && page.options !== undefined, '实际主界面及新增 preload IPC 可用');
-  const petCode = '(function(){const x=document.getElementById("pet-glasses-offset-x"),y=document.getElementById("pet-glasses-offset-y");return {inspect:typeof window.desktopPetInspect,x:!!x,y:!!y,balance:!!document.getElementById("pet-balance"),lines:getComputedStyle(document.getElementById("pet-label")).webkitLineClamp};})()';
-  const pet = await evaluate('(async function(){const e=' + electron + ';const w=e.BrowserWindow.getAllWindows().find(function(w){return w.webContents.getURL().includes("/float-bar.html");});return w.webContents.executeJavaScript(' + JSON.stringify(petCode) + ');})()');
-  check(pet.inspect === 'function' && pet.x && pet.y && pet.balance && pet.lines === '3', '实际 EXE 桌宠具有 X/Y 控件、余额及三行正文布局：' + JSON.stringify(pet));
+  const pet = await samplePet(electron);
+  const lines = require(path.join(applicationRoot, 'electron/lib/desktop-pet-config.json')).layout.dialogueLines;
+  check(pet.inspect === 'function' && pet.x && pet.y && pet.balance, '实际 EXE 包含桌宠检查接口、眼镜 X/Y 控件和余额');
+  // clientHeight 和 scrollHeight 取整，允许一个 CSS 像素的布局舍入差。
+  check(Math.abs(pet.contentHeight - lines * pet.lineHeight) <= 1 && pet.overflow === 'hidden' && pet.scrollTop > 0 && Math.abs(pet.bottomGap) <= 1,
+    '实际 EXE 桌宠保留长回复并显示最新 ' + lines + ' 行：' + JSON.stringify(pet));
   // 通过真实打包 preload 和主进程 IPC 开启再停止测试任务；长间隔确保不调用任何模型。
   const longAliveCode = '(async function(){const api=window.simple;const tabId="release-verification";await api.longAliveBind({tabId,workspace:' + JSON.stringify(root) + '});const started=await api.longAliveStart({tabId,goal:"仅核对发布 IPC，不执行外部任务",intervalSeconds:86400,timeoutSeconds:60});const stopped=await api.longAliveStop();const status=await api.longAliveStatus();return {button:!!document.getElementById("btn-long-alive"),started:started.enabled,stopped:!stopped.enabled,active:status.task.active,memory:status.memory.rss>0};})()';
   const longAlive = await evaluate('(async function(){const e=' + electron + ';const w=e.BrowserWindow.getAllWindows().find(function(w){return w.webContents.getURL().includes("/index.html");});return w.webContents.executeJavaScript(' + JSON.stringify(longAliveCode) + ');})()');

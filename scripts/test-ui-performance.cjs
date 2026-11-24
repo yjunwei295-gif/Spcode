@@ -7,7 +7,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
-const root = path.join(__dirname, '..');
+// 允许同一套真实 DOM 断言直接加载发布包中的页面和脚本。
+const root = path.resolve(process.argv[2] || path.join(__dirname, '..'));
 const source = fs.readFileSync(path.join(root, 'renderer/app.js'), 'utf8').split('\r\n').join('\n');
 const mainSource = fs.readFileSync(path.join(root, 'electron/main.js'), 'utf8');
 let checks = 0;
@@ -40,7 +41,8 @@ async function testSessions() {
   const start = mainSource.indexOf('const sessionMetaCache = new Map();');
   const end = mainSource.indexOf("ipcMain.handle('sessions:rename'", start);
   assert.ok(start >= 0 && end > start);
-  vm.runInNewContext(mainSource.substring(start, end), { fs, path, ipcMain: { handle }, sessionDir, require: dependency, console });
+  vm.runInNewContext(mainSource.substring(start, end), { fs, path, ipcMain: { handle }, sessionDir, require: dependency, console,
+    distillSubmittedRequirements: require('../electron/lib/composer-requirements').distillSubmittedRequirements });
   const full = { id: 'history', title: '测试对话', workspace: 'fixture', messages: [
     { role: 'user', text: '原始消息' }, { role: 'assistant', text: '历史正文'.repeat(400000) }
   ], composer: { text: '旧草稿' } };
@@ -127,7 +129,7 @@ function rendererSetup() {
   Object.assign(window, { $, activeSession, skillStack, prefersReducedMotion, renderMarkdown, paintLiveAssistant,
     persistTab, requestAnimationFrame, flushFrames, api, sameWorkspace, setWorkspace, persistSession,
     showChat, applyTabContext, restoreLastSession, newTab, state, metrics, frames, assistant, tab,
-    revealingMsgs: new WeakSet(), composerTimer: null,
+    revealingMsgs: new WeakSet(), composerTimer: null, composerPrediction: null, composerSessionsLoaded: false,
     renderTabs: noOp, renderQueue: noOp, syncSendBtn: noOp, renderSidebar: noOp, syncAgentBtn: noOp, loadFileTree, renderMessages });
 }
 
@@ -172,7 +174,9 @@ async function testRenderer() {
     await win.loadURL('data:text/html,<textarea id="input"></textarea><div id="slash-menu" class="hidden"></div><div id="at-menu" class="hidden"></div><div id="messages"><div class="msg assistant" data-msg-i="1"><div class="bubble"></div></div></div>');
     await win.webContents.executeJavaScript('(' + rendererSetup.toString() + ')()');
     const signatures = ['function collectComposer()', 'function hasComposerContent(c)', 'function rememberComposer(tab)',
-      'function saveComposerDraft()', 'function onInput()', 'function typeStep(behind)', 'function paintRevealBubble(msg, done)',
+      'function saveComposerDraft()', 'function refreshComposerPrediction(cancelPending = false)',
+      'function refreshComposerRequirements()', 'async function loadComposerSessions()', 'function onInput()',
+      'function typeStep(behind)', 'function paintRevealBubble(msg, done)',
       'function ensureTypewriter()', 'async function openProject(dir)', 'async function showProjectSession(ws)',
       'async function refreshMeta()', 'async function loadMilestones()', 'async function loadGlobalMemory()', 'async function loadSnapshotMax()'];
     for (const signature of signatures) await win.webContents.executeJavaScript(functionSource(signature));
@@ -185,7 +189,7 @@ async function testRenderer() {
 /** 注入完整页面的本地 API，所有模型和磁盘返回均使用测试数据。 */
 function fullPageSetup() {
   localStorage.setItem('spcode.onboarding.completed', 'true');
-  const record = { errors: [], drafts: [], fullSaves: 0, stream: '', turnId: '', resolveTurn: null };
+  const record = { errors: [], drafts: [], requests: [], fullSaves: 0, stream: '', turnId: '', resolveTurn: null };
   function noOp() {}
   async function emptyList() { return []; }
   async function nullValue() { return null; }
@@ -201,17 +205,27 @@ function fullPageSetup() {
     // 模型保存回包同步包含厂商派生的视频候选，夹具遵循真实 IPC 契约。
     saveModels: async function saveModels() { return { videoProviderModels: [] }; },
     onChatEvent: function onChatEvent(callback) { window.emitTestChat = callback; },
+    onFloatUserMessage: function onFloatUserMessage(callback) { window.emitFloatMessage = callback; },
+    chatInterject: function chatInterject() { throw new Error('整合需求不应调用实时插话接口'); },
     onWorkspaceChanged: noOp, onUiRefresh: noOp, onDownloadProgress: noOp, onIndexProgress: noOp,
+    onHotReload: function onHotReload() { return noOp; }, hotReloadStatus: nullValue,
     // 余额同步是新增的主窗桥接口，完整页面夹具同步提供入口。
     reportAccountQuota: noOp,
     floatBind: noOp, floatForget: noOp, floatCanStart: noOp, logSummaryTrace: noOp,
     reportError: function reportError(stage, details) {
       if (stage === '界面脚本报错' || stage === '界面未处理的 Promise 拒绝') record.errors.push({ stage, details });
     },
-    saveSession: async function saveSession() { record.fullSaves++; return true; },
+    /** 记录当前测试轮的会话保存回执，供核对三段回复的原文。 */
+    saveSession: async function saveSession(session) {
+      record.fullSaves++;
+      record.savedAssistant = session.messages.find(function current(message) { return message.turnId === record.turnId; });
+      return true;
+    },
     saveComposer: async function saveComposer(draft) { record.drafts.push(draft); return true; },
     chatSend: function chatSend(payload) {
+      record.requests.push(payload);
       record.turnId = payload.turnId;
+      record.tabId = payload.tabId;
       return new Promise(function pending(resolve) { record.resolveTurn = resolve; });
     },
     contextPreview: async function contextPreview() { return {}; }
@@ -285,6 +299,116 @@ async function testFullPage() {
     check(result.bubble === result.stream && result.stream.length > 0, '真实事件链结束后完整展示最终回复');
     assert.equal(result.errors.length, 0, JSON.stringify(result.errors));
     check(true, '完整页面初始化与输入无脚本异常');
+    const batches = await win.webContents.executeJavaScript('(' + async function verifyIntegratedQueue() {
+      const record = fullPageRecord;
+      const input = document.getElementById('input');
+      const enqueue = document.getElementById('btn-enqueue');
+      const firstIndex = record.requests.length;
+      /** 等待生产发送入口到达指定轮次，出现多余请求立即失败。 */
+      async function waitForTurn(count) {
+        for (let i = 0; i < 100; i++) {
+          if (record.requests.length >= count) {
+            if (record.requests.length !== count) throw new Error('出现额外模型请求');
+            return;
+          }
+          await new Promise(function wait(resolve) { setTimeout(resolve, 20); });
+        }
+        throw new Error('未启动下一轮整合需求');
+      }
+      /** 通过真实按钮提交一条主窗需求。 */
+      function submit(text) {
+        input.value = text;
+        enqueue.click();
+      }
+      /**
+       * 发出当前轮的最终事件，主进程回执仍可延后。
+       * @param {string} text 当前轮显示的最终答复。
+       * @param {boolean} taskSettled 当前任务是否完成。
+       * @returns {void} 事件交给真实页面处理。
+       */
+      function showDone(text, taskSettled = true) {
+        emitTestChat({ type: 'done', turnId: record.turnId, text, taskSettled });
+      }
+      /**
+       * 兑现当前轮发送入口等待的主进程回执。
+       * @param {string} text 当前轮的最终答复。
+       * @param {boolean} taskPending 当前任务是否还要继续。
+       * @returns {void} 恢复发送流程。
+       */
+      function endTurn(text, taskPending = false) { record.resolveTurn({ text, changes: [], taskPending }); }
+      /** 从真实队列 DOM 取还未送入模型的文本。 */
+      function pendingText() { return document.getElementById('queue').textContent; }
+
+      input.value = '原始任务';
+      document.getElementById('btn-send').click();
+      await waitForTurn(firstIndex + 1);
+      const button = enqueue.textContent;
+      submit('主窗第一条');
+      emitFloatMessage({ tabId: record.tabId, text: '浮窗第二条', images: ['../icons.png'], attachments: [{ name: '参考图.png', path: 'icons.png' }] });
+      submit('主窗第三条');
+      const pendingFirst = pendingText();
+      showDone('原始任务已完成');
+      await new Promise(function settlePaint(resolve) { setTimeout(resolve, 50); });
+      const noEarlyRequest = record.requests.length === firstIndex + 1;
+      endTurn('原始任务已完成');
+      await waitForTurn(firstIndex + 2);
+      const firstBatch = record.requests[firstIndex + 1];
+      const queueDrained = !pendingText();
+      submit('执行期间第四条');
+      submit('执行期间第五条');
+      const pendingNext = pendingText();
+      const noExtraRequest = record.requests.length === firstIndex + 2;
+      showDone('第一批验收受阻', false);
+      endTurn('第一批验收受阻', true);
+      await new Promise(function settlePaint(resolve) { setTimeout(resolve, 50); });
+      if (record.requests.length !== firstIndex + 2) throw new Error('未完成回执触发了下一批整合需求');
+      const pausedQueue = pendingText();
+      emitFloatMessage({ tabId: record.tabId, text: '浮窗等待第六条', images: [], attachments: [] });
+      submit('主窗等待第七条');
+      document.getElementById('btn-send').click();
+      await new Promise(function settlePaint(resolve) { setTimeout(resolve, 50); });
+      if (record.requests.length !== firstIndex + 2) throw new Error('追加需求或空发送提前解锁队列');
+      const pausedAdditions = pendingText();
+      input.value = '继续';
+      document.getElementById('btn-send').click();
+      await waitForTurn(firstIndex + 3);
+      const continuation = record.requests[firstIndex + 2];
+      showDone('还有待办未完成', false);
+      endTurn('还有待办未完成', true);
+      await new Promise(function settlePaint(resolve) { setTimeout(resolve, 50); });
+      if (record.requests.length !== firstIndex + 3 || pendingText() !== pausedAdditions) {
+        throw new Error('重试仍有待办时改变了待发队列');
+      }
+      input.value = '继续';
+      document.getElementById('btn-send').click();
+      await waitForTurn(firstIndex + 4);
+      showDone('第一批整合完成');
+      endTurn('第一批整合完成');
+      await waitForTurn(firstIndex + 5);
+      const nextBatch = record.requests[firstIndex + 4];
+      showDone('第二批整合完成');
+      endTurn('第二批整合完成');
+      return { button, pendingFirst, noEarlyRequest, firstBatch, queueDrained, pendingNext, noExtraRequest,
+        pausedQueue, pausedAdditions, continuation, nextBatch, errors: record.errors };
+    }.toString() + ')()');
+    assert.equal(batches.button, '整合需求');
+    assert.match(batches.pendingFirst, /主窗第一条[\s\S]*浮窗第二条[\s\S]*主窗第三条/);
+    assert.ok(batches.noEarlyRequest && batches.queueDrained);
+    assert.match(batches.firstBatch.text, /【整合需求 1】\n主窗第一条[\s\S]*【整合需求 2】\n浮窗第二条[\s\S]*参考图\.png[\s\S]*【整合需求 3】\n主窗第三条/);
+    assert.equal(batches.firstBatch.attachments[0].path, 'icons.png');
+    assert.ok(batches.firstBatch.history.some(function previous(message) { return message.role === 'assistant' && message.content === '原始任务已完成'; }));
+    check(true, '原轮完成回执后才发送首批整合，保留主窗和悬浮窗提交顺序及附件');
+    assert.ok(batches.noExtraRequest);
+    assert.match(batches.pendingNext, /执行期间第四条[\s\S]*执行期间第五条/);
+    assert.equal(batches.pausedQueue, batches.pendingNext);
+    assert.match(batches.pausedAdditions, /执行期间第四条[\s\S]*执行期间第五条[\s\S]*浮窗等待第六条[\s\S]*主窗等待第七条/);
+    assert.equal(batches.continuation.text, '继续');
+    assert.match(batches.nextBatch.text, /【整合需求 1】\n执行期间第四条[\s\S]*【整合需求 2】\n执行期间第五条[\s\S]*【整合需求 3】\n浮窗等待第六条[\s\S]*【整合需求 4】\n主窗等待第七条/);
+    check(true, '验收受阻或还有待办时保留整合队列，当前任务续做通过后才按序发送');
+    assert.doesNotMatch(batches.nextBatch.text, /主窗第一条|浮窗第二条|主窗第三条/);
+    assert.notEqual(batches.nextBatch.turnId, batches.firstBatch.turnId);
+    assert.equal(batches.errors.length, 0, JSON.stringify(batches.errors));
+    check(true, '整合任务执行期间的新需求组成下一批，当前模型请求不被续接打断');
     console.log('METRIC ' + JSON.stringify({ nativeInputCharacters: typed.length, streamCharacters: result.stream.length, roleMutations: result.mutations }));
   } finally {
     if (win.webContents.debugger.isAttached()) win.webContents.debugger.detach();

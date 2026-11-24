@@ -263,6 +263,11 @@ function migrateAssemblies(s) {
   return s;
 }
 
+/**
+ * 取得模型组合当前眼睛槽的传输配置。
+ * @param {object} s 当前设置，包含模型组合和被引用的模型条目。
+ * @returns {object} 视觉模型、协议和认证配置。直通模型沿用保存的推理档位，旧式设置保留原配置。
+ */
 function visionFrom(s) {
   const hit = resolveRole(s, 'vision');
   if (hit?.slot) {
@@ -277,11 +282,13 @@ function visionFrom(s) {
     let endpoint = slot.endpoint || '';
     let apiKey = '';
     let protocol = 'openai';
+    let reasoningEffort;
     try {
       const cfg = slotToModelCfg(slot, s);
       if (!endpoint && (cfg?.baseUrl || cfg?.endpoint)) endpoint = cfg.baseUrl || cfg.endpoint;
       if (cfg?.apiKey) apiKey = cfg.apiKey;
       if (cfg?.protocol) protocol = cfg.protocol;
+      if (protocol === 'codex') reasoningEffort = cfg.reasoningEffort;
     } catch { /* ignore */ }
     if (slot.apiKey) apiKey = slot.apiKey;
     return {
@@ -290,6 +297,7 @@ function visionFrom(s) {
       endpoint,
       apiKey,
       protocol,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
       source: hit.source
     };
   }

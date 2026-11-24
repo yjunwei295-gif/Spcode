@@ -24,21 +24,29 @@ function createWindowLayouts(options) {
 
   /**
    * 认领最近退出的一组窗口并保留其中各窗口的原始身份。
-   * 无参数；仍在运行的其他进程不受影响，同一宿主再次激活时复用已认领的组。
+   * @param {string[]|undefined} expectedWindows 自动重启交接指定的窗口组；普通启动不传，选择最近退出的组。
+   * 仍在运行的其他进程不受影响；明确指定的组不存在时报告错误，不借用另一组窗口。
    * @returns {string[]} 按原顺序返回待重开的稳定窗口编号；首次启动没有登记时返回空数组。
    * 整组退出保留所有窗口，用户单独关闭的窗口由close移出组，避免下次启动复活。
    */
-  function restore() {
+  function restore(expectedWindows) {
     if (group) return [...group.windows];
     const directory = options.directory();
-    if (!fs.existsSync(directory)) return [];
+    if (!fs.existsSync(directory)) {
+      if (expectedWindows) throw new Error('代码重载的窗口登记目录不存在，交接状态仍保留');
+      return [];
+    }
     for (const file of fs.readdirSync(directory)) {
       if (!file.endsWith('.json')) continue;
       const candidate = JSON.parse(fs.readFileSync(path.join(directory, file), 'utf8'));
       if (options.ownerAlive(candidate.ownerPid)) continue;
+      if (expectedWindows && JSON.stringify(candidate.windows) !== JSON.stringify(expectedWindows)) continue;
       if (!group || candidate.updatedAt > group.updatedAt) group = candidate;
     }
-    if (!group) return [];
+    if (!group) {
+      if (expectedWindows) throw new Error('代码重载的原窗口组未找到，交接状态仍保留');
+      return [];
+    }
     group.ownerPid = process.pid;
     write();
     return [...group.windows];

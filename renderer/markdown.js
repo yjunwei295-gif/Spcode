@@ -4,7 +4,7 @@
   两条硬约束：
 
   1. 输入是模型输出，**一律先 escape 再套格式**。任何时候都不能把原文直接交给
-     innerHTML。所有分支都走 esc()；网址只放行 http/https/mailto，本地文件只进入只读预览。
+     innerHTML。所有分支都走 esc()；网址只放行 http/https/mailto，本地文件使用编码后的路径属性。
 
   2. 这是编程工具，满屏都是 snake_case 和 *.ps1 之类的东西，所以**不支持 _斜体_**
      —— 否则 MAIN_STORY_001.story.json 会被中间那段切成斜体。单星号斜体也加了
@@ -27,9 +27,10 @@ function decodeLinkEntity(entity) {
 }
 
 /**
- * 将 Markdown 文件链接接入只读预览与已有右键菜单。
- * 尖括号目标允许路径含空格；盘符绝对路径与相对路径保留原文，不作为网址导航或执行程序。
- * 网页和邮件沿用原有入口，其它协议及页内锚点仍保留为文本。
+ * 把 Markdown 链接渲染成网页锚点或带原始路径的本地文件锚点。
+ * 尖括号目标允许路径含空格；相对路径和盘符绝对路径编码后交给聊天点击与右键处理。
+ * 网页和邮件使用外部链接，其它协议及页内锚点保留为原文。
+ * @returns {string} 已转义的锚点 HTML 或未匹配的原文。
  */
 function renderInlineLink(whole, label, angleUrl, bareUrl) {
   const escapedUrl = angleUrl === undefined ? bareUrl : angleUrl;

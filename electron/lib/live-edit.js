@@ -2,7 +2,7 @@
 
 /**
  * 原位更新已加载主入口与常驻服务的方法，保留窗口、会话和已注册回调。
- * 顶层初始化和闭包结构变化不能安全重放，必须明确拒绝，不能把 V8 的 Ok 当成完整生效。
+ * 顶层初始化和闭包结构变化返回明确的重启标记，由宿主保存状态后自动重启，不能把 V8 的 Ok 当成完整生效。
  */
 const inspector = require('inspector');
 const path = require('path');
@@ -36,14 +36,22 @@ function isPropertyName(parent, key) {
 }
 
 /**
- * 提取函数内部的词法声明、嵌套函数和标识符集合。
- * 保持这些结构不变，防止新增捕获变量时 V8 虽返回 Ok、旧闭包却继续执行旧实现。
+ * 提取函数内部的词法声明、声明初值、嵌套函数和标识符集合。
+ * 声明初值已可能被工厂执行并保留在闭包中；初值或词法结构变化须重启加载，不能把 V8 的 Ok 当成旧状态已更新。
+ * @param {object} body 函数体或箭头表达式的 AST 节点，仅用于建立兼容性比较结构。
+ * @returns {{bindings:object[]}} 按作用域和声明顺序保存的初值、嵌套函数与引用；不执行代码或修改运行状态。
  */
 function bodyShape(body) {
   const bindings = visit(body, null, '');
   return { bindings };
 
-  /** 按原声明顺序收集作用域结构；没有声明的代码块不产生额外结构。 */
+  /**
+   * 按原声明顺序收集作用域结构与声明初值；没有语义项的代码块不产生额外结构。
+   * @param {*} node 当前 AST 子树或属性值；非节点值不产生语义项。
+   * @param {object|null} parent 所属 AST 节点，用于区分词法引用与属性名。
+   * @param {string} key 当前属性名；数组子项沿用所属属性名。
+   * @returns {object[]} 当前子树的比较项；不能确认的动态作用域抛出重启标记，不应用更新。
+   */
   function visit(node, parent, key) {
     if (node === null || typeof node !== 'object') return [];
     if (Array.isArray(node)) {
@@ -54,10 +62,14 @@ function bodyShape(body) {
     if (isFunction(node)) return [functionShape(node)];
     // 非严格模式的条件/标签函数声明带有 Annex B 隐式作用域，不能按普通函数声明迁移。
     if ((node.type === 'IfStatement' && (node.consequent.type === 'FunctionDeclaration' || (node.alternate && node.alternate.type === 'FunctionDeclaration'))) || (node.type === 'LabeledStatement' && node.body.type === 'FunctionDeclaration')) {
-      throw new Error('脚本含条件或标签内的隐式函数作用域，尚未应用原位更新。');
+      const error = new Error('脚本含条件或标签内的隐式函数作用域，尚未应用原位更新，需自动重启加载。');
+      error.code = 'SPCODE_RELAUNCH_REQUIRED';
+      throw error;
     }
     if (node.type === 'WithStatement' || (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.callee.name === 'eval')) {
-      throw new Error('脚本含动态词法作用域，无法确认闭包布局，尚未应用原位更新。');
+      const error = new Error('脚本含动态词法作用域，无法确认闭包布局，尚未应用原位更新，需自动重启加载。');
+      error.code = 'SPCODE_RELAUNCH_REQUIRED';
+      throw error;
     }
     // 引用保留在各自作用域内并逐次登记，不能用全函数的 Set 合并：
     // 内层同名变量不能掩盖外层新增捕获，引用跨作用域移动也必须拒绝。
@@ -68,8 +80,13 @@ function bodyShape(body) {
     const children = [];
     if (node.type === 'VariableDeclaration') {
       const declarations = [];
-      for (const declaration of node.declarations) declarations.push(semantic(declaration.id));
-      children.push({ declaration: node.kind, names: declarations });
+      const initializers = [];
+      for (const declaration of node.declarations) {
+        declarations.push(semantic(declaration.id));
+        // 现存闭包不会重新执行初始化，必须连同初值语义一起比较；位置、注释和等值字面量格式仍忽略。
+        initializers.push(semantic(declaration.init));
+      }
+      children.push({ declaration: node.kind, names: declarations, initializers });
     }
     if (node.type === 'CatchClause') children.push({ catch: semantic(node.param) });
     for (const childKey of Object.keys(node)) {
@@ -98,14 +115,16 @@ function functionShape(node) {
  * 校验一次原位更新是否只改变既有函数实现。
  * @param {string} before 已加载的完整脚本正文。
  * @param {string} after 磁盘上的完整新正文。
- * @returns {void} 布局或初始化不同即抛错；不会修改文件或运行时状态。
+ * @returns {void} 布局或初始化不同即抛出 code=SPCODE_RELAUNCH_REQUIRED；不会修改文件或运行时状态。
  */
 function assertLiveEditCompatible(before, after) {
   const options = { ecmaVersion: 'latest', sourceType: 'script', allowReturnOutsideFunction: true, allowHashBang: true };
   const original = semantic(acorn.parse(before, options));
   const updated = semantic(acorn.parse(after, options));
   if (JSON.stringify(original) !== JSON.stringify(updated)) {
-    throw new Error('更新包含顶层初始化、函数签名或闭包依赖变化，尚未应用；原位热更新仅接受现有方法和回调内的逻辑变化。');
+    const error = new Error('更新包含顶层初始化、函数签名或闭包依赖变化，尚未应用；需要保存窗口状态后自动重启主进程。');
+    error.code = 'SPCODE_RELAUNCH_REQUIRED';
+    throw error;
   }
 }
 

@@ -5,6 +5,8 @@ const { app } = require('electron');
 const { SKIP, isInside, isForeignAiSkill } = require('./workspace');
 const retrieve = require('./memory-retrieve');
 const diag = require('./diag');
+// 绘图会同时启动向量索引，两种索引共用同一份项目目录设置。
+const { isMapPathIgnored } = require('./code-index');
 
 const INDEX_VERSION = 1;
 const CHUNK_LINES = 50;
@@ -117,7 +119,7 @@ function indexRoots(workspace, extra) {
     if (!dir) return;
     const abs = path.resolve(dir);
     const key = abs.replace(/\\/g, '/').toLowerCase();
-    if (seen.has(key)) return;
+    if (seen.has(key) || isMapPathIgnored(workspace, abs)) return;
     try { if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) return; } catch { return; }
     seen.add(key);
     roots.push(abs);
@@ -165,7 +167,8 @@ function chunkText(text) {
 }
 function yieldTick() { return new Promise((r) => setImmediate(r)); }
 
-function collectFiles(roots, signal) {
+/** 收集向量索引文件，按工作区设置在读取目录前跳过整棵子树。 */
+function collectFiles(workspace, roots, signal) {
   const files = [];
   const own = (roots || []).filter((r) => /[\\/](\.(simple|sinpo)[\\/])?skills$/i.test(path.resolve(r)));
   function walk(root, dir, rules, depth) {
@@ -180,7 +183,10 @@ function collectFiles(roots, signal) {
       if (isForeignAiSkill(abs, own)) continue;
       const rel = path.relative(root, abs).replace(/\\/g, '/');
       if (isIgnored(rel, ent.isDirectory(), rules)) continue;
-      if (ent.isDirectory()) { walk(root, abs, rules, depth + 1); continue; }
+      if (ent.isDirectory()) {
+        if (!isMapPathIgnored(workspace, abs)) walk(root, abs, rules, depth + 1);
+        continue;
+      }
       if (!ent.isFile() || !isIndexableFile(ent.name)) continue;
       try {
         const st = fs.statSync(abs);
@@ -188,6 +194,7 @@ function collectFiles(roots, signal) {
       } catch { /* 跳过 */ }
     }
   }
+  // 根目录已在 indexRoots 中按同一忽略清单筛选。
   for (const root of roots) walk(root, root, loadIgnoreRules(root), 0);
   return files;
 }
@@ -255,7 +262,7 @@ async function buildIndex(workspace, extra, signal) {
   }
   const chunksMap = loadJson(chunksPath(workspace), {});
   const vectorsMap = retrieve.loadVectors(vectorsFile(workspace));
-  const files = collectFiles(roots, signal);
+  const files = collectFiles(workspace, roots, signal);
   const seen = new Set();
   let changed = 0;
   let processed = 0;
@@ -270,10 +277,12 @@ async function buildIndex(workspace, extra, signal) {
   try {
     for (const f of files) {
       if (signal?.aborted) throw new Error('已停止');
+      // 嵌入期间用户仍可调整忽略范围，已排队但尚未读取的文件也要跳过。
+      processed++;
+      if (isMapPathIgnored(workspace, f.abs)) continue;
       const key = fileKey(workspace, extra, f.abs);
       seen.add(key);
       const body = readIndexable(f.abs, f.size);
-      processed++;
       if (!body) continue;
       const prev = meta.files[key];
       const intact = prev && prev.hash === body.hash && prev.size === f.size
@@ -365,6 +374,7 @@ async function searchHits(workspace, extra, { query, within, limit, signal } = {
     const ch = chunksMap[id];
     const vec = vectorsMap[id];
     if (!ch || !Array.isArray(vec) || !vec.length) continue;
+    if (isMapPathIgnored(workspace, ch.abs || path.resolve(workspace, ch.path))) continue;
     if (isForeignAiSkill(ch.abs || ch.path || '')) continue;
     if (withinAbs) {
       const abs = ch.abs ? path.resolve(ch.abs) : '';
@@ -394,7 +404,7 @@ function formatForPrompt(hits) {
 }
 
 async function upsertFile(workspace, abs, extra) {
-  if (!workspace || !abs || !fs.existsSync(abs)) return;
+  if (!workspace || !abs || isMapPathIgnored(workspace, abs) || !fs.existsSync(abs)) return;
   if (jobs.has(hashPath(workspace))) return;
   if (!fs.existsSync(metaPath(workspace))) { kickIndex(workspace, extra); return; }
   let st;

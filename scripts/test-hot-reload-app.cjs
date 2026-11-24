@@ -49,7 +49,7 @@ for (const name of ['icons.png', 'icons.ico']) {
 }
 const appSource = path.join(rendererCopy, 'app.js');
 // 只增加访问口；生产初始化、状态采集、控制器、preload 和 IPC 均照常执行。
-fs.appendFileSync(appSource, '\nwindow.__hotReloadAppTest = { state, newTab, switchToTab, rememberComposer, send, hotReloadController, retryHotReload, openModal, closeModal };\n', 'utf8');
+fs.appendFileSync(appSource, '\nwindow.__hotReloadAppTest = { state, newTab, switchToTab, rememberComposer, send, hotReloadController, retryHotReload, openModal, closeModal, refreshMeta };\n', 'utf8');
 
 /** 记录行为断言，失败保留现场目录与诊断，不覆盖生产文件。 */
 function check(value, message) {
@@ -252,8 +252,95 @@ async function verifyResendConfirmation() {
 }
 
 /**
- * 验证生产窗口的真实重载、确认归属及业务待校验门禁，并核对完整临时状态。
- * @returns {Promise<void>} 真实IPC、页面恢复和主入口更新全部通过后兑现；只操作隔离用户目录与本测试进程。
+ * 通过真实历史快照侧栏、preload 和主进程验证单文件及整份操作。
+ * @returns {Promise<void>} 临时项目的文件状态、快照历史和界面确认全部核对后兑现。
+ */
+async function verifySnapshotSelection() {
+  const snapshot = require('../electron/lib/snapshot');
+  const target = '脚本甲/同名.js';
+  const other = '脚本乙/同名.js';
+  const created = '新建.js';
+  const removed = '被删除.js';
+  // 用同名文件和不同操作验证路径精确匹配，保留中文及 CRLF 字节作为改前内容。
+  const files = [
+    { rel: target, before: '甲旧版\r\n', after: '甲新版\n' },
+    { rel: other, before: '乙旧版\n', after: '乙新版\n' },
+    { rel: created, before: null, after: '新建内容\n' },
+    { rel: removed, before: '被删除的旧内容\n', after: null }
+  ];
+  const saved = snapshot.create(workspace, '单文件还原验收');
+  for (const item of files) {
+    const abs = path.join(workspace, item.rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, item.before === null ? item.after : item.before, 'utf8');
+    snapshot.recordChange(workspace, saved, item.rel, item.before === null ? 'create' : item.after === null ? 'delete' : 'write', { existedBefore: item.before !== null });
+    if (item.after === null) fs.unlinkSync(abs);
+    else fs.writeFileSync(abs, item.after, 'utf8');
+  }
+  const manifest = path.join(saved.dir, 'manifest.json');
+  const originalManifest = fs.readFileSync(manifest, 'utf8');
+  const open = 'document.querySelector(' + JSON.stringify('#snap-list [data-restore="' + saved.id + '"]') + ').click()';
+  await page('window.__hotReloadAppTest.refreshMeta()');
+  await page('if (document.getElementById("sidebar").classList.contains("hidden")) document.getElementById("btn-sidebar").click()');
+  await page(open);
+  check(await page('document.activeElement.id === "m-cancel" && document.querySelectorAll("#m-restore-files input").length === 5'), '历史快照列出全部及四个文件，初始焦点在取消');
+  await page('document.querySelector(\'#m-restore-files input[value="0"]\').click()');
+  check(await page('document.getElementById("m-confirm").textContent === "仅还原此文件" && document.querySelector("#m-restore-files input:checked").parentElement.textContent.includes("脚本甲/同名.js")'), '同名脚本以完整路径区分，选择后显示单文件确认');
+  // 测试窗口保持隐藏，直接记录 Chromium 实际计算的控件尺寸和文案。
+  evidence.snapshotSelection = await page('(function selectionLayout() { const file = document.querySelector("#m-restore-files input:checked"); const confirm = document.getElementById("m-confirm"); return { file: file.parentElement.textContent, action: confirm.textContent, fileWidth: file.getBoundingClientRect().width, actionWidth: confirm.getBoundingClientRect().width }; })()');
+  check(evidence.snapshotSelection.fileWidth > 0 && evidence.snapshotSelection.actionWidth > 0, '真实 Chromium 为单文件选项和确认按钮生成布局');
+  await page('document.getElementById("m-cancel").click()');
+  check(read(target) === files[0].after && read(other) === files[1].after && read(created) === files[2].after && !exists(removed), '取消单文件选择后所有工作区文件都未改变');
+
+  await confirmFile(0);
+  check(read(target) === files[0].before && read(other) === files[1].after && read(created) === files[2].after && !exists(removed), '实际单文件还原保留原字节，同名文件和其他脚本不受影响');
+  check(await page('document.getElementById("modal-card").textContent.includes("脚本甲/同名.js")'), '单文件成功提示指出实际文件');
+  await page('document.getElementById("m-ok").click()');
+  await confirmFile(2);
+  check(!exists(created) && read(other) === files[1].after && !exists(removed), '选中新建文件只删除该文件');
+  await page('document.getElementById("m-ok").click()');
+  await confirmFile(3);
+  check(read(removed) === files[3].before && read(other) === files[1].after, '选中曾删除的文件从历史备份重建该文件');
+  await page('document.getElementById("m-ok").click()');
+  check(fs.readFileSync(manifest, 'utf8') === originalManifest, '逐文件操作不改写历史快照清单');
+
+  await page(open);
+  check(await page('document.getElementById("m-confirm").textContent === "还原全部"'), '同一历史快照保留整份还原入口');
+  await page('document.getElementById("m-confirm").click()');
+  await waitFor(restoreComplete, '整份还原成功提示');
+  check(read(other) === files[1].before && read(target) === files[0].before && !exists(created) && read(removed) === files[3].before, '整份还原依然恢复所有历史条目');
+  await page('document.getElementById("m-ok").click()');
+
+  /**
+   * 在历史侧栏确认还原一个文件。
+   * @param {number} index 快照文件清单中从 0 开始的索引，全部文件选项不占索引。
+   * @returns {Promise<void>} 主进程完成所选文件的还原且界面显示成功提示后兑现。
+   */
+  async function confirmFile(index) {
+    await page(open);
+    const selector = '#m-restore-files input[value="' + index + '"]';
+    await page('document.querySelector(' + JSON.stringify(selector) + ').click(); document.getElementById("m-confirm").click()');
+    await waitFor(restoreComplete, '单文件还原成功提示');
+  }
+  /**
+   * 读取隔离项目中的文件内容。
+   * @param {string} rel 相对于隔离项目根目录的文件路径。
+   * @returns {string} 用于精确比较的 UTF-8 文本。
+   */
+  function read(rel) { return fs.readFileSync(path.join(workspace, rel), 'utf8'); }
+  /**
+   * 检查隔离项目中的路径是否存在。
+   * @param {string} rel 相对于隔离项目根目录的路径。
+   * @returns {boolean} 路径存在时为 true。
+   */
+  function exists(rel) { return fs.existsSync(path.join(workspace, rel)); }
+  /** 检查已收到写入回执的成功弹窗。 */
+  function restoreComplete() { return page('Boolean(document.getElementById("m-ok"))'); }
+}
+
+/**
+ * 在隔离项目和用户目录中启动生产窗口，按命令行参数运行快照专项或完整热重载回归。
+ * @returns {Promise<void>} 指定 --snapshot-selection 时，快照选择、文件状态及界面异常检查通过后提前结束。默认在项目切换、重发确认、业务待校验门禁、真实 IPC 和页面恢复以及主入口更新的断言完成后兑现。
  */
 async function verifyApplication() {
   await app.whenReady();
@@ -265,6 +352,11 @@ async function verifyApplication() {
   await page('(window.simple || window.sinpo).setWorkspace(' + JSON.stringify(workspace) + ')');
   await mainWindow.loadFile(path.join(rendererCopy, 'index.html'));
   await waitFor(initializedPage, '完整界面初始化');
+  if (process.argv.includes('--snapshot-selection')) {
+    await verifySnapshotSelection();
+    check(evidence.errors.length === 0, '历史快照操作未发生 preload 或界面脚本异常');
+    return;
+  }
   await verifyWorkspaceRoundTrip();
   await verifyResendConfirmation();
   const ids = await seedTabs();
@@ -273,9 +365,13 @@ async function verifyApplication() {
   const originalPid = process.pid;
   const before = navigationCount;
   runtime.changed(path.join(root, 'renderer', 'styles.css'));
-  await waitFor(queued, '任务繁忙时更新排队');
-  async function queued() {
-    return page('Boolean(document.getElementById("status-hot-reload") && document.getElementById("status-hot-reload").textContent.includes("排队"))');
+  await waitFor(waitingForIdle, '任务繁忙时显示等待空闲的重载提示');
+  /**
+   * 读取任务繁忙时的界面重载状态，确认渲染进程已收到可重载的通知。
+   * @returns {Promise<boolean>} 界面显示等待空闲提示时为真。
+   */
+  async function waitingForIdle() {
+    return page('document.getElementById("status-hot-reload")?.textContent === "已请求界面重载，空闲后加载"');
   }
   check(navigationCount === before, '标签发送或队列执行期间不会重载页面');
   check(await page('sessionStorage.getItem("spcode:hot-reload") === null'), '繁忙状态没有提早保存过期快照');

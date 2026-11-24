@@ -17,6 +17,8 @@ const ADAPTER_PATH = path.resolve(process.argv[2] || path.join(__dirname, '..', 
 const TEST_TIMEOUT_MS = 15000;
 let assertionCount = 0;
 const failures = [];
+// 同版 CLI 先发顶层 error 通知重连，之后才发 turn.completed 或 turn.failed。
+const RECONNECT_REASON = 'stream disconnected before completion: IO error: peer closed connection without sending TLS close_notify';
 
 /** 创建可人工交付的异步边界，不把经过时间当作任务已经完成。 */
 function deferred() {
@@ -88,7 +90,9 @@ function fixtureCloseIdle() {
 
 /**
  * 向生产 startBridge 发起真实本机 HTTP MCP 请求。
- * 返回完整 JSON 回执，让断言核对实际执行的工具及归属，而不是只检查源码。
+ * @param {object} session 当前夹具会话，包含桥的端口及令牌。
+ * @param {object} plan 本次调用的夹具，tag 同时标记工具参数和调用标识。
+ * @returns {Promise<object>} 解析后的完整 JSON 回执，用于核对工具执行与会话归属。
  */
 function requestTool(session, plan) {
   const body = JSON.stringify({
@@ -107,6 +111,11 @@ function requestTool(session, plan) {
         'Content-Length': Buffer.byteLength(body)
       }
     }, receiveResponse);
+    /**
+     * 读取本机 MCP 桥的 HTTP 回包并兑现外层请求。
+     * @param {import('node:http').IncomingMessage} response 响应状态和可读数据流。
+     * @returns {void} 订阅数据和结束事件；流错误、JSON 无效或非 200 状态时拒绝外层 Promise。
+     */
     function receiveResponse(response) {
       const chunks = [];
       function received(chunk) {
@@ -134,8 +143,11 @@ function requestTool(session, plan) {
 }
 
 /**
- * 模拟 SDK 的事件生成器和真实退出时刻。
- * 正常消费会等 exit 闸门；提前关闭生成器只记录关闭，不把 writer 伪装成已经退出。
+ * 模拟 SDK 的事件流与写入进程的退出时序。
+ * @param {object} plan 本轮用例的工具调用、重连、终止配置及同步闸门。
+ * @param {object} state 当前 SDK 会话的夹具状态，工具请求使用其中的会话。
+ * @returns {AsyncGenerator<object>} 启用工具调用时先产出工具完成事件，启用重连时接着产出重试次数和等待网络通知。终止用例在退出闸门前产出失败事件，其余用例在闸门释放后产出正文和回合完成事件。
+ * 提前关闭迭代器只记录流结束，模拟写入进程仍需等退出闸门释放。
  */
 async function* fixtureEvents(plan, state) {
   try {
@@ -147,6 +159,11 @@ async function* fixtureEvents(plan, state) {
       yield { type: 'item.completed', item: { type: 'mcp_tool_call', tool: 'fixture_probe' } };
     } else {
       plan.toolDone.resolve();
+    }
+    if (plan.reconnect) {
+      yield { type: 'error', message: 'Reconnecting... 1/5 (' + RECONNECT_REASON + ')' };
+      yield { type: 'error', message: 'Reconnecting... 2/5 (' + RECONNECT_REASON + ')' };
+      yield { type: 'error', message: 'Reconnecting... waiting for network (Connection failed: error sending request)' };
     }
     if (plan.terminalType) {
       plan.terminalOffered.resolve();
@@ -160,6 +177,7 @@ async function* fixtureEvents(plan, state) {
     plan.drained = true;
     if (!plan.terminalType) {
       yield { type: 'item.completed', item: { type: 'agent_message', text: plan.tag + ' 已完成' } };
+      yield { type: 'turn.completed' };
     }
   } finally {
     if (!plan.drained) plan.closedEarly = true;
@@ -216,7 +234,8 @@ function createHarness() {
       return { runTurn: unexpectedChatRun, closeSession: noop, busy: fixtureChatBusy, closeIdle: fixtureCloseIdle };
     }
     if (id === './training-recorder') return { note: noop };
-    if (['http', 'crypto', 'os', 'path', 'fs'].includes(id)) return require(id);
+    // 保留 Node 内置的进程诊断与异步作用域，网络与模型依赖仍由本夹具隔离。
+    if (['http', 'crypto', 'os', 'path', 'fs', 'node:async_hooks', 'node:diagnostics_channel'].includes(id)) return require(id);
     throw new Error('测试禁止加载未隔离依赖：' + id);
   }
   const moduleValue = { exports: {} };
@@ -257,6 +276,7 @@ function addPlan(harness, name, options) {
   const plan = {
     tag: '@@fixture:' + name + '@@',
     terminalType: options.terminalType || '',
+    reconnect: options.reconnect === true,
     errorMessage: '原始终止错误：' + name,
     withTool: options.withTool === true,
     beforeTool: deferred(), started: deferred(), toolDone: deferred(),
@@ -360,6 +380,46 @@ async function testTerminalEvent(type) {
     await checkIdle(harness);
   } finally {
     await cleanup(harness);
+  }
+}
+
+/** 核对同一轮的重连进度、工具执行次数及 SDK 最终结果。 */
+async function testStreamReconnect() {
+  for (const terminalType of ['', 'turn.failed']) {
+    const harness = createHarness();
+    try {
+      const name = terminalType ? 'reconnect-failed' : 'reconnect-recovered';
+      const plan = addPlan(harness, name, { terminalType, reconnect: true, withTool: true });
+      const result = start(harness, 'reconnect', plan);
+      await plan.toolDone.promise;
+      plan.exit.resolve();
+      await result.promise;
+      if (terminalType) {
+        check('重试最终失败时返回 turn.failed 的原始错误', result.error?.message === plan.errorMessage);
+      } else {
+        check('SDK 重连成功后仍交付本轮正文', result.value?.content === plan.tag + ' 已完成');
+        const next = addPlan(harness, 'after-reconnect', {});
+        const nextResult = start(harness, 'reconnect', next);
+        next.exit.resolve();
+        await nextResult.promise;
+        check('重连成功后的下一轮复用原会话', !nextResult.error && harness.sessions.length === 1);
+      }
+      const progress = [];
+      for (const entry of harness.events) {
+        if (entry.owner !== plan.tag || entry.event.type !== 'status') continue;
+        if (entry.event.text.includes('正在重连') || entry.event.text.includes('等待网络恢复')) {
+          progress.push(entry.event.text);
+        }
+      }
+      check('两次 SDK 重连及等待网络的状态按顺序展示',
+        progress.length === 3 && progress[0].includes('1/5') && progress[1].includes('2/5')
+        && progress[2] === 'Codex 正在等待网络恢复…');
+      checkTool(harness, plan);
+      check('未重提已执行工具的原请求', harness.modelStarts.length === (terminalType ? 1 : 2));
+      await checkIdle(harness);
+    } finally {
+      await cleanup(harness);
+    }
   }
 }
 
@@ -523,6 +583,7 @@ async function main() {
   try {
     await runCase('error 事件等待真实退出', testErrorEvent);
     await runCase('turn.failed 事件等待真实退出', testFailedEvent);
+    await runCase('SDK 断流重连及最终结果', testStreamReconnect);
     await runCase('同 key 串行及真实 HTTP 工具归属', testSameKey);
     await runCase('不同 key 保持并行', testDifferentKeys);
     await runCase('前序失败释放后继', testFailureReleasesQueue);

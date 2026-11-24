@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { channel } = require('node:diagnostics_channel');
 const diag = require('./diag');
 const codexEnv = require('./codex-env');
 const codexModel = require('./codex-model');
@@ -13,6 +15,9 @@ const sessions = new Map();
 // 同一会话只能有一个 SDK 写入者；队列尾在真实执行收尾后释放，不把不同会话串行化。
 const turnQueues = new Map();
 let activeRuns = 0;
+// 只关联 SDK 事件流启动的子进程，其他会话和工具执行器不进入该作用域。
+const sdkProcessScope = new AsyncLocalStorage();
+const childProcessEvents = channel('child_process');
 const MAX_SESSIONS = 8;
 const CODEX_TOOL_RESTRICTIONS = {
   features: { shell_tool: false, unified_exec: false, multi_agent: false, view_image_tool: false },
@@ -65,15 +70,25 @@ function sendJson(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
-async function readJson(req) {
+/**
+ * 读取本机工具桥的 JSON 请求。
+ * @param {import('http').IncomingMessage} req 已验证会话令牌的 HTTP 请求。
+ * @param {boolean} commandRequest 当前轮已开放运行命令，且发送方标记了命令请求。
+ * @returns {Promise<object>} 请求正文；命令正文大小不限，其他请求按原有上限处理。
+ */
+async function readJson(req, commandRequest) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 8 * 1024 * 1024) throw new Error('request too large');
+    if (!commandRequest && size > 8 * 1024 * 1024) throw new Error('request too large');
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+  const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+  if (commandRequest && (body.method !== 'tools/call' || body.params?.name !== 'run_command')) {
+    throw new Error('invalid command request');
+  }
+  return body;
 }
 
 function startBridge(session) {
@@ -83,11 +98,15 @@ function startBridge(session) {
       return sendJson(res, 403, { error: 'forbidden' });
     }
     if (req.headers.authorization !== `Bearer ${token}`) return sendJson(res, 401, { error: 'unauthorized' });
+    // HTTP 请求跨越等待正文的边界时仍归属原轮次，不能借用下一次插话的工具授权。
+    const ctx = session.ctx;
     try {
-      const body = await readJson(req);
       if (req.method !== 'POST' || req.url !== '/mcp') return sendJson(res, 404, { error: 'not found' });
+      const commandRequest = req.headers['x-spcode-command'] === '1'
+        && toolDefs(ctx?.tools).some(function allowsCommand(tool) { return tool.name === 'run_command'; });
+      const body = await readJson(req, commandRequest);
       if (body.method === 'tools/list') {
-        return sendJson(res, 200, { tools: toolDefs(session.ctx?.tools).map((tool) => ({
+        return sendJson(res, 200, { tools: toolDefs(ctx?.tools).map((tool) => ({
           name: tool.name,
           description: String(tool.description || ''),
           inputSchema: tool.parameters || { type: 'object', properties: {} },
@@ -103,14 +122,19 @@ function startBridge(session) {
       }
       if (body.method === 'tools/call') {
         const name = String(body.params?.name || '');
-        if (!toolDefs(session.ctx?.tools).some((tool) => tool.name === name)) {
+        if (!toolDefs(ctx?.tools).some((tool) => tool.name === name)) {
           return sendJson(res, 200, { content: [{ type: 'text', text: '当前轮没有开放这个工具。' }], isError: true });
         }
-        const ctx = session.ctx;
-        const result = await ctx.runTool(name, body.params?.arguments || {}, body.params?.toolCallId || '');
-        if (ctx.stats) ctx.stats.calls.push(name);
-        if (result && Array.isArray(result.spcodeContent)) return sendJson(res, 200, { content: result.spcodeContent });
-        return sendJson(res, 200, { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result ?? '') }] });
+        // 回包提交前计作在途，插话不能中断正在执行的工具。
+        if (ctx.stats) ctx.stats.activeTools++;
+        try {
+          const result = await ctx.runTool(name, body.params?.arguments || {}, body.params?.toolCallId || '');
+          if (ctx.stats) ctx.stats.calls.push(name);
+          if (result && Array.isArray(result.spcodeContent)) return sendJson(res, 200, { content: result.spcodeContent });
+          return sendJson(res, 200, { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result ?? '') }] });
+        } finally {
+          if (ctx.stats) ctx.stats.activeTools--;
+        }
       }
       return sendJson(res, 400, { error: 'unsupported method' });
     } catch (e) {
@@ -283,15 +307,47 @@ async function runTurn(args) {
 }
 
 /**
- * 执行已取得会话写入权的一轮请求，配额路由、SDK 上下文与工具回传均沿用原语义。
- * @param {object} args 由 runTurn 按 key 排队后的原始调用参数。
- * @returns {Promise<object>} 模型正文；失败事件须等事件流结束后抛出，避免提前打断 SDK 的进程退出等待。
+ * 在 Windows 上等待旧 SDK 子进程实际退出，再结束它的输出流。
+ * @param {AbortSignal} handoff 只标记当前请求是否因用户插话交接。
+ * @param {Function} consume 消费当前 SDK 事件的函数。
+ * @returns {Promise<unknown>} 事件消费结果或原始错误。
+ * 子进程退出时管道可能仍保持打开，SDK 的逐行读取需要明确的流结束信号。
  */
-async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false }) {
+async function consumeWithHandoff(handoff, consume) {
+  const owner = {};
+  /** 只记录当前作用域中启动的 SDK 子进程。 */
+  function bindSdkChild({ process: child }) {
+    if (sdkProcessScope.getStore() !== owner || owner.child) return;
+    owner.child = child;
+    child.once('exit', finishSdkPipes);
+    /** 确认旧进程退出后，令 SDK 在已计划的交接中结束读取。 */
+    function finishSdkPipes() {
+      if (!handoff.aborted) return;
+      child.stdout.push(null);
+      child.stderr.destroy();
+    }
+  }
+  childProcessEvents.subscribe(bindSdkChild);
+  try {
+    return await sdkProcessScope.run(owner, consume);
+  } finally {
+    childProcessEvents.unsubscribe(bindSdkChild);
+  }
+}
+
+/**
+ * 执行已取得会话写入权的一轮请求，配额路由、SDK 上下文与工具回传均沿用原语义。
+ * @param {object} args 由 runTurn 按 key 排队后的调用参数。
+ * @param {Function} [args.onInterjectionDelivered] 模型活动或成功完成时确认插话；切换官方聊天时交给该适配器调用。
+ * @returns {Promise<object>} 模型正文或交接结果；SDK 真实失败仍在事件流收尾后抛出。
+ */
+async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false, shouldYield, watchInterjections, onInterjectionDelivered, sdkOnly = false }) {
   // 额度触顶的判定与 UI 切换由本地代码完成，无需等待已耗尽的模型作决定。
   if (await isWorkQuotaExhausted(modelCfg)) {
+    // 并发分支的父请求可能正占用官方聊天队列，不能再次入队等父请求退出。
+    if (sdkOnly) throw new Error('Codex 工作额度已耗尽，官方聊天模式使用单一前台，无法启动并发分支。');
     closeSdkSession(key);
-    return codexChatDirect.runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode });
+    return codexChatDirect.runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode, shouldYield, onInterjectionDelivered });
   }
   const chatSig = sig;
   // 模式改变必须重建 SDK 会话，不能复用旧的只读权限。
@@ -303,13 +359,26 @@ async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContex
     session = null;
   }
   if (!session) session = await createSession(key, sig, modelCfg, specs, onEvent, agiMode);
-  const stats = { calls: [] };
+  const stats = { calls: [], activeTools: 0 };
   session.ctx = { tools: specs, runTool, stats };
+  const handoff = watchInterjections ? new AbortController() : null;
+  const streamSignal = handoff && signal ? AbortSignal.any([signal, handoff.signal]) : handoff?.signal || signal;
+  const toolItems = new Set();
+  let acceptingHandoff = false;
+  let unwatch;
+  /**
+   * 只结束已开始的本次 SDK 流，保留会话和用户的整轮取消信号。
+   * 等待在途工具回传及下一次模型活动，才允许接手该请求。
+   */
+  function yieldToInterjections() {
+    if (acceptingHandoff && !signal?.aborted && !stats.activeTools && !toolItems.size && shouldYield()) handoff.abort();
+  }
   let images = [];
   const prefix = session.turns ? '' : `${firstPrefix || ''}\n\n`;
   const prompt = `${prefix}${systemContext ? `【本轮 SpCode 当前规则与上下文；与旧指令冲突时以本段为准】\n${systemContext}\n\n` : ''}${turnText || ''}`.trim();
   let content = '';
   try {
+    if (watchInterjections) unwatch = watchInterjections(yieldToInterjections);
     images = imagesOf(userContent);
     onEvent({ type: 'think', text: session.turns ? 'Codex 直通：沿用本对话会话' : 'Codex 直通：新会话已载入 SpCode 规则' });
     const toolGuidance = '【本轮 SpCode 工具规则】是否需要工具取决于用户任务：需要查看或修改项目、查询本地信息、执行已确认操作时，必须实际调用本轮提供的 spcode MCP 工具，并根据工具结果继续；不得只口头描述将要操作、凭猜测汇报结果，或把工具限制说成用户需要处理的步骤。用户只问原理或闲聊时，不要为了调用工具而调用。每次只调用当前任务最相关的工具，成功后复用结果，避免重复读取或重复操作。修改代码后必须核对目标行为：语法检查只证明语法有效，不等于功能已修复；优先用相关测试、运行命令或可用的桌面工具验证。若运行中的页面不会热更新，或当前无法重启/构建验证，必须明确说明文件修改与运行效果的区别及用户需要采取的重启/更新步骤，不得把写入成功当作修复完成。';
@@ -320,37 +389,67 @@ async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContex
     const required = [...new Set((requiredToolNames || []).map((name) => String(name || '').trim()).filter(Boolean))];
     for (let attempt = 0; ; attempt += 1) {
       session.turns = (session.turns || 0) + 1;
+      acceptingHandoff = false;
       let streamError = null;
-      const { events } = await session.thread.runStreamed(nextInput, { signal });
-      for await (const event of events) {
-        // 原样留存 SDK 实际返回的事件，包含公开推理摘要、消息及调用状态。
-        require('./training-recorder').note('sdk-event', { provider: 'codex', event });
-        if (signal?.aborted) {
-          streamError = new Error('已停止');
-          streamError.name = 'AbortError';
-          continue;
-        }
-        // 终止事件不提前关闭生成器；消费到 SDK 真正退出后再交付错误，期间不再展示后续正文。
-        if (streamError) continue;
-        if (event.type === 'item.started' && event.item?.type === 'mcp_tool_call') {
-          onEvent({ type: 'status', text: `Codex 正在调用 ${event.item.tool}` });
-        } else if (event.type === 'item.completed' && event.item?.type === 'mcp_tool_call' && event.item?.error?.message) {
-          const message = String(event.item.error.message);
-          if (/requires approval|approval policy.*never|需要审批|审批策略.*never/i.test(message)) {
-            streamError = new Error(`Codex 拒绝调用 SpCode 工具：${message}`);
+      /** 消费 SDK 事件，保留工具结果确认和进程退出的顺序。 */
+      async function consumeSdkEvents() {
+        const { events } = await session.thread.runStreamed(nextInput, { signal: streamSignal });
+        for await (const event of events) {
+          // 原样留存 SDK 实际返回的事件，包含公开推理摘要、消息及调用状态。
+          require('./training-recorder').note('sdk-event', { provider: 'codex', event });
+          if (signal?.aborted) {
+            streamError = new Error('已停止');
+            streamError.name = 'AbortError';
+            continue;
           }
-        } else if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
-          content = String(event.item.text || '');
-          // SDK 的 agent_message 是一条完整消息，不是增量片段；工具往返时后续消息应替换前文。
-          onEvent({ type: 'rewrite_text', text: content });
-        } else if (event.type === 'turn.failed') {
-          streamError = new Error(event.error?.message || 'Codex 运行失败');
-        } else if (event.type === 'error') {
-          streamError = new Error(event.message || 'Codex 运行失败');
+          // 终止事件不提前关闭生成器；消费到 SDK 真正退出后再交付错误，期间不再展示后续正文。
+          if (streamError || handoff?.signal.aborted) continue;
+          // turn.started 不代表原始用户消息已写入会话，必须等模型活动才能安全续接。
+          const itemType = event.item?.type;
+          // 启动事件只说明 SDK 建立了轮次；模型活动或成功完成才确认用户消息送达。
+          if (itemType === 'reasoning' || itemType === 'agent_message' || itemType === 'mcp_tool_call' || event.type === 'turn.completed') {
+            onInterjectionDelivered?.();
+          }
+          if (itemType === 'reasoning' || itemType === 'agent_message') acceptingHandoff = !!handoff;
+          if (event.type === 'turn.completed' || event.type === 'turn.failed' || event.type === 'error') acceptingHandoff = false;
+          if (event.type === 'item.started' && event.item?.type === 'mcp_tool_call') {
+            toolItems.add(event.item.id);
+            onEvent({ type: 'status', text: `Codex 正在调用 ${event.item.tool}` });
+          } else if (event.type === 'item.completed' && event.item?.type === 'mcp_tool_call') {
+            // 工具完成事件可以先于结果进入会话历史；等模型再活动才能结束旧流。
+            acceptingHandoff = false;
+            toolItems.delete(event.item.id);
+            const message = String(event.item.error?.message || '');
+            if (/requires approval|approval policy.*never|需要审批|审批策略.*never/i.test(message)) {
+              streamError = new Error(`Codex 拒绝调用 SpCode 工具：${message}`);
+            }
+          } else if (event.type === 'item.completed' && event.item?.type === 'agent_message' && !shouldYield?.()) {
+            content = String(event.item.text || '');
+            // SDK 的 agent_message 是一条完整消息，不是增量片段；工具往返时后续消息应替换前文。
+            onEvent({ type: 'rewrite_text', text: content });
+          } else if (event.type === 'turn.failed') {
+            streamError = new Error(event.error?.message || 'Codex 运行失败');
+          } else if (event.type === 'error') {
+            // 顶层 error 也承载重试次数和等待网络的通知，继续消费到正文或最终失败。
+            const reconnect = /^Reconnecting\.\.\. (\d+\/\d+|waiting for network)(?: \(|$)/.exec(event.message);
+            if (reconnect) {
+              const progress = reconnect[1];
+              const text = progress === 'waiting for network' ? 'Codex 正在等待网络恢复…' : `Codex 正在重连（${progress}）…`;
+              onEvent({ type: 'status', text });
+            } else {
+              streamError = new Error(event.message || 'Codex 运行失败');
+            }
+          }
+          if (streamError) acceptingHandoff = false;
+          else yieldToInterjections();
         }
       }
+      if (handoff && process.platform === 'win32') await consumeWithHandoff(handoff.signal, consumeSdkEvents);
+      else await consumeSdkEvents();
+      acceptingHandoff = false;
       if (streamError) throw streamError;
-      if (!required.length || required.some((name) => stats.calls.includes(name))) break;
+      // 插话已改变范围时将控制权交还宿主，停止后的模型请求只投递最新用户要求。
+      if (shouldYield?.() || !required.length || required.some((name) => stats.calls.includes(name))) break;
       if (attempt >= 2) throw new Error('Codex 未调用本轮要求的 SpCode 工具，无法确认任务已执行。');
       onEvent({ type: 'status', text: 'Codex 还没有调用完成任务所需的 SpCode 工具，正在继续…' });
       nextInput = [{
@@ -360,14 +459,17 @@ async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContex
     }
     return { content, reasoning: '' };
   } catch (e) {
+    // 仅接管主动结束的旧流；整轮停止或 SDK 真实错误仍走原失败路径。
+    if (handoff?.signal.aborted && !signal?.aborted && e?.name === 'AbortError') return { content: '', reasoning: '' };
     closeSdkSession(key);
     // 只有尚未执行任何工具、且服务端确认五小时刚好耗尽时，才安全地重投当前任务。
-    if (!stats.calls.length && !signal?.aborted && await isWorkQuotaExhausted(modelCfg)) {
+    if (!sdkOnly && !stats.calls.length && !signal?.aborted && await isWorkQuotaExhausted(modelCfg)) {
       onEvent({ type: 'status', text: 'Codex 工作额度在本轮耗尽，自动转入官方聊天模式…' });
-      return codexChatDirect.runTurn({ key, sig: chatSig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode });
+      return codexChatDirect.runTurn({ key, sig: chatSig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode, shouldYield, onInterjectionDelivered });
     }
     throw e;
   } finally {
+    if (unwatch) unwatch();
     session.ctx = null;
     for (const file of images) { try { fs.unlinkSync(file); } catch { /* 临时图已清理 */ } }
   }

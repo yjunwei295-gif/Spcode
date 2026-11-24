@@ -8,7 +8,7 @@ function textOf(item) {
 }
 /** 将多条补充按到达顺序标为用户插话。 */
 function block(items) {
- return '【用户实时插话】\n'+items.map(textOf).join('\n\n')+'\n【插话结束】\n以上是当前任务执行中收到的用户补充，请先处理补充，再继续原任务。';
+ return '【用户实时插话】\n'+items.map(textOf).join('\n\n')+'\n【插话结束】\n补充内容与此前仍有效的要求一并处理。用户明确停止或调整范围时，按更新后的要求处理。';
 }
 /** 解析真实附件，原生视觉模型接收像素，文本模型使用既有视觉槽位。 */
 async function prepare(items,options) {
@@ -27,17 +27,4 @@ async function prepare(items,options) {
  }
  return {text:texts.filter(Boolean).join('\n\n'),parts};
 }
-/** MCP 工具返回支持图片内容块；无图时保持原有纯文本结果。 */
-function toolResult(base,prepared) {
- const text=[typeof base==='string'?base:JSON.stringify(base),prepared.text].filter(Boolean).join('\n\n');
- if(!prepared.parts.length)return text;
- const content=[{type:'text',text}];
- for(const part of prepared.parts) {
-  if(part.type!=='image_url')continue;
-  const url=part.image_url.url,index=url.indexOf(';base64,');
-  if(!url.startsWith('data:')||index<0)throw new Error('插话图片必须为已解析的本地图片数据');
-  content.push({type:'image',mimeType:url.slice(5,index),data:url.slice(index+8)});
- }
- return {spcodeContent:content};
-}
-module.exports={textOf,block,prepare,toolResult};
+module.exports={textOf,block,prepare};

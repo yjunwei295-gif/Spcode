@@ -100,7 +100,7 @@ function untilAbort(p, signal) {
  * 跑一轮。会话按 key 复用；sig（模型、项目、技能、规则等）变了或 fresh 为真时新开会话，
  * 新会话的第一条消息带上 firstPrefix（SpCode 系统提示 + 之前对话），之后每轮只发本轮内容。
  */
-async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [] }) {
+async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], shouldYield }) {
   await untilAbort(cursorModel.ensureLogin(modelCfg), signal);
   const route = cursorModel.refreshCursorRoute();
   const selectedModel = await untilAbort(cursorModel.highModelSelection(modelCfg), signal);
@@ -196,6 +196,8 @@ async function runTurn({ key, sig, fresh, modelCfg, workspace, firstPrefix, syst
         });
         const res = await untilAbort(Promise.race([run.wait(), stallP]), signal);
         if (signal?.aborted) throw abortError();
+        // 未投递的新范围优先于旧请求的重发和工具催办。
+        if (shouldYield?.()) { if (stalled) cancelRun(); return { content, reasoning }; }
         if (stalled) {
           diag.log('cursor', 'Cursor 直通 run 没有正常收尾', { ended, status: res.status, attempt });
           cancelRun();

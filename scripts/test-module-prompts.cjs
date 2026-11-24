@@ -89,6 +89,9 @@ async function main() {
       planning: { protocol: 'openai', model: 'planning-test', baseUrl: 'http://unused' },
       code: { protocol: 'openai', model: 'code-test', baseUrl: 'http://unused' }
     }, roleTag: 'brain', startOrdered: true, userOrder: '/spcode-start', hardRounds: 6 });
+  const firstBrain = requests.find(function brain(item) { return item.model === 'brain-test'; });
+  assert.ok(firstBrain.messages.some(function guide(msg) { return msg.role === 'system' && msg.content.includes('能验收的小步'); }));
+  console.log('PASS ordinary model receives the work and self-test instruction before its first implementation step');
   for (const model of ['planning-test', 'code-test']) {
     const request = requests.find(function match(item) { return item.model === model; });
     assert.ok(request, model + ' 未被实际调用');

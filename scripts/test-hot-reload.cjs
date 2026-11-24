@@ -737,8 +737,91 @@ async function run(name, test) {
 }
 
 /**
+ * 结构预检先结束时，待提交业务成功后必须继续发布自动重启候选。
+ * 使用真实 V8 结构判定和预检子进程；宿主忙状态控制提交顺序，不靠再次保存唤醒。
+ */
+async function testRestartAfterBusinessCommit() {
+  const sample = fixture(['business.cjs']);
+  try {
+    sample.file('renderer/index.html', '<script src="app.js"></script>');
+    sample.file('renderer/app.js', 'window.loaded = true;');
+    sample.file('electron/main.js', 'const value = 1; function read() { return value; } module.exports = { read };');
+    const resident = sample.load('electron/main.js');
+    sample.file('business.cjs', 'module.exports = { value: 1 };');
+    const business = sample.load('business.cjs');
+    const validating = waitNotification(sample, isValidating, 5000);
+    sample.update('electron/main.js', 'const value = 2; function read() { return value; } module.exports = { read };');
+    check(sample.hot.flush(), '实际发起主入口结构更新');
+    // 原位检查已经发起，再阻止业务提交，使结构预检先完成而业务候选仍保留。
+    sample.state.busy = true;
+    sample.update('business.cjs', 'module.exports = { value: 2 };');
+    await validating;
+    await waitForResourceCount(isProcess, 0, 5000);
+    await nextTurn();
+    check(sample.hot.status().kind === 'validating' && !sample.state.notifications.some(isRestart), '预检完成时待提交业务阻止提前发布重启候选');
+    check(sample.hot.isBusy() && business.value === 1 && resident.read() === 1, '业务仍排队且结构交接前原进程保持旧实现');
+    sample.state.busy = false;
+    check(sample.hot.flush() && business.value === 2, '解除忙状态后同批业务真实提交并执行新值');
+    const update = sample.hot.status();
+    check(update.kind === 'restart' && update.paths.includes('electron/main.js') && sample.state.notifications.at(-1) === update, '业务提交后无需再次保存即可继续发布结构性自动重启候选');
+    check(!sample.hot.isBusy(), '业务提交与结构预检均完成后可进入全窗快照交接');
+  } finally { sample.close(); }
+  /** 识别预检子进程资源；只等待真实子进程退出，不以固定延时推定预检结束。 */
+  function isProcess(name) { return name === 'ProcessWrap'; }
+  /** 只接受结构更新实际发出的预检通知，避免将业务通知当作预检开始。 */
+  function isValidating(update) { return update.kind === 'validating'; }
+  /** 识别真正可交接的自动重启候选；validating 仍表示尚未加载。 */
+  function isRestart(update) { return update.kind === 'restart'; }
+}
+
+/**
+ * 工厂函数已执行的声明初值变化必须进入自动重启，不能把旧闭包状态报成新代码已加载。
+ * 同时核对字面量格式与注释不改变语义；实际重启后的新值由生产应用集成测试验证。
+ */
+async function testFactoryInitialization() {
+  const { assertLiveEditCompatible } = require('../electron/lib/live-edit');
+  const changes = [
+    { name: 'let 字面量', before: 'let phase = 0;', after: 'let phase = 1;' },
+    { name: 'const 字面量', before: 'const phase = 0;', after: 'const phase = 1;' },
+    { name: 'var 字面量', before: 'var phase = 0;', after: 'var phase = 1;' },
+    { name: '对象初值', before: 'let phase = { value: 0 };', after: 'let phase = { value: 1 };' },
+    { name: '数组初值', before: 'let phase = [0];', after: 'let phase = [1];' },
+    { name: '运算符', before: 'let phase = 1 + 2;', after: 'let phase = 1 * 2;' }
+  ];
+  for (const change of changes) {
+    assert.throws(changedInitialization, { code: 'SPCODE_RELAUNCH_REQUIRED' });
+    check(true, change.name + '初始化变化要求重启加载');
+    /** 使用同一工厂和读取闭包，仅改变声明初值，确保测试不依赖其他结构变化。 */
+    function changedInitialization() {
+      assertLiveEditCompatible(factorySource(change.before), factorySource(change.after));
+    }
+  }
+  assertLiveEditCompatible(factorySource('let phase = 1;'), factorySource('let phase = 0x1; /* 等值格式不改变初始化。 */'));
+  check(true, '等值字面量格式和注释变化不会变成结构性重启');
+  const sample = fixture([]);
+  try {
+    sample.file('renderer/index.html', '<script src="app.js"></script>');
+    sample.file('renderer/app.js', 'window.loaded = true;');
+    sample.file('electron/lib/factory-service.js', factorySource('let phase = 0;'));
+    const held = sample.load('electron/lib/factory-service.js');
+    check(held() === 0, '工厂已执行并保留初始状态');
+    const updated = waitNotification(sample, isResult, 5000);
+    sample.update('electron/lib/factory-service.js', factorySource('let phase = 1;'));
+    sample.hot.flush();
+    check((await updated).kind === 'restart' && held() === 0, '仅修改工厂初值会发布自动重启，交接前不冒充旧闭包已更新');
+    check(!sample.hot.isBusy(), '工厂初始化变更通过预检后可进入状态交接');
+  } finally { sample.close(); }
+  /** 构造已执行工厂及其读取闭包，init 为声明正文；返回完整 CommonJS 样本。 */
+  function factorySource(init) {
+    return 'function create() { ' + init + ' function read() { return phase; } return read; } module.exports = create();';
+  }
+  /** 接收真实原位更新、重启或错误结果，不把预检开始通知当成成功。 */
+  function isResult(update) { return update.kind === 'runtime' || update.kind === 'restart' || update.kind === 'error'; }
+}
+
+/**
  * 使用真实已加载主入口和常驻回调，确认旧引用原位执行新代码。
- * 同时验证宿主繁忙排队、定时器实例保留，以及初始化和捕获变化被拒绝而非假成功。
+ * 同时验证宿主繁忙排队、定时器实例保留，以及初始化和捕获变化进入自动重启而非假成功。
  */
 async function testResidentLiveEdit() {
   const sample = fixture([]);
@@ -746,6 +829,8 @@ async function testResidentLiveEdit() {
   try {
     const source = "const values = []; const events = new (require('events').EventEmitter)(); const initial = 1; const other = 2; function read() { return 10 + initial; } function record() { values.push(10); } const timer = setInterval(record, 5); timer.unref(); events.on('sample', record); module.exports = { read, record, values, events, timer };";
     sample.file('electron/main.js', source);
+    sample.file('renderer/index.html', '<script src="app.js"></script>');
+    sample.file('renderer/app.js', 'window.loaded = true;');
     resident = sample.load('electron/main.js');
     const held = resident.read;
     const originalTimer = resident.timer;
@@ -779,14 +864,15 @@ async function testResidentLiveEdit() {
     }
     check(resident.timer === originalTimer && !resident.timer._destroyed, '定时器保持原实例，没有第二次启动');
     const rejected = waitNotification(sample, isError, 5000);
-    function isError(update) { return update.kind === 'error'; }
+    /** 只接受完整预检后生成的自动重启候选；不把 validating 当作加载完成。 */
+    function isError(update) { return update.kind === 'restart'; }
     sample.update('electron/main.js', updated.replace('initial = 1', 'initial = 9'));
     sample.hot.flush();
-    check((await rejected).message.includes('尚未应用') && held() === 21, '顶层初始化变化明确拒绝，保留实际在用值');
+    check((await rejected).kind === 'restart' && held() === 21, '顶层初始化变化进入自动重启流程，交接完成前保留实际在用值');
     const changedCapture = waitNotification(sample, isError, 5000);
     sample.update('electron/main.js', updated.replace('return 20 + initial', 'return 20 + other'));
     sample.hot.flush();
-    check((await changedCapture).kind === 'error' && held() === 21, '新增捕获依赖不会因 V8 返回 Ok 就冒充生效');
+    check((await changedCapture).kind === 'restart' && held() === 21, '新增捕获依赖进入自动重启候选，不把旧闭包冒充新实现');
 
     const switchBefore = 'const x=100;function create(){let result;switch(1){case 1:const x=10;result=function read(){return x+1;};}return result;}module.exports=create();';
     const switchAfter = 'const x=100;function create(){let result;const x=10;switch(1){case 1:result=function read(){return x+2;};}return result;}module.exports=create();';
@@ -795,7 +881,7 @@ async function testResidentLiveEdit() {
     const switchRejected = waitNotification(sample, isError, 5000);
     sample.update('electron/lib/switch-service.js', switchAfter);
     sample.hot.flush();
-    check((await switchRejected).kind === 'error' && switchHeld() === 11, 'switch 词法绑定跨作用域移动被拒绝，不冒充更新成功');
+    check((await switchRejected).kind === 'restart' && switchHeld() === 11, 'switch 绑定跨作用域变化等待新进程整体加载');
 
     const shadowBefore = 'const x=20;module.exports=function read(){{const x=1;}return 10;};';
     const shadowAfter = 'const x=20;module.exports=function read(){{const x=1;}return 10+x;};';
@@ -804,14 +890,14 @@ async function testResidentLiveEdit() {
     const shadowRejected = waitNotification(sample, isError, 5000);
     sample.update('electron/lib/shadow-service.js', shadowAfter);
     sample.hot.flush();
-    check((await shadowRejected).kind === 'error' && shadowHeld() === 10, '内层同名声明不能掩盖新增外部捕获');
+    check((await shadowRejected).kind === 'restart' && shadowHeld() === 10, '同名声明与外部捕获变化进入自动重启候选');
 
     const movedReference = waitNotification(sample, isError, 5000);
     sample.file('electron/lib/moved-service.js', 'const x=20;module.exports=function read(){{const x=1;x;}return 10;};');
     const movedHeld = sample.load('electron/lib/moved-service.js');
     sample.update('electron/lib/moved-service.js', 'const x=20;module.exports=function read(){{const x=1;}return 10+x;};');
     sample.hot.flush();
-    check((await movedReference).kind === 'error' && movedHeld() === 10, '引用跨同名变量作用域移动被拒绝');
+    check((await movedReference).kind === 'restart' && movedHeld() === 10, '引用跨作用域变化通过自动重启整体应用');
 
     const { assertLiveEditCompatible } = require('../electron/lib/live-edit');
     assert.throws(checkThisCapture, /尚未应用/);
@@ -830,12 +916,12 @@ async function testResidentLiveEdit() {
         'function make(){function inner(){return 20;}return inner;}module.exports=make();');
     }
     check(true, '非严格模式条件函数的隐式作用域不能冒充兼容布局');
-    const repaired = waitNotification(sample, isRuntime, 5000);
+    const repaired = waitNotification(sample, isError, 5000);
     sample.update('electron/main.js', updated.split('20').join('30'));
     sample.hot.flush();
     await repaired;
-    check(held() === 31, '拒绝不兼容变化后，后续兼容版本仍能实际更新旧引用');
-    check(sample.hot.status().kind === 'error' && sample.hot.isBusy(), '常驻入口修复成功仍不解除其它独立常驻模块的失败与重载门禁');
+    check(held() === 21, '整批自动重启交接前不会混用后续局部新实现');
+    check(sample.hot.status().kind === 'restart' && !sample.hot.isBusy(), '全部结构性变更预检完成后可进入全窗口交接');
   } finally {
     if (resident) clearInterval(resident.timer);
     sample.close();
@@ -853,7 +939,9 @@ async function main() {
   await run('实际文件监听触发与关闭清理', testRealWatcherAndClose);
   await run('真实同内容保存事件过滤与后续更新', testSameContentSave);
   await run('ESM 资源校验与待处理通知保留', testResourceClassification);
-  await run('主入口、事件与定时器原位更新及结构拒绝', testResidentLiveEdit);
+  await run('结构预检先结束后的同批业务提交继续自动重启', testRestartAfterBusinessCommit);
+  await run('工厂内声明初始化变化触发自动重启', testFactoryInitialization);
+  await run('主入口、事件与定时器原位更新及结构性自动重启候选', testResidentLiveEdit);
   await run('界面CSS与脚本整批校验及错误恢复', testRendererBatchFailure);
   await run('完整静态图、HTML脚本类型及缺依赖导出拒绝', testStaticRendererGraph);
   await run('主进程最终版本核对阻止旧页面重载', testMainReloadRevision);

@@ -24,8 +24,15 @@ const api = {
     ipcRenderer.on('app:hot-reload', receive);
     return function unsubscribe() { ipcRenderer.removeListener('app:hot-reload', receive); };
   },
-  /** 界面已保存临时状态后，请主进程核对指定版本和运行任务，再安排页面重载。 */
-  hotReloadReady: function hotReloadReady(revision) { return ipcRenderer.invoke('app:hotReloadReady', revision); },
+  /** 转交 revision、当前窗口 snapshot 和自动重启 phase；返回 Promise<{ok:boolean}>，由主进程核对任务和版本后安排刷新或重启。 */
+  hotReloadReady: function hotReloadReady(revision, snapshot, phase) { return ipcRenderer.invoke('app:hotReloadReady', revision, snapshot, phase); },
+  /** 页面已实际恢复交接快照后，按所属主窗确认消费；失败会拒绝，快照不被冒充已恢复。 */
+  hotReloadRestored: function hotReloadRestored() { return ipcRenderer.invoke('app:hotReloadRestored'); },
+  /**
+   * 转交用户点击的手动重载请求，不因文件保存或页面初始化主动调用。
+   * 无参数；返回 Promise<{ok:boolean}>，预检失败保留旧进程，后续进度由 onHotReload 通知。
+   */
+  reload: function reload() { return ipcRenderer.invoke('app:reload'); },
   /** 初始化后读取加载期间错过的更新通知，不触发扫描或重载。 */
   hotReloadStatus: function hotReloadStatus() { return ipcRenderer.invoke('app:hotReloadStatus'); },
   /** 长时存活的配置、执行确认和结束回执，全部按发送者窗口路由。 */
@@ -120,7 +127,7 @@ const api = {
   listChildren: (rel, root, absolute) => ipcRenderer.invoke('workspace:children', { rel, root, absolute }),
   readWorkspaceFile: (rel) => ipcRenderer.invoke('workspace:read', rel),
   /**
-   * 请求系统启动文件树选中的文件，相对路径按所属窗口项目解析。
+   * 请求系统打开点击的本地文件，相对路径按所属窗口项目解析。
    * @returns {Promise<true>} 系统成功打开文件时兑现为 true；失败保持 Promise 拒绝。
    */
   openWorkspaceFile: function openWorkspaceFile(rel) { return ipcRenderer.invoke('shell:openFile', rel); },
@@ -176,11 +183,17 @@ const api = {
   getSnapshotMax: () => ipcRenderer.invoke('snapshot:getMax'),
   setSnapshotMax: (max) => ipcRenderer.invoke('snapshot:setMax', max),
   /**
-   * 转交用户已确认的项目快照操作，始终保留快照所属工作区。
-   * @param {{id: string, workspace: string}} payload 已确认的快照编号与项目路径。
-   * @returns {Promise<object>} 主进程的实际处理结果；不改用当前窗口的其他项目。
+   * 转交用户确认的整份快照及其所属工作区。
+   * @param {{id: string, workspace: string}} payload 快照编号与项目目录。
+   * @returns {Promise<object>} 主进程的实际处理结果，还原失败时拒绝。
    */
   restoreSnapshot: function restoreSnapshot(payload) { return ipcRenderer.invoke('snapshot:restore', payload); },
+  /**
+   * 把单文件还原请求交给专用 IPC 通道。
+   * @param {{id: string, workspace: string, path: string}} payload 快照编号、项目目录和所选相对路径。
+   * @returns {Promise<object>} 所选文件的实际处理结果，处理失败时拒绝。
+   */
+  restoreSnapshotFile: function restoreSnapshotFile(payload) { return ipcRenderer.invoke('snapshot:restoreFile', payload); },
   undoSnapshot: (id) => ipcRenderer.invoke('snapshot:undo', id),
   redoSnapshot: (id) => ipcRenderer.invoke('snapshot:redo', id),
   listHunks: (payload) => ipcRenderer.invoke('snapshot:hunks', payload),
@@ -305,6 +318,12 @@ const api = {
   indexSync: (extraFolders, opts) => ipcRenderer.invoke('index:sync', extraFolders, opts),
   indexGetMap: () => ipcRenderer.invoke('index:getMap'),
   indexSourceItem: (request) => ipcRenderer.invoke('index:sourceItem', request),
+  /** 读取当前项目保存的忽略目录，返回绝对路径数组。 */
+  indexGetIgnoredFolders() { return ipcRenderer.invoke('index:getIgnoredFolders'); },
+  /** 保存当前窗口对一个目录的添加或移除，返回更新后的完整清单。 */
+  indexChangeIgnoredFolder(workspace, folder, ignored, extra) {
+    return ipcRenderer.invoke('index:changeIgnoredFolder', workspace, folder, ignored, extra);
+  },
   indexGetExcludes: () => ipcRenderer.invoke('index:getExcludes'),
   indexSetExcludes: (ids) => ipcRenderer.invoke('index:setExcludes', ids),
   indexGetInclude: () => ipcRenderer.invoke('index:getInclude'),

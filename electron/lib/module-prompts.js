@@ -12,7 +12,7 @@ const ROLE_DUTIES = {
 /**
  * 为指定内部模块组合本轮提示词。
  * @param {string} role 模块标识，代码、总结、规划分别使用独立职责，其他辅助角色保留调用方的专用指令。
- * @param {object} context 本轮生效的 rules 与 skill；不读取人设、语气、工作记忆或历史摘要字段。
+ * @param {object} context 本轮生效的 rules、skill 与 AGI 开关 agi，用于选择可见的技能段落。
  * @param {string} instructions 调用路径的技术约束与输出协议，不包含大脑系统提示词。
  * @returns {string} 内部模块系统提示词；不修改输入或任何持久化数据。
  */
@@ -24,8 +24,9 @@ function buildModulePrompt(role, context, instructions = '') {
     for (const rule of context.rules) rules.push(`### ${rule.name}\n${rule.body}`);
     parts.push('## 本轮规则\n' + rules.join('\n\n'));
   }
-  if (context && context.skill) {
-    parts.push(`## 本轮技能：${context.skill.name}\n${context.skill.body}`);
+  const skillBody = require('./skills').skillTextForMode(context?.skill?.body, context?.agi);
+  if (skillBody.trim()) {
+    parts.push(`## 本轮技能：${context.skill.name}\n${skillBody}`);
   }
   // 技能可能同时规定技术要求和大脑沟通方式；保留原文，按模块职责限定其适用范围。
   parts.push('## 内部模块职责边界\n大脑负责理解用户需求、裁定任务范围、派单和面向用户的沟通。本模块以准确完成派单和核对事实为目标，不以沟通效果或文案润色为目标；结果只交给大脑，按调用方要求的格式给出实际产物、证据、验证结果和未解决项，不用面向用户的开场、收尾或比喻。只执行技能与规则中的任务、技术和质量要求。人设、称呼、语气、寒暄、面向用户的解释与确认流程只适用于大脑，本模块不采用。不要模仿上下文中用户或助手的说话风格，不输出角色扮演内容。任务由大脑交付；缺少必要信息时仅回报大脑，不向用户提问，不调用其他模块。遵守派单中的禁止改动范围，只依据实际代码和工具结果报告事实。');

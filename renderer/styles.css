@@ -531,6 +531,9 @@ input, textarea, select, [contenteditable="true"] {
   font-size: 14px;
   user-select: text;
 }
+/* 插话续接前保存的答复沿用助手气泡样式，每段与下一段留出间距。 */
+.interjection-replies > .bubble { margin-bottom: 8px; }
+
 /* 主窗插话提示：灰色弱化样式，区别于正常对话气泡 */
 .msg.system { margin-left: 0; margin-right: auto; }
 .msg.system .bubble {
@@ -1149,7 +1152,7 @@ input, textarea, select, [contenteditable="true"] {
 .composer-wrap {
   padding: 0 4% 20px;
 }
-.chat-stage:has(.messages.empty-center) + .composer-wrap {
+.chat-stage:has(.messages.empty-center) ~ .composer-wrap {
   position: absolute; left: 0; right: 0; top: 42%; transform: translateY(-20%);
 }
 .composer {
@@ -1169,11 +1172,25 @@ input, textarea, select, [contenteditable="true"] {
 .chip button { border: 0; background: none; cursor: pointer; color: var(--muted); }
 /* 隐式生效的默认技能：显出来但不像是用户选的 */
 .chip-muted { background: transparent; border: 1px dashed var(--border); color: var(--muted); }
+/* 输入和预测共用同一定位容器，提示层不接收鼠标，也不参与真实草稿。 */
+.composer-input { position: relative; }
 #input {
+  display: block; margin: 0;
   width: 100%; border: 0; background: transparent; resize: none; outline: none;
   font-size: 14px; line-height: 1.5; min-height: 64px; max-height: 180px;
   user-select: text;
 }
+.composer-prediction {
+  position: absolute; inset: 0; overflow: hidden; pointer-events: none;
+  color: var(--muted); user-select: none;
+}
+.composer-prediction[hidden] { display: none; }
+/* 字体和内边距由控制器同步真实 textarea；透明前缀为后续灰字保留准确位置。 */
+.composer-prediction-text { white-space: pre-wrap; overflow-wrap: break-word; }
+.composer-prediction-prefix { visibility: hidden; }
+/* 快捷键说明独占输入框下方一行，避免混入灰字候选或遮住用户输入。 */
+.composer-prediction-hint { margin: 2px 0 8px; color: var(--muted); font-size: 11px; line-height: 1.5; user-select: none; }
+.composer-prediction-hint[hidden] { display: none; }
 /* 底栏布局为三排（靠 flex-wrap 折行 + 各组 flex-basis 100% 形成）：
    第 1 排：模型条（.model-roster-wrap），用 flex: 1 1 100%（basis 100%）独占整排，
    底下一条 1px 分割线把它与第 2 排隔开；
@@ -1369,6 +1386,10 @@ html[data-theme="dark"] .send { background: #eee; color: #111; }
 }
 .status-dl-btn:hover { color: var(--accent); background: var(--hover); }
 .status-dl-ico { margin-right: 2px; }
+/* 手动重载始终在状态栏可见；排队期间禁用，避免重复提交同一次重载。 */
+.status-reload-btn { border: 1px solid var(--border); border-radius: 4px; background: transparent; color: var(--text); cursor: pointer; font-size: 11px; white-space: nowrap; padding: 0 6px; }
+.status-reload-btn:hover { color: var(--accent); background: var(--hover); }
+.status-reload-btn:disabled { opacity: .55; cursor: wait; }
 
 .download-drawer {
   position: relative; flex-shrink: 0; align-self: stretch;
@@ -1641,8 +1662,11 @@ html[data-theme="dark"] .send { background: #eee; color: #111; }
   max-height: 200px; overflow: auto; padding: 6px; font-size: 12px;
   border: 1px solid var(--border); border-radius: 8px; user-select: text;
 }
-.restore-files .file-row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 4px; }
+.restore-files .file-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 3px 4px; }
 .restore-files .desc { color: var(--muted); flex-shrink: 0; }
+/* 路径较长时换行，让文件选择和覆盖提示始终可见。 */
+.restore-file-path { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.restore-files .file-row input[type="radio"] { flex: none; margin: 0; }
 
 /* ===== 下载模型 ===== */
 .dl-title-row {

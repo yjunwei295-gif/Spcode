@@ -1,7 +1,7 @@
 /**
  * 在同一主进程内替换可重建的业务模块，并通知界面加载新的资源。
  * 无常驻资源的受管业务模块重建依赖闭包；主入口与常驻服务通过 V8 更新既有函数。
- * 原位更新保留窗口、SDK、模型进程和调度器实例；初始化或闭包布局变化会明确报告未应用。
+ * 兼容修改原位保留窗口和服务；初始化、签名或闭包结构变化则在全窗空闲后自动交接并重启主进程。
  * 更新等到全部业务调用和聊天轮次空闲后提交；加载失败会明确报告，磁盘文件不会被还原。
  */
 const fs = require('fs');
@@ -25,7 +25,8 @@ const SAVE_SETTLE_MS = 350;
  * 创建一套热重载生命周期，必须在业务模块首次 require 之前调用。
  * @param {object} options root 为程序源码根；modules 可指定受管模块的相对路径；
  * canApply 检查宿主是否空闲，notify 接收可见状态，afterReload 恢复宿主注入的回调。
- * @returns {object} start/close 管理监听，flush 在空闲边界应用更新，status 返回待处理界面通知。
+ * @returns {object} start/close 管理显式注册的监听，flush 在空闲边界应用更新，status 返回待处理通知；
+ * requestReload 仅由用户操作请求完整代码重载，预检成功后等待全窗口状态交接。
  */
 function createHotReload(options) {
   const root = path.resolve(options.root);
@@ -52,6 +53,9 @@ function createHotReload(options) {
   let revision = 0;
   let lastStatus = null;
   let rendererStatus = null;
+  /** 结构性代码变更由自动重启加载；候选仍须通过整图预检和全窗口空闲确认。 */
+  let restartStatus = null;
+  const restartPaths = new Set();
   const rendererPaths = new Set();
   const rendererPending = new Set();
   const rendererInvalid = new Set();
@@ -73,7 +77,7 @@ function createHotReload(options) {
 
   /**
    * 发布真实更新结果；错误撤销旧 ready，业务修复成功后重新预检被撤销的界面资源。
-   * @param {string} kind runtime/data/renderer/validating/error，决定状态和待加载版本的处理。
+   * @param {string} kind runtime/data/renderer/restart/validating/error，决定状态和待加载版本的处理。
    * @param {string[]} paths 相对于程序根的变更路径，仅描述本次结果；不写入源码文件。
    * @param {string} message 交给界面与诊断的实际结果文案。
    * @returns {object} 带递增 revision 的本次通知；业务修复可随后产生新的 validating 通知。
@@ -89,6 +93,12 @@ function createHotReload(options) {
       // 错误可能早于预检完成；尚未 ready 的候选同样必须等待业务修复后重新校验。
       rendererNeedsRecheck = businessInvalid.size > 0 && rendererPending.size > 0;
       rendererStatus = null;
+      restartStatus = null;
+    }
+    if (kind === 'validating') restartStatus = null;
+    if (kind === 'restart') {
+      payload.phase = 0;
+      restartStatus = payload;
     }
     if (kind === 'renderer') {
       for (const file of paths) rendererPaths.add(file);
@@ -115,7 +125,7 @@ function createHotReload(options) {
   function releaseCall() {
     active--;
     if (pending.size || pendingLive.size) schedule();
-    if (active === 0 && rendererStatus && !idleQueued && !closed) {
+    if (active === 0 && (rendererStatus || restartStatus) && !idleQueued && !closed) {
       idleQueued = true;
       queueMicrotask(notifyRendererIdle);
     }
@@ -124,7 +134,7 @@ function createHotReload(options) {
   /** 受管异步任务收尾时唤醒等待中的页面；合并同一调用栈内的重复空闲事件。 */
   function notifyRendererIdle() {
     idleQueued = false;
-    if (!closed && active === 0 && rendererStatus && options.canApply()) options.notify(rendererStatus);
+    if (!closed && active === 0 && (restartStatus || rendererStatus) && options.canApply()) options.notify(restartStatus || rendererStatus);
   }
 
   /**
@@ -303,6 +313,8 @@ function createHotReload(options) {
       for (const file of affected) businessInvalid.delete(file);
       if (!businessInvalid.size) businessFailure = null;
       publish('runtime', changed.map(relative), '业务代码已热更新，后续调用使用新实现。');
+      // 结构预检可能先结束并等待本批业务；提交成功后继续发布重启候选，无需再次保存。
+      if (restartPaths.size && !validating.size) publishRendererReady();
       return true;
     } catch (error) {
       // 只恢复 Node 的内存缓存，不改动任何磁盘源码；失败必须在界面和日志里可见。
@@ -329,7 +341,7 @@ function createHotReload(options) {
   /**
    * 原位更新主入口与常驻服务，不重新创建窗口、调度器或 SDK 会话。
    * 先读取整批正文，再由 V8 通道核对初始化和闭包布局；异步提交期间阻止其他重载。
-   * @returns {Promise<void>} 完成后发布实际结果；失败列出已提交路径，不把部分更新报成全部成功。
+   * @returns {Promise<void>} 兼容修改发布实际结果，结构性修改排队自动重启；其他失败保留诊断，不把排队报成已经加载。
    */
   async function applyLiveUpdates() {
     liveApplying = true;
@@ -342,6 +354,10 @@ function createHotReload(options) {
         new vm.Script(Module.wrap(source), { filename: file });
         updates.push({ file, source });
       }
+      if (restartPaths.size) {
+        queueRestart(changedFiles);
+        return;
+      }
       const applied = await liveEditor.apply(updates);
       if (closed) return;
       const paths = changedFiles.map(relative);
@@ -352,6 +368,10 @@ function createHotReload(options) {
         : '更新文件尚未加载，首次调用将读取磁盘上的新实现。');
     } catch (error) {
       if (closed) return;
+      if (error.code === 'SPCODE_RELAUNCH_REQUIRED') {
+        queueRestart(changedFiles);
+        return;
+      }
       const applied = (error.applied || []).map(relative);
       const detail = applied.length ? ' 已提交：' + applied.join('、') + '；其余尚未应用。' : '';
       const failedBatch = new Set(changedFiles);
@@ -360,14 +380,69 @@ function createHotReload(options) {
     } finally {
       liveApplying = false;
       if (pending.size || pendingLive.size) schedule();
-      if (rendererStatus) notifyRendererIdle();
+      if (restartPaths.size && !validating.size) publishRendererReady();
+      if (rendererStatus || restartStatus) notifyRendererIdle();
     }
+  }
+
+  /**
+   * 处理用户明确发起的完整代码重载，预检后交给既有全窗口交接流程。
+   * 无参数；只读取当前 electron 脚本与界面资源，不安装源码自动监听，不原位应用业务模块。
+   * @returns {{ok:boolean}} 已接收或同一请求正在处理时为 true；脚本解析失败为 false，并发布具体诊断。
+   * 前端整图异步预检失败时保留旧进程；修正源码后可再次点击，标签与草稿由重启协调器交接。
+   */
+  function requestReload() {
+    if (validating.size || restartStatus) return { ok: true };
+    const scripts = [];
+    const directories = [path.join(root, 'electron')];
+    try {
+      while (directories.length) {
+        const directory = directories.pop();
+        for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+          const file = path.join(directory, entry.name);
+          if (entry.isDirectory()) {
+            directories.push(file);
+            continue;
+          }
+          if (!entry.isFile() || !['.js', '.cjs'].includes(path.extname(file))) continue;
+          new vm.Script(Module.wrap(fs.readFileSync(file, 'utf8')), { filename: file });
+          scripts.push(file);
+        }
+      }
+    } catch (error) {
+      publish('error', ['electron'], '手动重载校验失败，当前进程继续运行：' + error.message);
+      return { ok: false };
+    }
+    queueRestart(scripts);
+    return { ok: true };
+  }
+
+  /**
+   * 将已确认的代码变更放入重启批次，并重新预检界面依赖图。
+   * @param {string[]} files 已通过脚本语法检查的绝对路径；只解除将由新进程加载的同批结构错误。
+   * @returns {void} 不立即退出；所有窗口必须完成两次空闲确认与临时快照交接。
+   */
+  function queueRestart(files) {
+    for (const file of files) {
+      restartPaths.add(relative(file));
+      businessInvalid.delete(file);
+    }
+    if (!businessInvalid.size) businessFailure = null;
+    rendererStatus = null;
+    rendererSettled = true;
+    publish('validating', files.map(relative), '正在检查代码重载所需的界面资源。');
+    validateRenderer(relative(files[0]));
+  }
+
+  /** 保存或重启交接失败必须报告；只发布失败，不退出应用或改动源码。 */
+  function rejectRestart(error) {
+    businessFailure = publish('error', Array.from(restartPaths), '代码自动重载失败，当前进程继续运行：' + error.message);
   }
 
   /**
    * 接收真实保存事件，按业务、常驻脚本或界面资源进入对应更新流程。
    * @param {string} file 保存或删除的源码路径，统一解析为绝对路径后分类。
-   * @returns {void} 登记待更新集合并安排异步处理；不写文件，不重启窗口或模型会话。
+   * @returns {void} 登记候选并安排预检；本方法不直接退出进程，结构性修改由全窗交接流程自动重启。
    * 每次界面保存立即撤销旧 ready；全部静态依赖预检通过且保存稳定后才发布新版本。
    */
   function changed(file) {
@@ -432,7 +507,16 @@ function createHotReload(options) {
    * 预检完成和后续界面保存均不能解除业务错误，避免旧页面被未修复的候选替换。
    */
   function publishRendererReady() {
-    if (closed || businessInvalid.size || !rendererSettled || validating.size || rendererInvalid.size || !rendererPending.size) return;
+    if (closed || businessInvalid.size || !rendererSettled || validating.size || rendererInvalid.size) return;
+    if (restartPaths.size) {
+      if (pending.size || pendingLive.size || liveApplying) return;
+      const paths = Array.from(restartPaths);
+      for (const file of rendererPending) if (!paths.includes(file)) paths.push(file);
+      rendererPending.clear();
+      publish('restart', paths, '重载请求已排队，全部窗口空闲后保存状态并重启加载新代码。');
+      return;
+    }
+    if (!rendererPending.size) return;
     const paths = Array.from(rendererPending);
     rendererPending.clear();
     publish('renderer', paths, '界面资源有更新，空闲后自动重新加载。');
@@ -594,7 +678,7 @@ function createHotReload(options) {
    * 查询仍有效的更新状态，业务错误未修复时优先报告错误。
    * @returns {object|null} 已暴露的错误、尚未加载的界面版本或最近通知；不消费候选。
    */
-  function status() { return businessFailure || rendererFailure || rendererStatus || lastStatus; }
+  function status() { return businessFailure || rendererFailure || restartStatus || rendererStatus || lastStatus; }
   /**
    * 检查受管调用、待更新批次与未修复错误是否仍阻止页面重载。
    * @returns {boolean} 有受管业务待校验、常驻脚本待更新、在途调用、界面候选或未修复错误时为 true。
@@ -603,7 +687,7 @@ function createHotReload(options) {
   function isBusy() {
     return active > 0 || staging !== null || liveApplying || pending.size > 0 || pendingLive.size > 0 || businessInvalid.size > 0 || rendererPending.size > 0 || validating.size > 0 || rendererInvalid.size > 0;
   }
-  return { start, close, flush, changed, status, isBusy };
+  return { start, close, flush, changed, status, isBusy, rejectRestart, requestReload };
 }
 
 module.exports = { createHotReload, LIVE_MODULES };

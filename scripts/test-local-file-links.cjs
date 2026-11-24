@@ -1,4 +1,4 @@
-/** 在隔离的完整页面验证聊天文件链接、只读预览与生产目录定位 IPC；不启动链接指向的程序。 */
+/** 在隔离的完整页面验证聊天文件链接、只读预览与目录定位；仅记录系统启动目标。 */
 'use strict';
 const { app, BrowserWindow, ipcMain, nativeImage, shell } = require('electron');
 const fs = require('node:fs');
@@ -11,10 +11,11 @@ if (appRoot !== root) Object.defineProperty(app, 'isPackaged', { value: true });
 const workspaceApi = require(path.join(appRoot, 'electron/lib/workspace'));
 const output = fs.mkdtempSync(path.join(root, 'generated', 'file-links-check-'));
 app.setPath('userData', path.join(output, 'user-data'));
-const binaryRel = 'generated/程序 #1 & (测试).exe';
+const binaryRel = 'generated/二进制 #1 & (测试).bin';
 const textRel = 'generated/说明 #1.md';
 const imageRel = 'generated/图片 #1.png';
 const reveals = [];
+const opened = [];
 let win;
 let checks = 0;
 let liveReveal = false;
@@ -30,7 +31,7 @@ async function until(expression) {
   const details = await win.webContents.executeJavaScript('({url:location.href,errors:fullPageRecord.errors,preview:document.getElementById("preview-body").innerText})');
   throw Error('条件超时：' + expression + '\n' + JSON.stringify(details));
 }
-/** 复用真实文件读取及目录 IPC；先记录路径断言，末项再实际唤起资源管理器供系统核对。 */
+/** 复用生产文件 IPC；记录启动路径，末项实际唤起资源管理器供核对。 */
 function registerHandlers() {
   const source = fs.readFileSync(path.join(appRoot, 'electron/main.js'), 'utf8');
   const start = source.indexOf("ipcMain.handle('workspace:read'");
@@ -42,7 +43,10 @@ function registerHandlers() {
     getWin: function owner() { return win; },
     workspaceByWin: { get: function workspace() { return output; } },
     extraRoots: function extras() { return []; },
-    shell: { showItemInFolder: function reveal(file) { reveals.push(file); if (liveReveal) shell.showItemInFolder(file); } }
+    shell: {
+      openPath: function recordOpen(file) { opened.push(file); return Promise.resolve(''); },
+      showItemInFolder: function reveal(file) { reveals.push(file); if (liveReveal) shell.showItemInFolder(file); }
+    }
   });
 }
 /** 点击真实聊天链接；文件路径来自 Markdown 输出而不是测试直接调用预览函数。 */
@@ -73,7 +77,7 @@ async function main() {
   const meta = workspaceApi.readForPreview(root, executable);
   check(meta.kind === 'binary' && meta.size === fs.statSync(executable).size && !('content' in meta), '真实大型 EXE 只返回元信息，不传送完整二进制内容');
   const preload = path.join(output, 'preload.cjs');
-  fs.writeFileSync(preload, 'const {contextBridge,ipcRenderer}=require("electron");contextBridge.exposeInMainWorld("fileFixture",{read:function(p){return ipcRenderer.invoke("workspace:read",p)},reveal:function(p){return ipcRenderer.invoke("shell:showInFolder",p)}});');
+  fs.writeFileSync(preload, 'const {contextBridge,ipcRenderer}=require("electron");contextBridge.exposeInMainWorld("fileFixture",{read:function(p){return ipcRenderer.invoke("workspace:read",p)},reveal:function(p){return ipcRenderer.invoke("shell:showInFolder",p)},open:function(p){return ipcRenderer.invoke("shell:openFile",p)}});');
   win = new BrowserWindow({ show: false, width: 1280, height: 900, webPreferences: { preload, backgroundThrottling: false } });
   registerHandlers();
   const fixture = fs.readFileSync(path.join(root, 'scripts/test-ui-performance.cjs'), 'utf8');
@@ -81,7 +85,7 @@ async function main() {
   const end = fixture.indexOf('\n/**', start);
   assert.ok(start >= 0 && end > start);
   // 本测试不发送热更新通知；补齐当前页面所需的订阅、状态和确认接口，不伪造可重载版本。
-  const setup = fixture.substring(start, end) + '\nfullPageSetup();simple.onHotReload=function onHotReload(){return function unsubscribe(){};};simple.hotReloadStatus=async function hotReloadStatus(){return null;};simple.hotReloadReady=async function hotReloadReady(){return false;};const originalState=simple.getState;simple.getState=async function(){const s=await originalState();s.workspace=' + JSON.stringify(output) + ';return s;};simple.readWorkspaceFile=fileFixture.read;simple.showInFolder=fileFixture.reveal;window.findFileLink=function(label){for(const a of document.querySelectorAll("#messages a")){if(a.textContent===label)return a;}throw Error("链接不存在："+label);};';
+  const setup = fixture.substring(start, end) + '\nfullPageSetup();simple.onHotReload=function onHotReload(){return function unsubscribe(){};};simple.hotReloadStatus=async function hotReloadStatus(){return null;};simple.hotReloadReady=async function hotReloadReady(){return false;};const originalState=simple.getState;simple.getState=async function(){const s=await originalState();s.workspace=' + JSON.stringify(output) + ';return s;};simple.readWorkspaceFile=fileFixture.read;simple.showInFolder=fileFixture.reveal;simple.openWorkspaceFile=fileFixture.open;window.findFileLink=function(label){for(const a of document.querySelectorAll("#messages a")){if(a.textContent===label)return a;}throw Error("链接不存在："+label);};';
   await win.loadURL('about:blank');
   win.webContents.debugger.attach('1.3');
   await win.webContents.debugger.sendCommand('Page.enable');
@@ -97,11 +101,13 @@ async function main() {
   check(await win.webContents.executeJavaScript('document.querySelectorAll("#messages a").length===5&&document.querySelector("#messages code").textContent.includes("unrelated.exe")'), '脚本和数据协议不可点击，代码内路径保持原文');
   const pageUrl = win.webContents.getURL();
   await clickLink('新版程序');
-  await until('!!document.querySelector(".file-info-preview")');
-  check(await win.webContents.executeJavaScript('document.querySelector(".file-info-preview strong").textContent==="SimpleCode.exe"&&document.querySelector(".file-info-preview").textContent.includes("修改时间")'), '与交付消息相同的绝对路径可打开 EXE 文件信息预览');
-  check(win.webContents.getURL() === pageUrl && BrowserWindow.getAllWindows().length === 1, '预览不会导航当前页面或打开额外程序窗口');
+  for (let i = 0; i < 100 && opened.length === 0; i++) {
+    await new Promise(function delay(resolve) { setTimeout(resolve, 30); });
+  }
+  check(opened.length === 1 && opened[0] === executable, '对话 EXE 链接把原始绝对路径交给系统启动入口');
+  check(win.webContents.getURL() === pageUrl && BrowserWindow.getAllWindows().length === 1, 'EXE 链接保留当前聊天页面和窗口');
   await clickLink('特殊字符文件');
-  await until('document.querySelector(".file-info-preview strong")?.textContent==="程序 #1 & (测试).exe"');
+  await until('document.querySelector(".file-info-preview strong")?.textContent==="二进制 #1 & (测试).bin"');
   check(await win.webContents.executeJavaScript('document.querySelector(".file-info-preview").textContent.includes("8 字节")'), '含空格、中文、井号、括号及与号的目标按原路径读取');
   await revealFrom('findFileLink("特殊字符文件")', binary);
   await revealFrom('document.querySelector(".file-info-preview strong")', binary);
@@ -111,8 +117,7 @@ async function main() {
   await clickLink('图片');
   await until('document.querySelector("#preview-body img")?.naturalWidth===1');
   check(true, '图片文件链接复用可解码的图片预览');
-  await clickLink('新版程序');
-  await until('document.querySelector(".file-info-preview strong")?.textContent==="SimpleCode.exe"');
+  check(opened.length === 1, '普通文件链接只使用侧栏预览');
   check(await win.webContents.executeJavaScript('fullPageRecord.errors.length===0'), '完整页面没有脚本异常');
   liveReveal = true;
   await revealFrom('findFileLink("新版程序")', executable);

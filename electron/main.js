@@ -5,7 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { spawn } = require('child_process');
-// 在业务模块首次加载前建立稳定导出入口；热更新不会重启 Electron 进程。
+// 在业务模块首次加载前建立稳定导出入口；源码只在用户点击手动重载后经状态交接重新加载。
 const hotReload = require('./lib/hot-reload').createHotReload({
   root: path.join(__dirname, '..'),
   canApply: canApplyHotReload,
@@ -43,6 +43,7 @@ const codeIndex = require('./lib/code-index');
 const codeEmbed = require('./lib/code-embed');
 const desktopHand = require('./lib/desktop-hand');
 const contextPreview = require('./lib/context-preview');
+const { distillSubmittedRequirements } = require('./lib/composer-requirements');
 const trainingArchive = require('./lib/training-recorder');
 // 发送前预览：只读拼一遍本轮 system 文本给预览面板，模块内不发模型请求、不写盘
 const promptPreview = require('./lib/prompt-preview');
@@ -70,6 +71,26 @@ const windowLayouts = require('./lib/session-layout').createWindowLayouts({
 });
 /** 主窗到其持久化身份的映射；不使用进程槽位或运行时窗口编号作为磁盘身份。 */
 const layoutByWin = new WeakMap();
+/** 用户请求手动重载后等待全部主窗空闲再重启；交接按稳定窗口身份隔离。 */
+const codeRestart = require('./lib/restart-reload').createRestartReload({
+  app, argv: process.argv, directory: codeRestartDirectory, windows: codeRestartWindows,
+  status: codeRestartStatus, isBusy: codeRestartBusy, canApply: canApplyHotReload,
+  notify: notifyHotReload, failed: codeRestartFailed
+});
+/** 无参数；返回当前用户数据中的一次性交接目录，不依赖安装位置。 */
+function codeRestartDirectory() { return path.join(app.getPath('userData'), 'code-reload'); }
+/** 无参数；只列出本进程存活的主窗及其稳定身份，不包含桌宠和作品窗。 */
+function codeRestartWindows() {
+  const owners = [];
+  for (const win of windows) if (!win.isDestroyed()) owners.push({ key: layoutByWin.get(win), win });
+  return owners;
+}
+/** 无参数；读取真实候选版本，不将已保存源码当作运行成功。 */
+function codeRestartStatus() { return hotReload.status(); }
+/** 无参数；返回业务调用、更新预检或失败是否仍阻止自动重启。 */
+function codeRestartBusy() { return hotReload.isBusy(); }
+/** 接收交接保存或 relaunch 异常；通过原更新通道报告，应用保持运行。 */
+function codeRestartFailed(error) { hotReload.rejectRestart(error); }
 /** 整体退出期间的关闭事件只释放运行资源，不能移除待恢复的窗口身份。 */
 let quitting = false;
 /** 常驻置顶悬浮对话栏（主进程持有，退出流程里 destroy） */
@@ -251,6 +272,8 @@ function canApplyHotReload() {
 
 /** 将真实更新状态送到主窗；已经确认加载的界面版本不重复触发重载。 */
 function notifyHotReload(update) {
+  codeRestart.observe(update);
+  if (update.kind === 'restart') update = Object.assign({}, update, { phase: codeRestart.phase() });
   diag.log('hot-reload', update.message, { kind: update.kind, paths: update.paths, revision: update.revision });
   for (const win of windows) {
     if (update.kind === 'renderer' && (hotReloadVersions.get(win) || 0) >= update.revision) continue;
@@ -270,19 +293,34 @@ ipcMain.handle('app:hotReloadStatus', function hotReloadStatus(event) {
   const update = hotReload.status();
   const win = getWin(event);
   if (update && update.kind === 'renderer' && (hotReloadVersions.get(win) || 0) >= update.revision) return null;
+  if (update && update.kind === 'restart') return Object.assign({}, update, { phase: codeRestart.phase() });
   return update;
+});
+
+/**
+ * 接收主窗口的手动重载请求，校验源码后沿用全部窗口的状态交接。
+ * @param {Electron.IpcMainInvokeEvent} event 点击重载按钮的窗口，由发送者核对主窗身份。
+ * @returns {{ok:boolean}} 是否接收本次请求；预检失败通过更新通知报告，不退出旧进程。
+ */
+ipcMain.handle('app:reload', function manualReload(event) {
+  const win = getWin(event);
+  if (!win || !windows.has(win)) return { ok: false };
+  return hotReload.requestReload();
 });
 
 /**
  * 渲染层保存临时快照后请求真正重载；主进程再次检查聊天与业务调用。
  * @param {Electron.IpcMainInvokeEvent} event 发起确认的主窗口 IPC，不能替其他窗口登记版本。
  * @param {number} revision 渲染层已经保存快照的预检版本，必须与最新可加载版本一致。
+ * @param {object} snapshot 结构性代码重启需要交接的本窗完整状态；普通界面刷新仍使用 sessionStorage。
+ * @param {number} phase 自动重启的就绪或最终采集阶段；其他窗口的回执不能替代本窗。
  * @returns {{ok:boolean}} 当前确认是否接受；返回 true 后仍在下一事件循环复核版本和忙状态。
  * IPC 应答先送达旧页面，新保存或错误会取消最终重载并通知页面清除临时快照。
  */
-ipcMain.handle('app:hotReloadReady', function hotReloadReady(event, revision) {
+ipcMain.handle('app:hotReloadReady', function hotReloadReady(event, revision, snapshot, phase) {
   const win = getWin(event);
   const update = hotReload.status();
+  if (update && update.kind === 'restart') return codeRestart.ready(win, revision, snapshot, phase);
   if (!win || !windows.has(win) || !update || update.kind !== 'renderer' || update.revision !== revision) return { ok: false };
   if (!canApplyHotReload() || hotReload.isBusy()) return { ok: false };
   hotReloadVersions.set(win, revision);
@@ -519,7 +557,24 @@ function forwardTurnEventToFloatBar(ev, turnId) {
   }
 }
 
-// 悬浮栏发送入口：按小窗带来的会话键定位窗口；空闲时交给那个窗口的发送流程，跑着就插话
+/**
+ * 把补充交给会话当前轮的收件箱。
+ * @param {string} key 主窗标签与悬浮窗共用的会话键。
+ * @param {string} text 本条插话正文。
+ * @param {Array<object>} attachments 已校验的图片附件；允许纯图插话。
+ * @returns {boolean} 当前轮接受时返回 true，并通知悬浮窗下一次模型请求会读取。
+ */
+function deliverChatInterjection(key, text, attachments) {
+  if (!agent.pushInterjection(key, text, attachments)) return false;
+  broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '插话已接收，下一次模型请求将读取' });
+  return true;
+}
+
+/**
+ * 按悬浮窗绑定的会话键转交正文和图片。
+ * @param {object} payload 本次提交的会话键、正文和图片列表。
+ * @returns {void} 有活动收件箱时提交插话并通知主窗存档，其余请求交给原队列。
+ */
 function handleFloatBarSend(payload) {
   const incoming = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
   const key = String(incoming.key || '');
@@ -543,30 +598,20 @@ function handleFloatBarSend(payload) {
     broadcastToFloatBars({ kind: 'error', sessionKey: key, text: '对应的主界面已关闭，这条没发出去' });
     return;
   }
-  // 正文与附件共同进入运行中的会话，纯图消息也可实时插话。
-  // 小窗要显示带了几张图，所以广播文案里带上张数；images 只是占位，小窗不渲染图片本身
+  // 小窗只显示附件数量，主窗绑定标签收到真实附件路径和预览地址。
   const userText = attList.length > 0 ? msg + `（附 ${attList.length} 张图）` : msg;
-  broadcastToFloatBars({ kind: 'user', sessionKey: key, text: userText, images: attList.map((a) => a.path) });
-  if (turnIsRunning(target)) {
-    let pushed = false;
-    try {
-      pushed = agent.pushInterjection(key, msg, attList) === true;
-    } catch (e) {
-      diag.log('floatbar', '插话失败', { message: e && e.message });
-    }
-    if (pushed) {
-      // 已投递的插话也交给绑定会话记入历史；只登记，不经过 send 再次投递或覆盖当前草稿。
-      sendTo(target, 'chat:float-user-message', { tabId: key.slice(key.indexOf(':') + 1), text: msg, attachments: attList, images: attList.map(function imageUrl(att) { return require('url').pathToFileURL(att.path).href; }), interjection: true });
-      broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '插话已接收，将在当前工具或模型请求结束后优先处理' });
-      return;
-    }
-    // AGI 关闭或大脑已进入收尾时，交给主窗队列，不能报告为已插话后丢掉。
-    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '当前无法插话，这条已交给主窗排队' });
-    sendTo(target, 'chat:float-user-message', { text: msg, attachments: attList });
-    return;
+  broadcastToFloatBars({ kind: 'user', sessionKey: key, text: userText, images: attList.map(function attachmentPath(att) { return att.path; }) });
+  const interjection = deliverChatInterjection(key, msg, attList);
+  sendTo(target, 'chat:float-user-message', {
+    tabId: key.slice(key.indexOf(':') + 1),
+    text: msg,
+    attachments: attList,
+    images: attList.map(function imageUrl(att) { return require('url').pathToFileURL(att.path).href; }),
+    interjection
+  });
+  if (!interjection && turnIsRunning(target)) {
+    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '需求已交给绑定会话，任务结束后按队列处理' });
   }
-  // 会话历史由渲染层维护，所以这条提示转发给那个主窗，复用现有的发送流程，不另起一套
-  sendTo(target, 'chat:float-user-message', { text: msg, attachments: attList });
 }
 
 // 小窗的答复：key 定位窗口，把答复送进那个窗口里对应的一轮
@@ -635,6 +680,7 @@ function createWindow(layoutId) {
     if (screenWatchOwner && screenWatchOwner.win === win) stopScreenRequests();
     stopWorkspaceWatch(win);
     windows.delete(win);
+    codeRestart.check();
     // 这个窗口的身份和会话一起撤掉，免得小窗还挂着一个已经没了的会话
     winIdByWin.delete(win);
     winById.delete(winId);
@@ -673,13 +719,20 @@ function createWindow(layoutId) {
   return win;
 }
 
+/** 界面真正恢复交接状态后才消费对应快照；IPC 不能指定别的窗口身份。 */
+ipcMain.handle('app:hotReloadRestored', function hotReloadRestored(event) {
+  const win = getWin(event);
+  codeRestart.restored(layoutByWin.get(win));
+  return true;
+});
+
 /**
  * 冷启动或重新激活时按稳定身份恢复原窗口组。
  * 无参数；首次启动没有登记时创建新主窗，有登记时按原顺序创建对应窗口。
  * @returns {void} 各主窗自行加载其标签清单；登记读取失败直接报告，不用另一窗口的数据代替。
  */
 function restoreWindows() {
-  const layouts = windowLayouts.restore();
+  const layouts = windowLayouts.restore(codeRestart.layouts());
   if (!layouts.length) createWindow();
   else {
     for (const layout of layouts) createWindow(layout);
@@ -1420,14 +1473,11 @@ app.whenReady().then(async () => {
   broadcastSessions();
   startClipboardWatch();
   if (store.load().desktopAlive) desktopHand.setAlive(true);
-  // 源码版与发布版均监听程序代码和界面；发布配置使用真实文件目录，避免把 asar 虚拟路径交给 fs.watch。
-  // 外置技能/规则仍读取 APP_ROOT，程序资源仍读取 CODE_ROOT，两类更新沿用同一空闲加载流程。
+  // 程序源码不再注册自动监听；保存 electron、renderer 或包清单不会自动应用代码或重启。
+  // 外置技能与规则仅刷新资料，下一次请求读取新正文，不触发页面重载。
   const hotReloadDirectories = [
     { path: path.join(APP_ROOT, 'skills'), kind: 'data' },
-    { path: path.join(APP_ROOT, 'rules'), kind: 'data' },
-    path.join(CODE_ROOT, 'electron'),
-    path.join(CODE_ROOT, 'renderer'),
-    path.join(CODE_ROOT, 'package.json')
+    { path: path.join(APP_ROOT, 'rules'), kind: 'data' }
   ];
   hotReload.start(hotReloadDirectories);
   app.on('activate', function activateWindows() {
@@ -1473,6 +1523,7 @@ ipcMain.handle('app:state', async function appState(e) {
     workspace: workspaceByWin.get(win) || '',
     // 清单绑定跨重启保留的窗口身份，运行编号和多开进程槽位变化不会读到其他窗口的清单。
     sessionLayoutKey: `spcode:open-tabs:${layoutByWin.get(win)}`,
+    codeReloadSnapshot: codeRestart.snapshot(layoutByWin.get(win)),
     appRoot: APP_ROOT,
     localFiles: listLocalFilesEnriched(modelsDir),
     assemblyKey: assembly.assemblyKey(s)
@@ -1713,6 +1764,18 @@ ipcMain.handle('index:sourceItem', (e, request) => {
   return codeIndex.sourceItem(ws, [], request || {});
 });
 
+/** 读取发起窗口当前项目的扫描忽略清单，首次绘制之前也可配置。 */
+ipcMain.handle('index:getIgnoredFolders', function getMapIgnoredFolders(e) {
+  return codeIndex.getIgnoredFolders(workspaceByWin.get(getWin(e)));
+});
+
+/** 将单条目录选择应用到原项目；选择对话框打开期间切换项目时拒绝写入。 */
+ipcMain.handle('index:changeIgnoredFolder', function changeMapIgnoredFolder(e, expected, folder, ignored, extra) {
+  const ws = workspaceByWin.get(getWin(e));
+  if (!ws || ws !== expected) throw new Error('当前项目已切换，请重新打开设置');
+  return codeIndex.changeIgnoredFolder(ws, folder, ignored, extra);
+});
+
 ipcMain.handle('index:getExcludes', (e) => {
   const ws = workspaceByWin.get(getWin(e)) || '';
   return codeIndex.getExcludes ? codeIndex.getExcludes(ws) : [];
@@ -1829,8 +1892,8 @@ ipcMain.handle('workspace:read', async (e, rel) => {
 });
 
 /**
- * 用系统默认程序启动文件树选中的本地文件。
- * 相对路径沿用发送窗口的项目归属，附加目录使用树内的绝对路径；系统拒绝时原样返回错误。
+ * 用系统默认程序打开用户从文件树或对话正文点击的本地文件。
+ * 相对路径按发送窗口的项目解析，绝对路径沿用原值；系统拒绝时原样返回错误。
  * @returns {Promise<true>} 系统成功打开文件时兑现为 true；路径解析或系统启动失败时拒绝。
  */
 ipcMain.handle('shell:openFile', async function openWorkspaceFile(event, rel) {
@@ -2396,14 +2459,26 @@ ipcMain.handle('snapshot:setMax', (e, max) => {
 });
 
 /**
- * 还原用户已确认的指定项目快照，不从当前前台窗口推断快照归属。
- * @param {object} _e IPC 发送事件；项目由确认动作捕获的 payload.workspace 明确指定。
+ * 还原用户确认的整份快照。
+ * @param {object} _e IPC 发送事件；项目由用户打开确认框时捕获。
  * @param {{id: string, workspace: string}} payload 快照编号与所属工作区。
- * @returns {object} snapshot.restore 的实际处理结果；缺少工作区或处理失败继续向调用方报告。
+ * @returns {object} 实际处理结果；缺少工作区或还原失败时拒绝 IPC 请求。
  */
 ipcMain.handle('snapshot:restore', function restoreOwnedSnapshot(_e, payload) {
   if (!payload.workspace) throw new Error('未选择工作目录');
   return snapshot.restore(payload.workspace, payload.id);
+});
+
+/**
+ * 只还原用户选中的文件，通过专用通道避免旧主进程把单文件请求当成整份还原。
+ * @param {object} _e IPC 发送事件；项目由历史快照的确认动作捕获。
+ * @param {{id: string, workspace: string, path: string}} payload 快照编号、项目目录和所选文件相对路径。
+ * @returns {object} 单文件处理结果；缺少文件路径或文件不在快照中时拒绝 IPC 请求。
+ */
+ipcMain.handle('snapshot:restoreFile', function restoreOwnedSnapshotFile(_e, payload) {
+  if (!payload.workspace) throw new Error('未选择工作目录');
+  if (typeof payload.path !== 'string' || !payload.path) throw new Error('未选择要还原的文件');
+  return snapshot.restore(payload.workspace, payload.id, payload.path);
 });
 
 ipcMain.handle('snapshot:undo', (e, id) => {
@@ -2662,6 +2737,12 @@ ipcMain.handle('paste:save', (_e, { name, mime, base64 }) => {
 const sessionMetaCache = new Map();
 // 草稿走独立小文件，打字不再经 IPC 复制和重存整份历史。
 const sessionComposers = require('./lib/session-composer').createComposerStore(sessionDir);
+/**
+ * 生成历史清单与缓存共用的轻量会话摘要。
+ * @param {object} data 完整会话存档或独立草稿记录；未提交草稿只影响 hasComposer，不作为需求候选。
+ * @returns {object} 原有历史元数据及已提交需求的正文、频次和最近索引，不携带助手回复。
+ * 清单首次读盘和完整会话保存后都走这里，预测摘要随现有修改时间缓存更新，不新增全文 IPC。
+ */
 function sessionMetaOf(data) {
   return {
     id: data.id,
@@ -2669,7 +2750,8 @@ function sessionMetaOf(data) {
     workspace: data.workspace,
     updatedAt: data.updatedAt,
     messageCount: Array.isArray(data.messages) ? data.messages.length : 0,
-    hasComposer: !!(data.composer && (data.composer.text || (data.composer.attachments && data.composer.attachments.length) || data.composer.refillFromIndex != null))
+    hasComposer: !!(data.composer && (data.composer.text || (data.composer.attachments && data.composer.attachments.length) || data.composer.refillFromIndex != null)),
+    requirements: distillSubmittedRequirements(data)
   };
 }
 
@@ -2910,12 +2992,21 @@ ipcMain.handle('chat:promptPreview', (e, payload) => {
 
 ipcMain.handle('chat:send', async (e, payload) => {
   const win = getWin(e);
-  if (payload.longAliveRunId && !longAliveHost.authorize(win, payload.longAliveRunId, payload.turnId)) {
+  // 只接受调度器对当前投递保存的授权目标，渲染层的轮次正文仅提供模型上下文。
+  const longAliveGoal = payload.longAliveRunId
+    ? longAliveHost.authorize(win, payload.longAliveRunId, payload.turnId)
+    : undefined;
+  if (longAliveGoal === null) {
     throw new Error('长时存活已停止，本轮未执行');
   }
   const ws = String(payload?.workspace || workspaceByWin.get(win) || '');
   const s = store.load();
   const modelCfg = store.resolveModelCfg(payload.modelId || s.currentModelId, s);
+  // 外部授权配置只绑定到主进程确认的工作区；手动聊天不获得收发工具。
+  const weixinProfile = process.env.SPCODE_WEIXIN_PROFILE;
+  const weixinChannel = longAliveGoal !== undefined && weixinProfile
+    ? require('./lib/weixin-channel').forWorkspace(weixinProfile, workspaceByWin.get(win), app.getPath('userData'))
+    : null;
   const ctl = new AbortController();
   const turnId = String(payload?.turnId || '');
   // 这一轮挂在哪个窗口的哪个标签页上：渲染层没上报 tabId 时用该窗口上次上报的标签页兜底，
@@ -3010,6 +3101,8 @@ ipcMain.handle('chat:send', async (e, payload) => {
       modelCfg,
       history: payload.history || [],
       userText: payload.text || '',
+      longAliveGoal,
+      weixinChannel,
       action: payload.action === 'start-work' ? 'start-work' : undefined,
       attachments: payload.attachments || [],
       contextPaths: payload.contextPaths || [],
@@ -3061,24 +3154,21 @@ ipcMain.handle('chat:send', async (e, payload) => {
   }
 });
 
-// 主窗运行中接收本会话插话，由 Agent 在工具或模型请求边界优先交给 AI。
-ipcMain.handle('chat:interject', async (e, payload) => {
+/**
+ * 将主窗提交的补充放进绑定会话当前轮的收件箱。
+ * @param {Electron.IpcMainInvokeEvent} e 来源事件，用于确定所属窗口。
+ * @param {object} payload 提交快照，含可选 tabId、正文 text 和图片附件 attachments；支持纯图。
+ * @returns {{ok: boolean, key?: string, reason?: string}} 只有收件箱接受时返回会话键；无效请求和非活动轮次返回原因。
+ */
+ipcMain.handle('chat:interject', function submitChatInterjection(e, payload) {
   const win = getWin(e);
   const text = payload && typeof payload.text === 'string' ? payload.text.trim() : '';
   const attachments = Array.isArray(payload && payload.attachments) ? payload.attachments : [];
-  // 纯图插话同样有效；只有正文与附件均为空才拒收。
   if (!text && !attachments.length) return { ok: false, reason: 'empty' };
-  // 会话键算法与 chat:send 完全一致，保证主窗插话和小窗插话落进同一个桶
-  const key = makeSessionKey(win, resolveTurnTabId(win, payload));
-  try {
-    // AGI 关闭或大脑不再消费消息时明确拒收，由渲染层保留正文并排队发送。
-    if (agent.pushInterjection(key, text, attachments) !== true) {
-      return { ok: false, reason: 'not-accepting' };
-    }
-    broadcastToFloatBars({ kind: 'status', sessionKey: key, text: '插话已接收，将在当前工具或模型请求结束后优先处理' });
-  } catch (err) {
-    diag.log('floatbar', '插话失败', { message: err && err.message });
-    return { ok: false, reason: 'error' };
+  for (const att of attachments) {
+    if (!att || typeof att.path !== 'string' || !fs.existsSync(att.path)) return { ok: false, reason: 'error' };
   }
+  const key = makeSessionKey(win, resolveTurnTabId(win, payload));
+  if (!deliverChatInterjection(key, text, attachments)) return { ok: false, reason: 'not-accepting' };
   return { ok: true, key };
 });

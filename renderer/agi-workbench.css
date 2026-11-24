@@ -1,0 +1,60 @@
+/* 工作台位于当前会话底部，使用主题色并独立于项目标签和输入栏。 */
+.agi-workbench {
+  flex: none;
+  margin: 0 4% 10px;
+  border: 1px solid var(--border);
+  border-inline-start: 3px solid var(--accent);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--text);
+  overflow: hidden;
+  font-size: 12px;
+}
+.agi-workbench-head, .agi-workbench-desktop {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 9px 12px;
+}
+.agi-workbench-head strong { font-size: 14px; }
+.agi-workbench-head span, .agi-workbench-desktop span { color: var(--muted); }
+.agi-workbench-desktop { background: var(--hover); }
+.agi-workbench-desktop[hidden] { display: none; }
+.agi-workbench-desktop strong { overflow-wrap: anywhere; }
+/* 活动卡片与本轮回执共用滚动区域，长回执也能在聊天区底部读完。 */
+.agi-workbench-content {
+  max-height: 24vh;
+  overflow: auto;
+}
+.agi-workbench-grid[hidden] { display: none; }
+.agi-workbench-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
+  gap: 6px;
+  list-style: none;
+  padding: 8px 12px 10px;
+  margin: 0;
+}
+.agi-workbench-card {
+  display: grid;
+  gap: 4px;
+  align-content: start;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 8px;
+}
+.agi-workbench-card-head { display: flex; justify-content: space-between; gap: 6px; }
+.agi-workbench-resource, .agi-workbench-state { color: var(--muted); }
+.agi-workbench-card[data-status="running"] { border-color: var(--accent); }
+.agi-workbench-card[data-status="running"] .agi-workbench-state { color: var(--accent); font-weight: 600; }
+.agi-workbench-goal { overflow-wrap: anywhere; }
+.agi-workbench-results { padding: 8px 12px 10px; }
+.agi-workbench-results h3 { font-size: inherit; margin: 0 0 6px; }
+.agi-workbench-results ul { display: grid; gap: 6px; list-style: none; padding: 0; margin: 0; }
+.agi-workbench-receipt { border-top: 1px solid var(--border); padding: 6px 0 0; }
+.agi-workbench-receipt[data-status="blocked"] .agi-workbench-state { color: var(--danger); }
+.agi-workbench-receipt .agi-workbench-state { white-space: nowrap; }
+.agi-workbench-result { margin: 4px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
