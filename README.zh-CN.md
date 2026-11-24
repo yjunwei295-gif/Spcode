@@ -4,7 +4,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) · [下载 Windows 安装包](https://github.com/yjunwei295-gif/Spcode/releases/latest) · [中文逐步操作手册](docs/user-guide.zh-CN.md) · [Detailed English user guide](docs/user-guide.en.md)
 
-当前版本：**1.0.6，Windows 10/11 x64**。安装包包含应用运行时，普通用户无需安装 Node.js；模型账号、API 额度、本地模型权重需要另行配置。
+当前版本：**1.0.7，Windows 10/11 x64**。安装包包含应用运行时，普通用户无需安装 Node.js；模型账号、API 额度、本地模型权重需要另行配置。
 
 ## 这个软件到底是做什么的？
 
@@ -93,14 +93,14 @@ SimpleCode 把聊天窗口与电脑上的项目目录连接起来。你说清需
 
 1. 打开 [Releases](https://github.com/yjunwei295-gif/Spcode/releases/latest)。
 2. 如果附件折叠，展开 **Assets**。
-3. 下载 **`SimpleCode-Setup-1.0.6.exe`**；“Source code”压缩包是源码，不是安装程序。
+3. 下载 **`SimpleCode-Setup-1.0.7.exe`**；“Source code”压缩包是源码，不是安装程序。
 4. 更新前完整退出旧程序，包括仍在运行的桌宠实例。
 5. 运行安装程序，按向导选择安装位置；更新时使用原安装目录。
 6. 从快捷方式启动 **SimpleCode**。
 7. 右上角可切换 **中文 / EN**。部分新面板仍保留中文，英文手册已注明对应原文。
 8. 配好模型后，再发送项目任务。
 
-安装包约 670 MiB，不包含模型权重；发布附件同时提供免安装的便携版。两种 EXE 的 SHA256 见 [SHA256SUMS.txt](https://github.com/yjunwei295-gif/Spcode/releases/download/v1.0.6/SHA256SUMS.txt)。
+安装包约 680 MiB，不包含模型权重。可用 [SHA256SUMS.txt](https://github.com/yjunwei295-gif/Spcode/releases/download/v1.0.7/SHA256SUMS.txt) 校验安装包。
 
 首次安装的每一步及预期画面见[安装与首次启动](docs/user-guide.zh-CN.md#s2)。
 

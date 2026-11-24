@@ -4,7 +4,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) · [Download Windows installer](https://github.com/yjunwei295-gif/Spcode/releases/latest) · [Detailed English user guide](docs/user-guide.en.md) · [中文逐步操作手册](docs/user-guide.zh-CN.md)
 
-Current release: **1.0.6 · Windows 10/11 x64**. The installer includes the application runtime. You do not need Node.js to use the installer. AI accounts, API credits and local model weights are configured separately.
+Current release: **1.0.7 · Windows 10/11 x64**. The installer includes the application runtime. You do not need Node.js to use the installer. AI accounts, API credits and local model weights are configured separately.
 
 ## What is this application for?
 
@@ -93,14 +93,14 @@ Read the [complete English guide](docs/user-guide.en.md) for each feature's actu
 
 1. Open [Releases](https://github.com/yjunwei295-gif/Spcode/releases/latest).
 2. Expand **Assets** if necessary.
-3. Download **`SimpleCode-Setup-1.0.6.exe`** for the installer. GitHub's “Source code” archives are not installers.
+3. Download **`SimpleCode-Setup-1.0.7.exe`** for the installer. GitHub's “Source code” archives are not installers.
 4. Fully exit an older running instance before installing an update.
 5. Run the installer and select the destination when asked. For an update, use the existing installation directory.
 6. Start **SimpleCode** from the shortcut.
 7. Click **EN** at the upper right for English. Some newer panels still contain Chinese labels; the English guide gives the original labels alongside their meanings.
 8. Configure a model before sending your first project request.
 
-The installer is approximately 670 MiB. Model weights are not included. A portable executable is also available in the release assets. Check both executables against [SHA256SUMS.txt](https://github.com/yjunwei295-gif/Spcode/releases/download/v1.0.6/SHA256SUMS.txt).
+The installer is approximately 680 MiB. Model weights are not included. Verify the installer with [SHA256SUMS.txt](https://github.com/yjunwei295-gif/Spcode/releases/download/v1.0.7/SHA256SUMS.txt).
 
 For every individual click, field and expected result, follow [Installation and first run](docs/user-guide.en.md#s2).
 
