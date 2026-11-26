@@ -36,6 +36,12 @@ function verifyToolCatalog(content, specs) {
   assert.deepEqual(names, Array.from(specs, function name(spec) { return (spec.function || spec).name; }));
 }
 
+/** 仅运行局部模型循环的夹具按真实收件契约提供独立的插话账本。 */
+function testInbox(key) {
+  const { InterjectionTodos } = require('../electron/lib/interjection-todos');
+  return new InterjectionTodos({ current: { interjectionTodos: [] } }, key, noop);
+}
+
 /** 测试不持有真实窗口或模型资源。 */
 function noop() {}
 /** 加载真实 Agent，仅隔离模型传输、桌面观察与用户配置。 */
@@ -70,10 +76,11 @@ function loadAgent(overrides = {}) {
     if (name === './diag') return { log: noop };
     return localRequire(name);
   }
+  // 生产大脑与并发模块共用 Map 构造器，保证已派目标表能通过模块间的类型检查。
   const context = { require: dependency, module: { exports: {} }, __dirname: path.dirname(file),
-    process, console, Buffer, URL, AbortController, AbortSignal, setTimeout, clearTimeout, setInterval, clearInterval };
+    Map, process, console, Buffer, URL, AbortController, AbortSignal, setTimeout, clearTimeout, setInterval, clearInterval };
   const source = fs.readFileSync(file, 'utf8').split('\r\n').join('\n');
-  vm.runInNewContext(source + '\nmodule.exports.test = { runDirectWithInterjections, takeInterjections, activeInterjectKeys, interjectInbox, interjectInFlight, interjectArchives, agentLoop, requirementText, unfinishedTaskTodos, agiContinuationPrompt, stillWorking, promisesMoreInvestigation, abortErr, execTool, recordTaskTodoIds, answerParts, askAnswerIsStart, withholdUnverifiedDelivery, implementationStateKey, runParallelAgi };',
+  vm.runInNewContext(source + '\nmodule.exports.test = { runDirectWithInterjections, takeInterjections, waitForBatchOrInterjection, settleDeferredBatches, activeInterjectKeys, interjectInbox, interjectInFlight, interjectArchives, agentLoop, requirementText, unfinishedTaskTodos, agiContinuationPrompt, stillWorking, promisesMoreInvestigation, abortErr, execTool, recordTaskTodoIds, answerParts, askAnswerIsStart, withholdUnverifiedDelivery, implementationStateKey, runParallelAgi };',
     context, { filename: file });
   const agent = context.module.exports;
   function setAlive(value) { alive = value; }
@@ -101,6 +108,8 @@ function brainHarness(harness, direct, key, directOn = true) {
     interjectInFlight: harness.agent.test.interjectInFlight,
     interjectionTrace: [], directProgressText: '',
     runDirectWithInterjections: harness.agent.test.runDirectWithInterjections,
+    waitForBatchOrInterjection: harness.agent.test.waitForBatchOrInterjection,
+    settleDeferredBatches: harness.agent.test.settleDeferredBatches,
     agentLoop: harness.agent.test.agentLoop,
     unfinishedTaskTodos: harness.agent.test.unfinishedTaskTodos,
     agiContinuationPrompt: harness.agent.test.agiContinuationPrompt,
@@ -131,7 +140,7 @@ function brainHarness(harness, direct, key, directOn = true) {
   vm.runInNewContext(harness.source.substring(start, end) + '\nthis.runBrain = runBrain;', context);
   /** 模拟生产整轮持有的接收登记；仅测大脑时仍由测试外层负责释放。 */
   async function run(list, started, resume = false) {
-    context.activeInterjectKeys.add(key);
+    context.activeInterjectKeys.set(key, testInbox(key));
     context.snap.taskScope = harness.dependency('./agi-task-scope').create(context.userText, context.history, context.turnStart);
     for (const addition of context.turnInterjections) harness.dependency('./agi-task-scope').update(context.snap.taskScope, addition);
     try { return await context.runBrain(list, started, resume); }
@@ -182,7 +191,7 @@ async function testBeforeTool(harness) {
  * @returns {Promise<void>} 核对同批拦截、续接与会话隔离，任何断言失败都会拒绝。
  */
 async function testDuringTool(harness) {
-  harness.agent.test.activeInterjectKeys.add('other');
+  harness.agent.test.activeInterjectKeys.set('other', testInbox('other'));
   harness.agent.pushInterjection('other', '另一个会话的消息');
   let requests = 0;
   /**
@@ -277,7 +286,7 @@ async function testOrdinary(harness) {
       harness.agent.pushInterjection('ordinary', '普通模式请求中补充');
       return { role: 'assistant', content: '原答复' };
     }
-    check(args.messages.some(function included(message) { return message.role === 'user' && message.content === '普通模式请求中补充'; }),
+    check(args.messages.some(function included(message) { return message.role === 'user' && String(message.content).split('\n\n')[0] === '普通模式请求中补充'; }),
       '普通循环的下一次模型请求含完整插话');
     return { role: 'assistant', content: '已收到普通补充' };
   }
@@ -347,7 +356,7 @@ async function testOrdinaryQueuedTools(harness) {
         assert.ok(Buffer.from(part.image_url.url.split(',')[1], 'base64').equals(fs.readFileSync(imagePath)));
       } else {
         assert.match(first.content, /已停止旧工具/);
-        assert.ok(history.some(function delivered(message) { return message.role === 'user' && message.content === addition; }));
+        assert.ok(history.some(function delivered(message) { return message.role === 'user' && String(message.content).split('\n\n')[0] === addition; }));
       }
       continued = true;
       return { role: 'assistant', content: '已按补充核对。' };
@@ -413,7 +422,7 @@ async function testCodexVisionAttachment() {
   harness.setComplete(complete);
   const brain = brainHarness(harness, null, key, false);
   brain.context.modelCfg = { protocol: 'openai', model: 'fixture', vision: false };
-  harness.agent.test.activeInterjectKeys.add(key);
+  harness.agent.test.activeInterjectKeys.set(key, testInbox(key));
   assert.ok(harness.agent.pushInterjection(key, '补充截图', [{ path: imagePath, name: '截图.png' }]));
   const answer = await brain.run(messages(), false);
   check(answer === '已读截图。' && forwarded === 1, '文本大脑的截图插话按配置发给 Codex 视觉槽，由原图返回真实识别回执');
@@ -862,7 +871,7 @@ async function testCodexBridge(harness) {
   }
   session.thread = { runStreamed };
   codex.test.sessions.set(key, session);
-  harness.agent.test.activeInterjectKeys.add(key);
+  harness.agent.test.activeInterjectKeys.set(key, testInbox(key));
   /**
    * 模拟工具执行时把插话正文和原图路径加入当前会话的收件箱。
    * 此夹具只处理固定的读取调用，无需工具参数。
@@ -903,6 +912,7 @@ async function testCodexInterjectionHandoff(harness, phase) {
   const delivered = [];
   const prompts = [];
   const reads = [];
+  let sendingIds = [];
 
   /** 经真实 HTTP MCP 读取当前请求的工具回包。 */
   async function call(label) {
@@ -944,6 +954,7 @@ async function testCodexInterjectionHandoff(harness, phase) {
       await require('node:timers/promises').setTimeout(1000, undefined, { signal });
       assert.fail('插话后旧 Codex 流仍在等待，宿主未主动交接');
     }
+    check(sendingIds.length === (bulk ? burst.length : 1), 'SDK 等待首个模型回执时已按本批编号显示处理中');
     const result = await call('插话后的读取');
     check(result === '插话后的读取的真实结果', '续接请求能通过真实 MCP 调用工具：' + result);
     if (bulk) {
@@ -984,6 +995,7 @@ async function testCodexInterjectionHandoff(harness, phase) {
    * @returns {void} 记录原文，第二波走同一条真实收件入口。
    */
   function onEvent(event) {
+    if (event.processingInterjectionIds) sendingIds = event.processingInterjectionIds;
     if (!bulk || event.type !== 'interjection') return;
     delivered.push(...event.texts);
     if (delivered.length === 12) queueMicrotask(submitRemaining);
@@ -995,7 +1007,7 @@ async function testCodexInterjectionHandoff(harness, phase) {
 
   session.thread = { runStreamed };
   codex.test.sessions.set(key, session);
-  harness.agent.test.activeInterjectKeys.add(key);
+  harness.agent.test.activeInterjectKeys.set(key, testInbox(key));
   try {
     const result = await harness.agent.test.runDirectWithInterjections(codex, {
       key, sig: 'fixture', modelCfg: { apiKey: 'test-no-network', vision: bulk }, tools: [{ name: 'read_file', parameters: { type: 'object' } }],
@@ -1044,7 +1056,7 @@ async function testRoutes(harness) {
   };
   vm.runInNewContext(source.substring(deliveryStart, floatEnd + 3) + '\n' + source.substring(ipcStart), context);
   const key = 'route:tab';
-  harness.agent.test.activeInterjectKeys.add(key);
+  harness.agent.test.activeInterjectKeys.set(key, testInbox(key));
   try {
     const reply = await handlers.get('chat:interject')({}, { tabId: 'tab', text: '主窗需求' });
     context.handleFloatBarSend({ key, text: '小窗需求' });
@@ -1420,17 +1432,26 @@ async function testDeferredParallel() {
     if (parentRequests === 1) {
       sessionKey = args.key;
       sessionSig = args.sig;
-      assert.match(await args.runTool('run_agi_parallel', { tasks }), /仍在运行/);
-      assert.equal(children.length, 2);
-      assert.match(await args.runTool('run_agi_parallel', { tasks }), /请等正在执行/);
-      released.resolve();
+      try {
+        assert.match(await args.runTool('run_agi_parallel', { tasks }), /仍在运行/);
+        assert.equal(children.length, 2);
+        const repeated = await args.runTool('run_agi_parallel', { tasks });
+        assert.ok(repeated.includes(firstGoal) && repeated.includes('仍在执行'), repeated);
+        assert.equal(children.length, 2, '运行中的原目标不能创建第三个分支');
+      } finally {
+        // 宿主在退出请求前等待分支。先释放本例分支，断言失败才能报告原始错误。
+        released.resolve();
+      }
       return { content: '提前汇报，不应被当作最终结果' };
     }
     assert.equal(parentRequests, 2);
     assert.equal(args.key, sessionKey);
     assert.equal(args.sig, sessionSig);
     assert.match(args.turnText, /【子代理实际结果】[\s\S]*package\.json[\s\S]*renderer\/index\.html/);
-    assert.match(await args.runTool('run_agi_parallel', { tasks }), /只能启动一批/);
+    // 无新增要求时重复提交原目标，子会话数和已读取的原回执必须保持一致。
+    await args.runTool('run_agi_parallel', { tasks });
+    assert.equal(children.length, 2);
+    for (const goal of [firstGoal, secondGoal]) assert.equal(brain.context.snap.parallelResults.get(goal).status, 'completed');
     return { content: '两项读取已核对。' };
   }
 
@@ -1453,9 +1474,198 @@ async function testDeferredParallel() {
   }
 }
 
+/**
+ * 验证首批交回后，真实插话增加的独立交付能单独交给新的子代理。
+ * @returns {Promise<void>} 核对用户原话、三个独立会话及真实读盘回执；重复派发或丢失任一结果都会失败。
+ */
+async function testParallelAddition() {
+  const key = 'parallel-new-deliverable';
+  const goals = ['读取软件包定义', '读取渲染页面结构', '读取并发模块源码'];
+  const files = ['package.json', 'renderer/index.html', 'electron/lib/agi-parallel.js'];
+  const order = goals.slice(0, 2).join('，同时') + '，随后逐项汇总。';
+  const branchKeys = new Set();
+  const reads = [];
+  let rounds = 0;
+
+  /** 将用户原话 goal 原样交给项目资源队列。 */
+  function project(goal) { return { goal, resource: 'project' }; }
+  /**
+   * 在 args 所指的真实分支里读盘并提交对应目标的证据。
+   * @returns {Promise<object>} 分支的传输结束消息，真实交付取自 finish_agi_task。
+   */
+  async function child(args) {
+    const index = goals.findIndex(function requested(goal) { return args.turnText.startsWith('【当前并发目标】' + goal + '\n'); });
+    assert.ok(index >= 0, args.turnText);
+    branchKeys.add(args.key);
+    const receipt = await args.runTool('read_file', { path: files[index], startLine: 1, endLine: 3 });
+    assert.match(receipt, /【文件】/);
+    reads.push(files[index]);
+    assert.equal(await args.runTool('finish_agi_task', { status: 'completed', result: files[index] }), '本项结果已登记。');
+    return { content: '本项目标已提交。' };
+  }
+  /**
+   * 从主会话 args 派发首批，在汇总时插入新目标，然后提交单项追加。
+   * @returns {Promise<object>} 完整回执核对完毕后返回主会话答复。
+   */
+  async function parent(args) {
+    rounds++;
+    if (rounds === 1) {
+      const initial = JSON.parse(await args.runTool('run_agi_parallel', { tasks: goals.slice(0, 2).map(project) }));
+      assert.deepEqual(initial.map(function receipt(row) { return row.result; }), files.slice(0, 2));
+      assert.ok(harness.agent.pushInterjection(key, '另外，' + goals[2] + '。'));
+      return { content: '首批证据已收到。' };
+    }
+    assert.equal(rounds, 2);
+    assert.ok(args.turnText.includes(goals[2]));
+    const result = await args.runTool('run_agi_parallel', { tasks: [project(goals[2])] });
+    assert.ok(result.startsWith('['), result);
+    const additions = JSON.parse(result);
+    assert.ok(additions.some(function completed(row) { return row.goal === goals[2] && row.status === 'completed' && row.result === files[2]; }));
+    return { content: '三项目标已逐项核对。' };
+  }
+  const harness = loadAgent({ './codex-direct': { runTurn: child, closeSession: noop } });
+  const brain = brainHarness(harness, { runTurn: parent }, key);
+  brain.context.workspace = root;
+  brain.context.userText = order;
+  brain.context.toolsFor = harness.agent.toolsSpec;
+  const answer = await brain.run([{ role: 'user', content: order }], false);
+  assert.equal(answer, '三项目标已逐项核对。');
+  assert.equal(branchKeys.size, 3);
+  assert.deepEqual(reads.sort(), files.slice().sort());
+  for (const goal of goals) assert.equal(brain.context.snap.parallelResults.get(goal).status, 'completed');
+  check(true, '首批后收到独立插话，只增派一个子代理，三个目标各有一次真实读盘和完成回执');
+}
+
+/**
+ * 验证普通模型把多条独立插话并发派给子会话，执行中随后到达的新目标可立即加入。
+ * @returns {Promise<void>} 使用生产模型循环，核对三个分支的启动重叠、真实读取和按批次归还的结果。
+ */
+async function testParallelBeforeFirstBatch() {
+  const original = '读取软件包名称';
+  const related = '同一个软件包再核对版本号';
+  const independent = '读取渲染页面定义';
+  const late = '读取插话账本源码';
+  const key = 'parallel-before-first';
+  const children = new Set();
+  const entries = new Set();
+  const bothStarted = deferred();
+  let injected = false;
+  let appended = false;
+  let joined = false;
+  /** 以 API 传输格式返回 name 和 args，交由生产工具入口执行。 */
+  function call(name, args) {
+    return { role: 'assistant', content: '', tool_calls: [{ id: name, type: 'function', function: { name, arguments: JSON.stringify(args) } }] };
+  }
+  /**
+   * 响应真实模型请求 args。首个大脑请求中送达插话，两个子会话会合后各读取一次目标文件。
+   * @returns {Promise<object>} 返回下一项实际工具调用或记录完整结果的答复。
+   */
+  async function complete(args) {
+    const goal = args.messages.find(function branch(message) { return String(message.content).startsWith('【当前并发目标】'); });
+    const receipt = args.messages.findLast(function response(message) { return message.role === 'tool'; });
+    if (!goal) {
+      if (!injected) {
+        injected = true;
+        assert.ok(harness.agent.pushInterjection(key, related));
+        assert.ok(harness.agent.pushInterjection(key, independent));
+        assert.ok(harness.agent.pushInterjection(key, '继续'));
+        return { role: 'assistant', content: '原请求结束。' };
+      }
+      if (!receipt) {
+        const texts = args.messages.map(function content(m) { return String(m.content); });
+        for (const text of [related, independent, '各交给一个子代理同时处理']) assert.ok(texts.some(function contains(line) { return line.includes(text); }), text);
+        return call('run_agi_parallel', { tasks: [{ goal: original, resource: 'project' }, { goal: independent, resource: 'project' }] });
+      }
+      if (!appended) {
+        assert.match(receipt.content, /仍在运行/);
+        assert.ok(args.messages.some(function newGoal(row) { return String(row.content).includes(late); }));
+        appended = true;
+        return call('run_agi_parallel', { tasks: [{ goal: late, resource: 'project' }] });
+      }
+      const old = args.messages.find(function results(row) { return String(row.content).startsWith('【子代理实际结果】'); });
+      assert.ok(old && old.content.includes('包名和版本均已读取') && old.content.includes('页面定义已读取'));
+      assert.equal(JSON.parse(receipt.content)[0].result, '账本源码已读取');
+      const ledger = harness.agent.test.activeInterjectKeys.get(key);
+      const items = ledger.memory.current.interjectionTodos;
+      for (const item of items.filter(function separate(i) { return i.text === independent || i.text === late; })) {
+        assert.equal(item.status, 'completed', '子代理独立交付后，原插话须在主会话结束前办结');
+        assert.equal(item.result, item.text === independent ? '页面定义已读取' : '账本源码已读取');
+      }
+      assert.equal(items.find(function relatedItem(i) { return i.text === related; }).status, 'pending');
+      return { role: 'assistant', content: '三个分支的实际结果均已核对。' };
+    }
+    const isPackage = goal.content.startsWith('【当前并发目标】' + original + '\n');
+    const isLate = goal.content.startsWith('【当前并发目标】' + late + '\n');
+    let file = 'renderer/index.html';
+    if (isPackage) file = 'package.json';
+    if (isLate) file = 'electron/lib/interjection-todos.js';
+    if (!receipt) {
+      if (isPackage) assert.ok(goal.content.includes(related), '补充约束需要送入负责原交付的分支');
+      assert.ok(!entries.has(file), '同一目标只启动一次');
+      entries.add(file);
+      // 两个原分支等待第三个分支入场，任何串行等待都会触发下方的超时断言。
+      if (entries.size === 2) assert.ok(harness.agent.pushInterjection(key, late));
+      if (isLate) {
+        joined = entries.size === 3 && children.size === 0;
+        bothStarted.resolve();
+      }
+      await bothStarted.promise;
+      return call('read_file', { path: file, startLine: 1, endLine: 12 });
+    }
+    if (receipt.tool_call_id === 'finish_agi_task') return { role: 'assistant', content: '本项已提交。' };
+    assert.match(receipt.content, /【文件】/);
+    if (isPackage) {
+      assert.match(receipt.content, /"name"/);
+      assert.match(receipt.content, /"version"/);
+    }
+    children.add(file);
+    let result = '页面定义已读取';
+    if (isPackage) result = '包名和版本均已读取';
+    if (isLate) result = '账本源码已读取';
+    return call('finish_agi_task', { status: 'completed', result });
+  }
+  const harness = loadAgent();
+  harness.setComplete(complete);
+  const brain = brainHarness(harness, null, key, false);
+  brain.context.modelCfg = { protocol: 'openai', model: 'fixture', baseUrl: 'http://unused' };
+  brain.context.workspace = root;
+  brain.context.userText = original;
+  const timeout = setTimeout(function releaseForFailure() { bothStarted.resolve(); }, 10000);
+  try {
+    const answer = await brain.run([{ role: 'user', content: original }], false);
+    assert.equal(answer, '三个分支的实际结果均已核对。');
+    check(joined && children.size === 3, '三项独立工作在任一子代理交付前均已启动，各取一次真实回执；相关补充及继续没有额外分支');
+    const overlap = brain.events.find(function simultaneous(event) {
+      return event.type === 'agi_parallel' && event.tasks.filter(function active(task) { return task.status === 'running'; }).length === 3;
+    });
+    assert.ok(overlap, '工作台应收到三个同时运行的真实分支');
+    const linked = overlap.tasks.filter(function interjected(task) { return task.interjectionIds?.length; });
+    assert.deepEqual(Array.from(linked, function goal(task) { return task.goal; }), [independent, late]);
+    check(linked[0].interjectionIds[0] !== linked[1].interjectionIds[0], '运行中的子代理按原话关联到两条不同的插话卡片');
+  } finally {
+    clearTimeout(timeout);
+    bothStarted.resolve();
+  }
+}
+
 /** 核对桌面独占、未验证结果、中断后排队动作及用户原文范围。 */
 async function testParallelBoundaries() {
   const parallel = require('../electron/lib/agi-parallel');
+  // 同一文件中的额外要求不能由局部目标办结；相同原话在派单之后又送达，也有自己的编号。
+  const inbox = testInbox('partial-delivery');
+  const goal = '修改账款合计';
+  const one = inbox.receive(goal);
+  const compound = inbox.receive(goal + '，并导出月报');
+  inbox.markSeen([one, compound]);
+  const dispatchedIds = inbox.idsForGoal(goal);
+  const lateCopy = inbox.receive(goal);
+  inbox.markSeen([lateCopy]);
+  inbox.deliverBranch(goal, dispatchedIds, '新合计已交付');
+  inbox.deliverBranch(goal, dispatchedIds, '重复终态');
+  const saved = inbox.memory.current.interjectionTodos;
+  assert.equal(saved[0].result, '新合计已交付');
+  assert.deepEqual(saved.map(function state(item) { return item.status; }), ['completed', 'pending', 'pending']);
+  check(true, '独立分支仅办结派单时覆盖的完整插话，保留局部要求与稍后重复到达的卡片');
   const goals = ['打开网页甲', '打开网页乙', '验证游戏'];
   const tasks = parallel.tasksFrom({ tasks: [
     { goal: goals[0], resource: 'desktop' }, { goal: goals[1], resource: 'desktop' },
@@ -1599,6 +1809,8 @@ function finishHarness(harness, direct, key) {
   context.interjectInbox = harness.agent.test.interjectInbox;
   context.interjectArchives = harness.agent.test.interjectArchives;
   context.trainingArchive = { current: function current() { return null; } };
+  // 默认夹具中的功能要求都需交付，只有纯告知用例会返回实际知悉编号。
+  context.reviewWithoutTools = async function noNotices() { return 'NONE'; };
   context.snapshot = { captureAfter: noop };
   context.vs = {};
   context.history = [];
@@ -1612,7 +1824,8 @@ function finishHarness(harness, direct, key) {
   context.planLock = null;
   context.turnId = 'finish-fixture';
   context.snap.current = { id: 'finish-fixture', manifest: { changes: [{ path: 'fixture.js', action: 'write' }] } };
-  context.compact = { isContextOverflowError: function overflow() { return false; } };
+  context.workingMemory = context.workingMemoryRef.current;
+  context.compact = harness.dependency('./context-compact');
   context.diag = { log: noop };
   context.requirementText = harness.agent.test.requirementText;
   // 真实审美入口用当前交付指纹筛选录屏回执，沿用生产函数。
@@ -1638,6 +1851,7 @@ function finishHarness(harness, direct, key) {
   };
   vm.runInNewContext(source.substring(trackStart, trackEnd) +
     '\nasync function finish() {\n' + source.substring(lifeStart, lifeEnd) +
+    '\nglobalThis.workingMemoryRef = workingMemoryRef; snap.interjectionTodos = interjectionTodos;\n' +
     '\ntry {\n' + source.substring(enableStart, enableEnd) +
     source.substring(goalStart, goalEnd) + source.substring(finishStart, finishEnd) + '\nreturn result;\n' +
     source.substring(cleanupStart, cleanupEnd) + '\nthis.finish = finish;', context);
@@ -1750,7 +1964,7 @@ async function testFinishInterjections(harness) {
       check(args.userText.includes('新增核对条件'), stage + '最终审美使用最新插话目标');
       return { passed: true, report: 'current-aesthetic' };
     };
-    harness.agent.test.activeInterjectKeys.add('finish-other');
+    harness.agent.test.activeInterjectKeys.set('finish-other', testInbox('finish-other'));
     check(harness.agent.pushInterjection('finish-other', '其它会话的补充'), stage + '另一会话保持独立收件箱');
     const running = finish.run();
     await entered.promise;
@@ -1986,7 +2200,7 @@ async function testOrdinaryFinishInterjection(harness) {
 /**
  * 验证普通模型续接失败时，旧工具进度不会盖掉插话失败回执。
  * @param {object} harness 提供真实普通模型循环和轮次收尾。
- * @returns {Promise<void>} 核对第二次请求包含所有插话，失败时返回整批计数且没有完成事件。
+ * @returns {Promise<void>} 核对回退请求等待时已显示逐条进度，失败时返回整批未确认计数且没有完成事件。
  */
 async function testOrdinaryFailedReceipt(harness) {
   const key = 'ordinary-resume-error';
@@ -1994,7 +2208,7 @@ async function testOrdinaryFailedReceipt(harness) {
   let calls = 0;
 
   /**
-   * 生成首轮工具调用以留下实际工具结果，再拒绝包含积压插话的请求。
+   * 保留首轮工具结果，模拟流式协议被拒，待非流式请求显示进度后使其失败。
    * @param {object} args 普通模型收到的请求与对话历史。
    * @returns {Promise<object>} 首轮返回工具调用，含插话的请求拒绝。
    */
@@ -2010,6 +2224,19 @@ async function testOrdinaryFailedReceipt(harness) {
     }
     assert.equal(args.messages.filter(toolResult).length, 1, '首轮工具回包仍在对话历史中');
     assert.equal(args.messages.filter(interjection).length, 20, '续接请求携带整批插话');
+    if (args.stream) throw Object.assign(new Error('stream not supported'), { status: 400 });
+    // 让传输入口发出进度，检查时模型尚未返回正文、推理或工具调用。
+    await Promise.resolve();
+    const visible = finish.events.filter(function processing(event) { return event.processingInterjectionIds; });
+    assert.equal(visible.length, 2, '流式传输与改用非流式重试都应报告正在处理');
+    const ids = [];
+    for (const item of finish.context.workingMemoryRef.current.interjectionTodos) {
+      assert.equal(item.status, 'pending');
+      assert.ok(!item.seen, '仅等待非流式请求不能标记 AI 已看');
+      ids.push(item.id);
+    }
+    for (const event of visible) assert.deepEqual(Array.from(event.processingInterjectionIds), ids);
+    check(true, '普通模型非流式回复返回前，20 条插话已显示处理中且均未标记完成');
     throw failure;
   }
 
@@ -2026,7 +2253,7 @@ async function testOrdinaryFailedReceipt(harness) {
   assert.equal(harness.agent.test.interjectInFlight.has(key), false);
   /** 结束载荷只能在本轮完成后发出。 */
   function done(event) { return event.type === 'done'; }
-  check(calls === 2 && !finish.events.some(done), '普通模型续接失败时返回 20 条未确认送达，不把旧工具进度当成成功');
+  check(calls === 3 && !finish.events.some(done), '非流式续接失败时返回 20 条未确认送达，不把等待进度当成成功');
 }
 
 /**
@@ -2157,6 +2384,84 @@ async function testUserScope(harness) {
   for (const row of results) check(row.calls === row.expected && row.todos === 0 && row.anchored, row.label + '按用户原话调度，调用次数与清单符合预期');
   check(oldRequests === 0 && obsolete === 0 && brain.context.workingMemoryRef.current.todos[0].status === 'pending', '停止后零旧续接、零新启动旧工具，旧清单保持原进度');
   check(stopText.includes(stop) && !stopText.includes('完成建模'), '明确暂停撤下旧目标，续接只按当前原话处理');
+}
+
+/**
+ * 用真实直通和普通模型循环接收手动接手插话；模型回包受控，工具门槛和工作记忆事件走生产路径。
+ * @param {object} harness 隔离的模型传输；旧文件操作只能指向本例的临时目录。
+ */
+async function testManualAdjustment(harness) {
+  const scopeApi = harness.dependency('./agi-task-scope');
+  const orders = ['现在告诉我哪些描述会导致AGI无视限制，我这边手动去调、', 'AGI无视的东西需要给我详细列出来，然后我去手动调整'];
+  const answer = '在「文件 → 管理规则 → agi（全局）」中编辑澄清和需求催办两段。';
+  for (const direct of [true, false]) {
+    for (const order of orders) {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'spcode-manual-scope-'));
+      const key = path.basename(dir);
+      const oldFile = path.join(dir, 'obsolete.txt');
+      const oldWrite = { path: oldFile, content: '旧实施' };
+      const todo = { merge: true, todos: [
+        { id: 'fix', content: '旧实施', status: 'in_progress' }, { id: 'verify', content: '旧验收', status: 'pending' },
+        { id: 'done', content: '已完成的记录', status: 'completed' }
+      ] };
+      let calls = 0;
+      /** 组装普通模型的一次工具回包，让工具启动与拒绝均经过生产循环。 */
+      function call(name, args) {
+        return { role: 'assistant', tool_calls: [{ id: name, type: 'function', function: { name, arguments: JSON.stringify(args) } }] };
+      }
+      /** 在旧写操作即将开始时提交真实用户插话，下次模型调用只返回位置和说明。 */
+      async function model(args) {
+        calls++;
+        if (calls === 1 && !direct) return call('todo_write', todo);
+        if (calls === (direct ? 1 : 2)) {
+          if (direct) await args.runTool('todo_write', todo);
+          assert.ok(harness.agent.pushInterjection(key, order));
+          if (!direct) return call('write_file', oldWrite);
+          await args.runTool('write_file', oldWrite);
+          return { content: '正在准备旧实施。' };
+        }
+        assert.equal(calls, direct ? 2 : 3, '说明交付后不能再续跑旧实施');
+        const latest = direct ? args.turnText : args.messages[args.messages.length - 1].content;
+        assert.ok(latest.includes(order));
+        if (direct) await args.runTool('write_file', oldWrite);
+        return { role: 'assistant', content: answer };
+      }
+      const brain = brainHarness(harness, { runTurn: model }, key, direct);
+      brain.context.userText = '请修改当前规则并验证';
+      brain.context.workspace = dir;
+      brain.context.workingMemoryRef.current.todos = [{ id: 'history', content: '其他任务', status: 'pending' }];
+      if (direct) useProductionTodoTools(harness, brain);
+      else {
+        brain.context.modelCfg = { protocol: 'openai', model: 'fixture', baseUrl: 'http://unused' };
+        harness.setComplete(model);
+      }
+      try {
+        const reply = await brain.run([{ role: 'user', content: brain.context.userText }], false);
+        const scope = brain.context.snap.taskScope;
+        assert.equal(reply, answer);
+        assert.equal(scope.limit, 'reply');
+        assert.ok(!scope.active && !scope.implementation && scope.todos.size === 0);
+        const updates = brain.events.filter(function memory(ev) { return ev.type === 'working_memory'; });
+        const finalTodos = updates[updates.length - 1].workingMemory.todos;
+        assert.deepEqual(Array.from(finalTodos, function id(t) { return t.id; }), ['history', 'done']);
+        assert.equal(brain.context.workingMemoryRef.current.todos, finalTodos);
+        assert.ok(!fs.existsSync(oldFile));
+        check(true, (direct ? '直通' : '普通循环') + '只交付说明，旧文件未写，已撤两项旧待办：' + order);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  }
+  // 明确交给助手的实施、条件、历史叙述及引文均不触发接手。
+  for (const text of ['AGI模式的规则你单独分离出来吧，我手动去调整', '告诉我位置并修改配置，我手动调整',
+    '如果我手动调整', '我昨天手动调整了', '我手动调整吗？', '示例是「我自己来调」']) {
+    assert.equal(scopeApi.replyOnlyRequest(text), false, text);
+  }
+  const scope = scopeApi.create('请修改规则', [], false);
+  scopeApi.update(scope, '我自己来调');
+  assert.equal(scope.limit, 'reply');
+  scopeApi.update(scope, '请你修改配置');
+  assert.ok(scope.active && scope.implementation && !scope.limit);
 }
 
 /**
@@ -2309,7 +2614,7 @@ async function testOrdinaryScope(harness) {
           return { id, type: 'function', function: { name: 'read_file', arguments: JSON.stringify({ path: id }) } };
         }) };
       }
-      assert.ok(args.messages.some(function delivered(msg) { return msg.content === '先停下来吧，先给我一个方案'; }));
+      assert.ok(args.messages.some(function delivered(msg) { return msg.role === 'user' && String(msg.content).split('\n\n')[0] === '先停下来吧，先给我一个方案'; }));
       return { role: 'assistant', content: '方案如下。' };
     }
     harness.setComplete(model);
@@ -2554,133 +2859,85 @@ async function testWorkCycle(harness) {
 }
 
 /**
- * 核对五个随包技能的预览、模型文件读取和搜索结果。
- * probes 是逐段审阅后选定的普通流程原文；逐块定位可发现漏标或错标，公共原文用于排除整份技能被隐藏。
- * @param {object} harness 独立 Electron 测试进程中的真实模型工具入口。
- * @param {string} appRoot 当前源码或发布包随附技能的根目录。
- * @param {Array} skills 由应用实际列出的技能，增删时须重新审核范围。
- * @param {boolean} agi 当前要测的模式，只切换本测试进程的预览状态。
+ * 核对当前模式实际读取的简介、正文、行读、搜索以及内部模块提示。
+ * 使用独立的技能目录与用户可自由编辑的内容，保留普通版旧标记的兼容覆盖。
  */
-async function testSkillChannels(harness, appRoot, skills, agi) {
-  const common = {
-    'code-review': '只报告问题，不要改文件',
-    'explain-code': '用短段落说明这段代码做什么',
-    implement: '只改与需求相关的部分',
-    'vision-bridge': '识别结果以文字注入对话',
-    zabingsk: '核对这些上游调用方是否兼容'
-  };
-  const probes = [
-    '先复述再动手、K 方案、', '大脑与实现端的交接流程', '方案取舍与分歧结论只由用户拍板',
-    '方案取舍仍由用户拍板，见 B 裁决权', '缺口径、缺验收、多种改法等价时',
-    '改代码前复述需求并等确认', '大脑', '开工前必做：派单写', '改盘权/裁决权/', '与 B 联动',
-    '原因是空指针。在调用前加空值判断即可。', '先复述，再动手（只约束大脑）', '（开工前必做）',
-    '本条只管派单里必须带链路证据', '派单前必须查完调用链', '实现端', '不兼容就停手报告大脑，不许硬改',
-    '大脑未经本轮「开始」就派工改了仓库文件'
-  ];
-  // 角色称呼也可能出现在系统模板或更早的段落，用完整短语定位受测技能行。
-  const rolePhrases = {
-    '大脑': '开发完一个功能之后大脑需要做一个汇报',
-    '实现端': '实现端改任一方法前'
-  };
-  assert.deepEqual(Array.from(skills, function id(skill) { return skill.id; }).sort(), Object.keys(common).sort());
+async function testSkillChannels(harness, appRoot, agi) {
+  const skills = harness.agent.listSkills(appRoot, '', []);
+  const selected = skills.find(function named(skill) { return skill.id === 'sample'; });
   const preview = require(path.join(root, 'electron/lib/prompt-preview'));
-  const hand = require(path.join(root, 'electron/lib/desktop-hand'));
-  const previous = hand.isAlive();
-  hand.setAlive(agi);
-  try {
-    for (const skill of skills) {
-      const hidden = skill.id === 'zabingsk' ? probes : [];
-      const open = '<!--normal-only-->';
-      const close = '<!--/normal-only-->';
-      const chunks = skill.body.split(open);
-      assert.equal(chunks.length - 1, hidden.length, skill.id);
-      assert.equal(skill.body.split(close).length - 1, hidden.length, skill.id);
-      let expectedPreview = chunks[0];
-      let expectedFile = chunks[0];
-      for (let i = 0; i < hidden.length; i++) {
-        const parts = chunks[i + 1].split(close);
-        assert.equal(parts.length, 2);
-        assert.ok(parts[0].includes(hidden[i]), hidden[i] + ' 缺少对应标记');
-        expectedPreview += (agi ? '' : parts[0]) + parts[1];
-        expectedFile += (agi ? parts[0].replace(/[^\r\n]/g, '') : open + parts[0] + close) + parts[1];
-      }
-      const view = preview.build({ appRoot, workspace: '', modelCfg: { protocol: 'codex', model: 'fixture' },
-        skillIds: [skill.id], history: [], userText: '核对当前技能' });
-      assert.equal(view.editable.skill.body, expectedPreview, skill.id + ' 预览正文');
-      const surfaces = [view.system, view.modules.code, view.modules.planning, view.modules.summary];
-      const extra = [path.dirname(path.dirname(skill.file))];
-      async function invoke(name, args) {
-        return harness.agent.test.execTool(appRoot, {}, name, { path: skill.file, ...args }, noop, extra);
-      }
-      const file = await invoke('read_file', {});
-      const payload = file.substring(file.indexOf('\n') + 1).replace(/\r\n/g, '\n');
-      assert.equal(payload.trimEnd(), expectedFile.replace(/\r\n/g, '\n').trimEnd(), skill.id + ' 整读');
-      const sourceLines = skill.body.split(/\r?\n/);
-      for (const needle of hidden.concat(common[skill.id])) {
-        const shared = needle === common[skill.id];
-        const visible = shared || !agi;
-        const phrase = rolePhrases[needle] || needle;
-        const line = sourceLines.findIndex(function contains(s) {
-          return s.split(open).join('').split(close).join('').includes(phrase);
-        }) + 1;
-        assert.ok(line > 0, needle);
-        const span = await invoke('read_file', { startLine: line, endLine: line });
-        const hit = await invoke('search_text', { query: needle });
-        for (const surface of surfaces) {
-          assert.equal(surface.includes(phrase), visible, skill.id + ' 预览 ' + phrase);
-          // AGI 去掉称呼后，同一行的汇报或修改前核对要求仍须完整出现。
-          if (agi && rolePhrases[needle]) assert.ok(surface.includes(phrase.replace(needle, '')), phrase);
-        }
-        assert.equal(file.includes(needle), visible, skill.id + ' 整读 ' + needle);
-        assert.equal(span.includes(needle), visible, skill.id + ' 行读 ' + needle);
-        assert.equal(hit.includes(needle), visible, skill.id + ' 搜索 ' + hit);
-        if (!visible) assert.match(hit, /无匹配/);
-        console.log('SKILL ' + JSON.stringify({ agi, skill: skill.id, line, needle, visible, channels: ['preview', 'full', 'line', 'search'] }));
-      }
-      check(true, skill.id + ' 全部 ' + hidden.length + ' 段普通流程及共用内容在四个入口均符合 AGI=' + agi);
-    }
-  } finally {
-    hand.setAlive(previous);
+  const view = preview.build({ appRoot, workspace: '', modelCfg: { protocol: 'codex', model: 'fixture' },
+    skillIds: ['sample', 'empty'], history: [], userText: '核对当前技能' });
+  const shown = agi ? 'AGI正文甲' : '普通正文乙';
+  const hidden = agi ? '普通正文乙' : 'AGI正文甲';
+  const summary = agi ? 'AGI独立简介' : '普通独立简介';
+  assert.equal(view.editable.skill.name, 'sample');
+  assert.ok(view.system.includes(summary));
+  for (const surface of [view.system, view.editable.skill.body, view.modules.code, view.modules.planning, view.modules.summary]) {
+    assert.ok(surface.includes(shown) && !surface.includes(hidden) && !surface.includes('<!--normal-only-->'));
   }
+  for (const locale of ['zh', 'en']) {
+    const lang = harness.dependency('./reply-lang').fromLocale(locale);
+    const system = harness.agent.buildSystemPrompt({ skill: selected, allSkills: skills, lang, userOrder: '核对当前技能' });
+    assert.ok(system.includes(shown) && system.includes(summary) && !system.includes(hidden));
+  }
+  // 用户已有的普通版引用在 AGI 下也必须解析到独立正文，不能读回旧的普通约束。
+  const extra = [path.join(appRoot, 'skills')];
+  const invoke = harness.agent.test.execTool;
+  for (const file of new Set([selected.file, agi ? selected.agiFile : selected.file])) {
+    const all = await invoke(appRoot, {}, 'read_file', { path: file }, noop, extra);
+    const line = await invoke(appRoot, {}, 'read_file', { path: file, startLine: 4, endLine: 4 }, noop, extra);
+    const found = await invoke(appRoot, {}, 'search_text', { path: file, query: shown }, noop, extra);
+    const missing = await invoke(appRoot, {}, 'search_text', { path: file, query: hidden }, noop, extra);
+    assert.ok(all.includes(shown) && !all.includes(hidden));
+    assert.ok(line.includes(shown) && found.includes(shown) && missing.includes('无匹配'));
+  }
+  check(true, '技能独立简介、正文、多技能、预览、模块、整读、行读与搜索 AGI=' + agi);
 }
 
 /**
- * 用当前包的真实技能核对两种模式的中英文模型上下文，以及 AGI 从文件重读时的行范围。
- * @param {object} harness 只替换厂商传输及桌面开关，工具与提示词均走生产入口。
+ * 在隔离目录保存两份带不同 YAML 简介的手写正文，切换真实模式并核对持久化结果。
+ * 只操作测试数据，涵盖 AGI 未配置、单独新建、清空重开及再次编辑普通版。
  */
 async function testSkillVisibility(harness) {
-  const appRoot = process.argv[2] ? path.resolve(root, '../app-root') : root;
-  const skills = harness.agent.listSkills(appRoot, '', []);
-  const selected = skills.find(function named(skill) { return skill.id === 'zabingsk'; });
-  const technical = '先看清调用链';
-  const ordinary = '大脑与实现端的交接流程';
-  const headerRule = '先复述再动手';
-  const modulePrompt = harness.dependency('./module-prompts').buildModulePrompt;
-  for (const agi of [false, true]) {
-    harness.setAlive(agi);
-    await testSkillChannels(harness, appRoot, skills, agi);
-    for (const locale of ['zh', 'en']) {
-      const lang = harness.dependency('./reply-lang').fromLocale(locale);
-      const system = harness.agent.buildSystemPrompt({ skill: selected, allSkills: skills, lang, userOrder: '我已经让你直接改了' });
-      check(system.includes(technical) && system.includes(ordinary) === !agi &&
-        system.includes(headerRule) === !agi && system.includes('[开工选项]') === !agi && !system.includes('<!--normal-only-->'),
-        locale + ' 大脑技能正文、目录简介、开工选项按 AGI=' + agi + ' 展开');
+  const appRoot = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'spcode-skill-versions-'));
+  const lib = require(path.join(root, 'electron/lib/skills'));
+  const hand = require(path.join(root, 'electron/lib/desktop-hand'));
+  const previous = hand.isAlive();
+  const normal = '---\ndescription: 普通独立简介\n---\n<!--normal-only-->普通正文乙<!--/normal-only-->';
+  const agi = '---\ndescription: AGI独立简介\n---\nAGI正文甲';
+  try {
+    lib.saveSkill(appRoot, '', { id: 'sample', body: normal });
+    const normalPath = path.join(appRoot, 'skills/sample/SKILL.md');
+    const agiPath = path.join(appRoot, 'skills/sample/SKILL.agi.md');
+    const single = harness.agent.listSkills(appRoot, '', [])[0];
+    assert.equal(lib.skillBodyForMode(single, true), '');
+    assert.equal(single.agiDesc, '');
+    assert.ok(!fs.existsSync(agiPath));
+    lib.saveSkill(appRoot, '', { id: 'sample', mode: 'agi', body: agi });
+    assert.equal(fs.readFileSync(normalPath, 'utf8'), normal);
+    lib.saveSkill(appRoot, '', { id: 'empty', mode: 'normal', body: '' });
+    for (const mode of [false, true]) {
+      hand.setAlive(mode);
+      harness.setAlive(mode);
+      await testSkillChannels(harness, appRoot, mode);
     }
-    for (const role of ['code', 'planning', 'summary']) {
-      const prompt = modulePrompt(role, { skill: selected, agi });
-      assert.ok(prompt.includes(technical) && prompt.includes(ordinary) === !agi && !prompt.includes('<!--normal-only-->'));
-    }
-    const extra = [path.dirname(path.dirname(selected.file))];
-    const invoke = harness.agent.test.execTool;
-    const all = await invoke(appRoot, {}, 'read_file', { path: selected.file }, noop, extra);
-    const lines = selected.body.split(/\r?\n/);
-    const from = lines.findIndex(function inside(line) { return line.includes('**完整派单**'); }) + 1;
-    const span = await invoke(appRoot, {}, 'read_file', { path: selected.file, startLine: from, endLine: from }, noop, extra);
-    const hit = await invoke(appRoot, {}, 'search_text', { path: selected.file, query: ordinary }, noop, extra);
-    check(all.includes(technical) && all.includes(ordinary) === !agi && span.includes('完整派单') === !agi &&
-      hit.includes(ordinary) === !agi, '技能整读、块内按行读、单文件搜索遵守 AGI=' + agi);
+    lib.saveSkill(appRoot, '', { id: 'sample', mode: 'agi', body: '' });
+    lib.saveSkill(appRoot, '', { id: 'sample', mode: 'normal', body: '手改普通' });
+    const cleared = harness.agent.listSkills(appRoot, '', []).find(function sample(s) { return s.id === 'sample'; });
+    assert.equal(cleared.agiDesc, '');
+    assert.equal(cleared.agiBody, '');
+    assert.equal(fs.readFileSync(agiPath, 'utf8'), '');
+    lib.saveSkill(appRoot, '', { id: 'only-agi', mode: 'agi', body: agi });
+    const only = harness.agent.listSkills(appRoot, '', []).find(function onlyAgi(s) { return s.id === 'only-agi'; });
+    assert.equal(only.body, '');
+    assert.equal(only.agiBody, agi);
+    check(true, '技能未填写不生成，单独新建 AGI 可重开，清空后不会回填');
+  } finally {
+    hand.setAlive(previous);
+    harness.setAlive(true);
+    fs.rmSync(appRoot, { recursive: true, force: true });
   }
-  harness.setAlive(true);
 }
 
 /**
@@ -2911,6 +3168,8 @@ async function testCodexChatInterjections(harness, exhaustedAtEntry) {
   let sdkRequests = 0;
   let toolCalls = 0;
   let replied = 0;
+  let generatingRequest = 0;
+  const processingAt = [];
 
   /**
    * 在隔离环境中执行生产适配器。
@@ -2922,14 +3181,14 @@ async function testCodexChatInterjections(harness, exhaustedAtEntry) {
   function loadAdapter(name, dependency, extra) {
     const file = path.join(root, 'electron/lib', name + '.js');
     const context = { require: dependency, module: { exports: {} }, __dirname: path.dirname(file),
-      process, console, Buffer, AbortController, AbortSignal, runFixtureUi };
+      process, console, Buffer, AbortController, AbortSignal, setTimeout, runFixtureUi };
     vm.runInNewContext(fs.readFileSync(file, 'utf8') + '\n' + extra, context, { filename: file });
     return context.module.exports;
   }
   /**
    * 模拟官方 UI 的会话标识、实际发送和已完成回复。
    * @param {object} request 生产适配器发出的启动、发送或读取指令。
-   * @returns {Promise<object>} 当前指令的 UI 回执；读取首个回复时同步登记第 2 至 20 条插话。
+   * @returns {Promise<object>} 当前指令的 UI 回执；分别在首批发送确认前、确认后模拟新插话。
    */
   async function runFixtureUi(request) {
     if (request.action === 'start') {
@@ -2940,13 +3199,30 @@ async function testCodexChatInterjections(harness, exhaustedAtEntry) {
       if (!requests.length) marker = request.text.match(/SPCODE-SESSION:[\w-]+/)[0];
       else assert.equal(request.sessionMarker, marker);
       requests.push(request.text);
+      assert.equal(deliveredAt.length, requests.length - 1, '客户端确认发送前不得宣告送达');
+      if (!exhaustedAtEntry && requests.length === 1) {
+        for (let i = 2; i <= 20; i++) queueProbe(i);
+      }
       return { assistantCount: replied };
     }
     assert.equal(request.action, 'read');
     assert.equal(request.sessionMarker, marker);
     if (replied < requests.length) {
+      const items = state.activeInterjectKeys.get(key).memory.current.interjectionTodos;
+      if (generatingRequest < requests.length) {
+        // 本次发送已确认，客户端还未报告模型活动；这里只能看到办理进度。
+        // 首批可由 SDK 或官方客户端先报告发送；第二批只能在新的请求中出现。
+        assert.deepEqual(processingAt, requests.length === 1 ? [0] : [0, 1]);
+        assert.equal(deliveredAt.length, replied);
+        assert.ok(!items[items.length - 1].seen);
+        generatingRequest = requests.length;
+        return { markerFound: true, assistantCount: replied, generating: true, complete: false };
+      }
+      assert.equal(deliveredAt.length, requests.length, '开始生成即须确认已看');
+      const currentBatch = replied ? items.slice(1) : items.slice(0, 1);
+      for (const item of currentBatch) assert.equal(item.seen, true);
       replied++;
-      if (replied === 1) {
+      if (exhaustedAtEntry && replied === 1) {
         for (let i = 2; i <= 20; i++) queueProbe(i);
       }
     }
@@ -2999,12 +3275,23 @@ async function testCodexChatInterjections(harness, exhaustedAtEntry) {
    * @returns {void} 仅记录明确的插话送达状态。
    */
   function onEvent(event) {
-    if (event.type === 'status' && event.text.startsWith('插话已送达')) deliveredAt.push(replied);
+    if (event.type !== 'status') return;
+    if (event.text === '正在处理插话，等待模型回复…') processingAt.push(replied);
+    if (!event.text.startsWith('插话已送达')) return;
+    deliveredAt.push(replied);
+    // 取实际账本编号核对：晚到的首批回执不能重新点亮已被新插话打断的条目。
+    const items = state.activeInterjectKeys.get(key).memory.current.interjectionTodos;
+    const expected = [];
+    if (replied === 0 && exhaustedAtEntry) expected.push(items[0].id);
+    if (replied === 1) {
+      for (const item of items.slice(1)) expected.push(item.id);
+    }
+    assert.deepEqual(Array.from(event.processingInterjectionIds), expected);
   }
   /** 上一批已过期的工具申请必须在续接前被跳过。 */
   async function runTool() { toolCalls++; return '旧动作不应执行'; }
   const state = harness.agent.test;
-  state.activeInterjectKeys.add(key);
+  state.activeInterjectKeys.set(key, testInbox(key));
   try {
     queueProbe(1);
     const result = await state.runDirectWithInterjections(codex, {
@@ -3018,12 +3305,156 @@ async function testCodexChatInterjections(harness, exhaustedAtEntry) {
     const sent = requests.flatMap(function extract(text) { return text.match(/请记录官方聊天插话【\d+】。/g); });
     assert.deepEqual(sent, accepted);
     check(sent.length === 20, mode + '两批完整按序送达 20 条且无重复');
-    assert.deepEqual(deliveredAt, [1, 2]);
+    assert.deepEqual(deliveredAt, [0, 1]);
+    check(true, mode + '在两批回复各自生成完成前逐条通知处理中，过期回执不点亮旧插话');
     check(!state.interjectInFlight.has(key) && !state.interjectInbox.has(key) && result.content === '已收到第二批插话。', mode + '分批确认，清空收件箱并返回最终回复');
   } finally {
     state.activeInterjectKeys.delete(key);
     codex.closeSession(key);
   }
+}
+
+/**
+ * 走真实收件、工具和最终交付路径，核对主动确认、打断、重新载入的逐条状态。
+ * 外部模型受控返回，成功与业务失败均经过同一条 done 路径。
+ */
+async function testInterjectionChecklist(harness) {
+  for (const outcome of ['成功', '明确失败', '停止', '新插话', '异常']) {
+    const key = 'checklist-' + outcome;
+    const controller = new AbortController();
+    let count = 0;
+    let received;
+    async function respond(args) {
+      count++;
+      if (count === 1) {
+        assert.ok(harness.agent.pushInterjection(key, '相同的原话'));
+        assert.ok(harness.agent.pushInterjection(key, '相同的原话'));
+        received = finish.context.workingMemoryRef.current.interjectionTodos;
+        assert.equal(received.length, 2);
+        assert.notEqual(received[0].id, received[1].id);
+        for (const item of received) assert.ok(!item.seen, '仅入队的插话尚未被 AI 看到');
+        return { content: '收到。' };
+      }
+      if (count === 2) {
+        assert.ok(args.turnText.includes(received[0].id) && args.turnText.includes(received[1].id));
+        // 仅完成续接准备时不显示处理中；首个模型活动应准确指回同文不同编号的两项。
+        assert.ok(!finish.events.some(function processing(ev) { return ev.processingInterjectionIds; }));
+        args.onEvent({ type: 'reason', text: '正在核对插话。' });
+        const active = finish.events.filter(function processing(ev) { return ev.processingInterjectionIds; });
+        assert.equal(active.length, 1);
+        assert.deepEqual(Array.from(active[0].processingInterjectionIds), Array.from(received, function id(item) { return item.id; }));
+        for (const item of finish.context.workingMemoryRef.current.interjectionTodos) assert.equal(item.seen, true);
+        const reply = await args.runTool('interjection_done', { id: received[0].id });
+        assert.match(reply, /已登记/);
+        assert.equal(received[0].status, 'pending');
+        if (outcome === '成功') {
+          // 此时主回复还未返回；实际交付正文须立即出现在指定卡片上。
+          await args.runTool('interjection_done', { id: received[0].id, result: '第一项结果已交付' });
+          const current = finish.context.workingMemoryRef.current.interjectionTodos;
+          assert.equal(current[0].status, 'completed');
+          assert.equal(current[0].result, '第一项结果已交付');
+          assert.equal(current[1].status, 'pending');
+        }
+        if (outcome === '停止') controller.abort();
+        if (outcome === '异常') throw new Error('夹具模拟传输中断');
+        if (outcome === '新插话') assert.ok(harness.agent.pushInterjection(key, '打断上一段处理'));
+      }
+      return { content: outcome === '明确失败' ? '该项处理已结束，操作失败，结果已交付。' : '本次答复已交付。' };
+    }
+    const finish = finishHarness(harness, { runTurn: respond }, key);
+    useProductionTodoTools(harness, finish);
+    finish.context.signal = controller.signal;
+    finish.context.snap.current.manifest.changes = [];
+    if (outcome === '停止' || outcome === '异常') {
+      await assert.rejects(finish.run());
+    } else {
+      await finish.run();
+    }
+    const items = finish.context.workingMemoryRef.current.interjectionTodos;
+    const finished = outcome === '成功' || outcome === '明确失败';
+    assert.equal(items[0].seen, true);
+    assert.equal(items[1].seen, true);
+    assert.equal(items[0].status, finished ? 'completed' : 'pending');
+    assert.equal(items[1].status, 'pending');
+    assert.equal(items.length, outcome === '新插话' ? 3 : 2);
+    const restored = harness.dependency('./context-compact').normalizeWorking(JSON.parse(JSON.stringify(finish.context.workingMemoryRef.current)));
+    assert.equal(JSON.stringify(restored.interjectionTodos), JSON.stringify(items));
+    check(true, outcome + '：收件保留独立原话，交付前不完成，中断状态随会话保存');
+  }
+  // 真实工具在模型确认仅需知悉时立即办结；混合批次中要求改动的条目仍需交付。
+  const mixedKey = 'acknowledgment-checklist';
+  let round = 0;
+  async function acknowledge(args) {
+    round++;
+    if (round === 1) {
+      for (const text of ['继续', '资料明天给你，知悉即可', '插话不是功能需求的话，AI 看了就可以标记为已处理', '继续改按钮', '我的样书是浅橙色封面，只是告知。']) {
+        assert.ok(harness.agent.pushInterjection(mixedKey, text));
+      }
+      assert.ok(mixedFinish.context.workingMemoryRef.current.interjectionTodos.every(function unread(item) { return !item.seen && item.status === 'pending'; }));
+      return { content: '接手插话。' };
+    }
+    args.onEvent({ type: 'reason', text: '已看见本批消息。' });
+    const ledger = mixedFinish.context.workingMemoryRef.current;
+    const progress = mixedFinish.events.filter(function status(event) { return event.processingInterjectionIds; }).at(-1);
+    assert.ok(!progress.processingInterjectionIds.includes(ledger.interjectionTodos[0].id), '已办结的续办指令不能再次点亮处理中');
+    assert.deepEqual(Array.from(ledger.interjectionTodos, function status(item) { return item.status; }), ['completed', 'pending', 'pending', 'pending', 'pending']);
+    await args.runTool('interjection_done', { id: ledger.interjectionTodos[1].id, acknowledgmentOnly: true });
+    assert.equal(ledger.interjectionTodos[1].status, 'completed');
+    return { content: '已知悉。' };
+  }
+  const mixedFinish = finishHarness(harness, { runTurn: acknowledge }, mixedKey);
+  // 主模型只提交第一条告知的回执。交付前的只读核对只确认漏记的告知，其余工作仍须交付。
+  mixedFinish.context.reviewWithoutTools = async function reviewNotices(request) {
+    const batch = JSON.parse(request.user);
+    assert.deepEqual(batch.map(function original(item) { return item.text; }), [
+      '插话不是功能需求的话，AI 看了就可以标记为已处理', '继续改按钮', '我的样书是浅橙色封面，只是告知。'
+    ]);
+    return 'SPCODE_ACK ' + batch[2].id + '\nSPCODE_ACK unrelated';
+  };
+  useProductionTodoTools(harness, mixedFinish);
+  mixedFinish.context.snap.current.manifest.changes = [];
+  await mixedFinish.run();
+  const mixedItems = mixedFinish.context.workingMemoryRef.current.interjectionTodos;
+  assert.deepEqual(Array.from(mixedItems, function status(item) { return item.status; }), ['completed', 'completed', 'pending', 'pending', 'completed']);
+  check(mixedItems[4].seen, '交付前补齐主模型漏记的纯告知回执，混合批次中两条功能要求继续待办');
+  const key = 'ordinary-checklist';
+  let count = 0;
+  let id;
+  async function ordinary(args) {
+    count++;
+    if (count === 1) {
+      harness.agent.pushInterjection(key, '普通模型插话原文');
+      harness.agent.pushInterjection(key, '另一条已核实的普通模型插话');
+      return { role: 'assistant', content: '旧答复' };
+    }
+    if (count === 2) {
+      id = finish.context.workingMemoryRef.current.interjectionTodos[0].id;
+      assert.ok(args.messages.some(function matches(row) { return row.role === 'user' && String(row.content).includes(id); }));
+      assert.ok(!finish.context.workingMemoryRef.current.interjectionTodos[0].seen);
+      args.onReason('正在核对插话。');
+      assert.equal(finish.context.workingMemoryRef.current.interjectionTodos[0].seen, true);
+      const active = finish.events.find(function processing(ev) { return ev.processingInterjectionIds; });
+      const secondId = finish.context.workingMemoryRef.current.interjectionTodos[1].id;
+      assert.deepEqual(Array.from(active.processingInterjectionIds), [id, secondId]);
+      return { role: 'assistant', content: '', tool_calls: [
+        { id: 'finish-one', type: 'function', function: { name: 'interjection_done', arguments: JSON.stringify({ id }) } },
+        { id: 'publish-two', type: 'function', function: { name: 'interjection_done', arguments: JSON.stringify({ id: secondId, result: '第二项已核实' }) } }
+      ] };
+    }
+    // 同一轮内只登记编号的第一项继续等交付，第二项的实际答复已经发布。
+    const current = finish.context.workingMemoryRef.current.interjectionTodos;
+    assert.equal(current[0].status, 'pending');
+    assert.equal(current[1].status, 'completed');
+    assert.equal(current[1].result, '第二项已核实');
+    return { role: 'assistant', content: '完整答复。' };
+  }
+  const finish = finishHarness(harness, null, key);
+  finish.context.directOn = false;
+  finish.context.modelCfg = { protocol: 'openai', baseUrl: 'http://unused', model: 'fixture' };
+  finish.context.snap.current.manifest.changes = [];
+  harness.setComplete(ordinary);
+  const result = await finish.run();
+  check(count >= 3 && result.workingMemory.interjectionTodos[0].status === 'completed', '普通模型按编号立即发布有正文的结果，只登记编号的事项随整轮办结');
 }
 
 /** 顺序核对普通循环、生产直通入口、工具边界、会话隔离、停止和 MCP 传输。 */
@@ -3032,11 +3463,12 @@ async function main() {
   app.on('window-all-closed', noop);
   await app.whenReady();
   const harness = loadAgent();
+  await testInterjectionChecklist(harness);
   await testCodexChatInterjections(harness, true);
   await testCodexChatInterjections(harness, false);
   await testSkillVisibility(harness);
   check(!harness.agent.pushInterjection('idle', '空闲消息'), '空闲会话不接受无法消费的插话');
-  harness.agent.test.activeInterjectKeys.add('disabled');
+  harness.agent.test.activeInterjectKeys.set('disabled', testInbox('disabled'));
   harness.setAlive(false);
   check(!harness.agent.pushInterjection('disabled', 'AGI关闭消息'), 'AGI关闭仍保留排队语义');
   harness.setAlive(true);
@@ -3046,6 +3478,8 @@ async function main() {
   await testParallelAgi();
   await testParallelOrdinary();
   await testDeferredParallel();
+  await testParallelBeforeFirstBatch();
+  await testParallelAddition();
   await testParallelBoundaries();
   await testVisualFinish(harness, '验收指定窗口的实际画面');
   await testVisualFinish(harness, '验收 Unity 游戏界面里的按钮布局');
@@ -3059,6 +3493,7 @@ async function main() {
   await testFailedProbeRetries(harness);
   await testBlockedProbeRetries(harness);
   await testUserScope(harness);
+  await testManualAdjustment(harness);
   await testScopeBridge(harness);
   await testOrdinaryScope(harness);
   await testOrdinaryQueuedTools(harness);

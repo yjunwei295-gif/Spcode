@@ -79,12 +79,19 @@ function documentScope(parts) {
   return document ? { names, handoff, selected: '' } : null;
 }
 
-/** 仅处理真实用户补充。暂停截断旧任务的可执行范围，清单内容保留在工作记忆中。 */
+/**
+ * 按用户补充更新本轮有效要求。普通暂停保留进度，用户接手调整时交还本轮清单。
+ * @param {object} scope 本轮共享的任务范围。
+ * @param {string} text 用户原话。
+ * @param {boolean} start 本轮是否收到明确开工操作。
+ * @returns {Set<string>|undefined} 用户接手前本轮触及的待办编号，供宿主移除其中未完成的项。
+ */
 function update(scope, text, start = false) {
   const parts = clauses(text);
   const stopped = stopIndex(parts);
   const selected = parts.slice(stopped + 1);
-  const replyOnly = replyOnlyRequest(text);
+  const replyOnly = replyMode(parts);
+  const retired = replyOnly === 'manual' && scope.todos.size ? new Set(scope.todos) : undefined;
   const docs = documentScope(selected);
   const restricted = docs && /(?:只|仅|only\b)/iu.test(text);
   if (stopped >= 0 || restricted || replyOnly) {
@@ -107,6 +114,7 @@ function update(scope, text, start = false) {
     scope.active = true;
     scope.clarify = false;
   }
+  return retired;
 }
 
 /** 读取旧存档时仅用末句的明确整项完成声明排除已交付旧目标；它不能授予新的执行权。 */
@@ -151,12 +159,36 @@ function replacesWithReply(part) {
     /^(?:answer only\b|(?:please\s+)?(?:only|just)\s+(?:answer|explain|discuss|review)\b|(?:q\s*&\s*a|read[- ]only)(?:\s+only)?[.!?]?$)/iu.test(order);
 }
 
-/** 仅当用户明示答复范围且没有并列操作时，为整条消息选择问答流程。 */
-function replyOnlyRequest(text) {
-  const parts = clauses(text);
-  return parts.some(replacesWithReply) && !parts.some(function separateAction(part) {
+/** 识别用户明确接手本次调整的陈述；已经做过、假设和询问均不转移执行权。 */
+function takesOverAdjustment(part) {
+  return /^(?:然后|接着|接下来|之后)?(?:而是让|让)?我(?:这边)?(?:自己(?:来|去)?(?:手动)?|亲自(?:来|去)?|(?:来|去)?手动(?:来|去)?|来)(?:调(?:整)?|改)(?:一下|下)?(?:这些规则|规则|配置|参数)?(?:就行|就好|即可)?[、.！!。]?$/u.test(part);
+}
+
+/**
+ * 区分用户接手实施与普通的只答复要求。只有接手时才撤下旧实施待办。
+ * @param {string[]} parts 已剔除引用并分隔的用户分句。
+ * @returns {string} manual 表示用户接手，reply 表示仅答复，空串表示沿用原调度。
+ */
+function replyMode(parts) {
+  if (parts.some(takesOverAdjustment)) {
+    for (const part of parts) {
+      if (takesOverAdjustment(part)) continue;
+      // 「列出来」可位于宾语之后。保留同句明确交给助手的实施，例如「告诉我位置并修改配置」。
+      if (part.split(/(?:并且?|然后|同时|顺便|接着)/u).slice(1).some(action)) return '';
+      if (replacesWithReply(part)) continue;
+      if (action(part) || !(responseOnly.test(part) || /(?:给我|请你?)(?:详细)?列出(?:来|清单)?[、.！!。]?$/u.test(part))) return '';
+    }
+    return 'manual';
+  }
+  function separateAction(part) {
     return !replacesWithReply(part) && action(part);
-  });
+  }
+  return parts.some(replacesWithReply) && !parts.some(separateAction) ? 'reply' : '';
+}
+
+/** 用同一范围判定选择问答流程，并在用户接手时拦住尚未启动的旧工具。 */
+function replyOnlyRequest(text) {
+  return Boolean(replyMode(clauses(text)));
 }
 
 /** 在模型仍生成旧批次时，仅观察尚待投递的暂停或范围替换。 */
@@ -170,10 +202,10 @@ function redirects(items) {
 
 /** 为模型给出当前调度依据；插话与用户原话保留原顺序，裸续做无目标时只澄清。 */
 function instruction(scope) {
-  if (scope.clarify) return '当前没有可恢复的用户执行任务，请简短询问要继续哪件事。';
+  if (scope.clarify) return '当前没有可恢复的用户执行任务，' + require('./agi-rules').section('续做澄清');
   if (scope.limit === 'pause') return '用户已暂停此前任务。\n' + scope.orders.join('\n');
   return (scope.limit === 'reply' ? '【用户明确要求仅答复】' : '【执行依据·用户原话】') + '\n' + scope.orders.join('\n') +
-    '\n助手举例、工具结果和待办不能新增执行范围。';
+    '\n' + require('./agi-rules').section('原话范围');
 }
 
 /** 比较实际路径与用户点名或已选定的交付文档。只读判断也供返工验收筛选原有改动。 */
@@ -195,7 +227,8 @@ function reviewChanges(scope, changes, workspace, extra) {
 
 /** 在进入真实工具之前校验本轮授权。仅文档交付按工作区绝对路径核对，未点名文件时固定第一份交付文档。 */
 function toolDenial(scope, name, args, workspace, extra) {
-  if (!scope || readTools.has(name)) return '';
+  // 记录已处理的插话只影响其状态，询问、只读及仅交付文档时都不扩大执行范围。
+  if (!scope || readTools.has(name) || name === 'interjection_done') return '';
   if (scope.clarify || scope.limit) return instruction(scope);
   // 中性表述不封锁工具。确实开始执行时纳入同一套续做、自测与验收。
   if (!scope.active && !['todo_write', 'working_memory_update', 'agi_note'].includes(name)) scope.active = true;

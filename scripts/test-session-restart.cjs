@@ -73,6 +73,21 @@ function runChild() {
   const output = process.argv[2];
   const phase = process.argv[3];
   const evidence = { phase, pid: process.pid, passed: [], errors: [] };
+  // 只替换本地模型的生成边界，保留生产主进程模型选择、IPC、重启流程与页面渲染。
+  const reviewRequests = [];
+  require('../electron/lib/local-llm').complete = receiveReview;
+  /**
+   * 记录重启时送入本地模型的真实请求，并返回无工具的文字回执。
+   * @param {object} request 由生产适配器准备的消息及工具。
+   * @returns {Promise<object>} 模拟一次已完成的模型回复。
+   */
+  async function receiveReview(request) {
+    assert.ok(!request.tools?.length, '重启查看不授予工具');
+    const body = request.messages.map(function content(message) { return message.content; }).join('\n');
+    reviewRequests.push(body);
+    if (phase === 'restore-close' && body.includes('乙的正文')) throw new Error('测试模型离线');
+    return { role: 'assistant', content: body.includes('仅供知悉') ? '已查看未办事项。\nSPCODE_ACK notice' : '已查看未办事项。' };
+  }
   let win = null;
   let finished = false;
   const userData = path.join(output, 'user-data');
@@ -103,6 +118,7 @@ function runChild() {
    * @returns {void} 首个窗口登记为测试主窗，不接触用户的其他进程。
    */
   function observe(event, window) {
+    window.webContents.setBackgroundThrottling(false);
     window.hide();
     window.on('show', hide);
     /** 无参数；阻止本测试窗口遮挡用户桌面，不改变生产业务。 */
@@ -166,8 +182,10 @@ function runChild() {
       const ids = await page('(async function seedTabs() {'
         + 'const test=window.__sessionRestartTest; const state=test.state; const api=window.simple||window.sinpo;'
         + 'await api.setWorkspace(' + JSON.stringify(path.join(output, 'workspace-a')) + '); state.workspace=' + JSON.stringify(path.join(output, 'workspace-a')) + ';'
-        + 'test.newTab(); const a=state.tabs[state.tabs.length-1]; a.title="记录甲"; a.messages=[{role:"user",text:"甲的正文"},{role:"assistant",text:"甲的回复"}]; document.getElementById("input").value="甲的草稿"; await test.persistTab(a);'
-        + 'state.workspace=' + JSON.stringify(path.join(output, 'workspace-b')) + '; test.newTab(); const b=state.tabs[state.tabs.length-1]; b.title="记录乙"; b.messages=[{role:"user",text:"乙的正文"}]; document.getElementById("input").value="乙的草稿"; await test.persistTab(b);'
+        + 'test.newTab(); const a=state.tabs[state.tabs.length-1]; a.title="记录甲"; a.messages=[{role:"user",text:"甲的正文"},{role:"assistant",turnId:"turn-a",text:"甲的回复"}];'
+        + 'a.workingMemory={interjectionTodos:[{id:"first",turnId:"turn-a",text:"需查看的甲插话",status:"pending"},{id:"read",turnId:"turn-a",text:"已看未结的甲插话",status:"pending",seen:true},{id:"closed",turnId:"turn-a",text:"已交付的甲插话",status:"completed",seen:true},{id:"continue",turnId:"turn-a",text:"继续",status:"pending",seen:true},{id:"notice",turnId:"turn-a",text:"仅供知悉，原表将在明天提供。",status:"pending"}],todos:[{id:"todo",content:"甲待处理事项",status:"pending"},{id:"doing",content:"甲进行中事项",status:"in_progress"},{id:"cancel",content:"甲已取消事项",status:"cancelled"}],openQuestions:["甲仍未决的问题"]};'
+        + 'document.getElementById("input").value="甲已排队的需求"; document.getElementById("btn-enqueue").click(); document.getElementById("input").value="甲的草稿"; await test.persistTab(a);'
+        + 'state.workspace=' + JSON.stringify(path.join(output, 'workspace-b')) + '; test.newTab(); const b=state.tabs[state.tabs.length-1]; b.title="记录乙"; b.messages=[{role:"user",text:"乙的正文"},{role:"assistant",turnId:"turn-b",text:"中途停止",stopped:true}]; b.workingMemory={interjectionTodos:[{id:"unread",turnId:"turn-b",text:"乙的待办插话",status:"pending"}]}; document.getElementById("input").value="乙的草稿"; await test.persistTab(b);'
         + 'state.workspace=' + JSON.stringify(path.join(output, 'workspace-a')) + '; test.newTab(); const c=state.tabs[state.tabs.length-1]; c.title="空白记录"; test.renderTabs(); await test.switchToTab(b.id);'
         + 'return {ids:[a.id,b.id,c.id],active:b.id,scope:(await api.getState()).sessionLayoutKey}; })()');
       check('退出前确实存在三个独立标签', ids.ids.length === 3 && new Set(ids.ids).size === 3);
@@ -188,6 +206,7 @@ function runChild() {
       const b = restored.tabs.find(function second(tab) { return tab.id === expected.ids[1]; });
       check('会话正文独立且空白标签仍为空', b.messages[0].text === '乙的正文' && restored.tabs[restored.tabs.length - 1].messages.length === 0);
       if (phase === 'restore-close') {
+        await verifyRestartReview(expected.ids[0]);
         const a = restored.tabs[0];
         check('后台标签的正文和草稿也完整恢复', a.messages[0].text === '甲的正文' && a.composer.text === '甲的草稿');
         await page('document.querySelector("[data-close=\\"' + expected.ids[0] + '\\"]").click()');
@@ -214,6 +233,45 @@ function runChild() {
       evidence.screenshot = path.join(output, phase + '.png');
       fs.writeFileSync(evidence.screenshot, screenshot.toPNG());
     }
+  }
+  /**
+   * 验证冷启动发送的各标签请求、原卡片回执和随后刷新的次数。
+   * @param {string} id 带插话、普通待办和排队需求的后台标签编号。
+   * @returns {Promise<void>} 只在隔离窗口中读取会话并刷新页面。
+   */
+  async function verifyRestartReview(id) {
+    const until = Date.now() + 5000;
+    let stored;
+    do {
+      stored = await page('(window.simple||window.sinpo).loadSession(' + JSON.stringify(id) + ')');
+      if (reviewRequests.length >= 2 && stored.workingMemory.interjectionTodos[0].seen &&
+          await page('Boolean(document.querySelector(".restart-review-failed"))')) break;
+      await new Promise(function pause(resolve) { setTimeout(resolve, 25); });
+    } while (Date.now() < until);
+    check('冷启动自动向模型分别提交两个有未办事项的标签，跳过空标签', reviewRequests.length === 2);
+    const first = reviewRequests.find(function alpha(body) { return body.includes('需查看的甲插话'); });
+    const second = reviewRequests.find(function beta(body) { return body.includes('乙的正文'); });
+    assert.ok(first && second && first !== second);
+    for (const phrase of ['已看未结的甲插话', '甲待处理事项', '甲进行中事项', '甲仍未决的问题', '甲已排队的需求']) assert.ok(first.includes(phrase), phrase);
+    check('模型看到了未完成的插话、清单、未决问题、排队及未答复需求', !second.includes('需查看的甲插话') && !first.includes('乙的正文'));
+    for (const phrase of ['已交付的甲插话', '甲已取消事项', '甲的草稿', '乙的草稿']) assert.ok(!reviewRequests.join('\n').includes(phrase), phrase);
+    check('模型回执随原插话存档，保留待处理和原聊天记录', stored.workingMemory.interjectionTodos[0].seen === true &&
+      stored.workingMemory.interjectionTodos[0].status === 'pending' && stored.messages.length === 2);
+    // 先读失败会话的真实卡片，再切回成功会话检查原插话，最后恢复原标签供后续冷启动阶段使用。
+    const labels = 'Array.from(document.querySelectorAll(".interjection-todo-card li strong")).filter(function shown(el){return el.getClientRects().length;}).map(function label(el){return el.textContent;})';
+    const active = await page('window.__sessionRestartTest.state.activeTab');
+    assert.deepEqual(await page(labels), ['待处理']);
+    check('失败标签显示模型离线且原插话保持未读', await page('document.querySelector(".restart-review-failed").textContent.includes("测试模型离线")'));
+    await page('window.__sessionRestartTest.switchToTab(' + JSON.stringify(id) + ')');
+    assert.deepEqual(await page(labels), ['AI 已看 · 待处理', 'AI 已看 · 待处理', 'AI 已看 · 已处理', 'AI 已看 · 已处理', 'AI 已看 · 已处理']);
+    check('重启后旧续办指令和只需知悉的插话已结项并存档', stored.workingMemory.interjectionTodos.slice(3).every(function completed(item) { return item.seen && item.status === 'completed'; }));
+    check('切换至后台标签后，原卡片显示已看且保留每条办理状态', reviewRequests.length === 2);
+    await page('window.__sessionRestartTest.switchToTab(' + JSON.stringify(active) + ')');
+    const loaded = new Promise(function reloaded(resolve) { win.webContents.once('did-finish-load', resolve); });
+    win.webContents.reload();
+    await loaded;
+    await waitReady();
+    check('同进程刷新页面后未重复提交重启查看', reviewRequests.length === 2);
   }
   /** candidate为本测试进程的窗口；按真实主界面地址识别，返回boolean，不改变窗口。 */
   function isMainWindow(candidate) { return candidate.webContents.getURL().endsWith('/renderer/index.html'); }

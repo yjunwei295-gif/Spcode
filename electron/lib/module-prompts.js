@@ -24,7 +24,7 @@ function buildModulePrompt(role, context, instructions = '') {
     for (const rule of context.rules) rules.push(`### ${rule.name}\n${rule.body}`);
     parts.push('## 本轮规则\n' + rules.join('\n\n'));
   }
-  const skillBody = require('./skills').skillTextForMode(context?.skill?.body, context?.agi);
+  const skillBody = require('./skills').skillBodyForMode(context?.skill, context?.agi);
   if (skillBody.trim()) {
     parts.push(`## 本轮技能：${context.skill.name}\n${skillBody}`);
   }

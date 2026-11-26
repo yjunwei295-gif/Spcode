@@ -182,7 +182,7 @@ function build(ctx) {
 
   // 技能：与 chat:send 一致——勾中的按顺序组合成一份；没上报勾选时默认 zabingsk。
   // 同名 id 去重，勾选顺序保持用户点选的顺序。
-  const source = Array.isArray(skillIds) ? skillIds : ['zabingsk'];
+  const source = Array.isArray(skillIds) ? skillIds : [opts.skillId || 'zabingsk'];
   const ids = [];
   for (const id of source) {
     const s = String(id || '').trim();
@@ -190,13 +190,8 @@ function build(ctx) {
   }
   const allSkills = agent.listSkills(appRoot, workspace, order);
   const chosen = ids.map((id) => allSkills.find((x) => x.id === id)).filter(Boolean);
-  const skill = chosen.length
-    ? {
-      id: chosen.map((x) => x.id).join('+'),
-      name: chosen.map((x) => x.name).join(' + '),
-      body: chosen.map((x) => x.body).join('\n\n---\n\n')
-    }
-    : null;
+  const agiNow = desktopOn();
+  const skill = skillsLib.combineSkillsForMode(chosen, agiNow);
 
   // 规则、人设：与 runTurn 同一来源（安装目录 + 工作区 .simple 下的 rules），不在这里另算优先级
   const rules = agent.listRules(appRoot, workspace);
@@ -217,7 +212,6 @@ function build(ctx) {
   // 代码槽即使和大脑是同一只模型也算配了：runTurn 里派工只看槽位是否存在
   const codeWorker = workerOf(vs, 'code');
   const planningWorker = planningWorkerOf(vs, modelCfg);
-  const agiNow = desktopOn();
   const turnStart = startOrderedFor(userText, action);
   const roundLimit = store.clampAgentRounds(maxAgentRounds != null ? maxAgentRounds : vs.maxAgentRounds);
   const planFile = planFileOf(workspace, sessionKey);
@@ -275,7 +269,7 @@ function build(ctx) {
     editable: {
       persona,
       rules: rules.map((r) => ({ name: r.name, body: r.body })),
-      skill: skill ? { id: skill.id, name: skill.name, body: skillsLib.skillTextForMode(skill.body, agiNow) } : null,
+      skill: skill ? { id: skill.id, name: skill.name, mode: agiNow ? 'agi' : 'normal', body: skillsLib.skillBodyForMode(skill, agiNow) } : null,
       summary: String(contextSummary || '')
     },
     // 这些内容发送时才现场产生，预览里看不到，面板会按这些说明标注

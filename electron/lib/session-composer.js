@@ -29,20 +29,23 @@ function createComposerStore(sessionDir) {
     async function write() {
       const file = fileOf(data.id);
       await fs.promises.mkdir(path.dirname(file), { recursive: true });
-      await fs.promises.writeFile(file + '.tmp', JSON.stringify(draft), 'utf8');
-      await fs.promises.rename(file + '.tmp', file);
+      const temporary = file + '.' + process.pid + '.tmp';
+      // 重命名前先刷盘，避免断电后文件名已经切换，内容却还在缓存中。
+      await fs.promises.writeFile(temporary, JSON.stringify(draft), { encoding: 'utf8', flush: true });
+      await fs.promises.rename(temporary, file);
     }
     return enqueue(data.id, write);
   }
 
-  /** 读取已保存草稿；旧会话尚无草稿文件是正常状态，其他读取错误照常报告。 */
+  /** 草稿缺失或损坏时保留正文自带的输入状态，损坏文件留在磁盘供恢复。 */
   async function load(id) {
     const job = pending.get(id);
-    if (job) await job;
+    if (job) await job.catch(() => { /* 保存调用方收到失败，读取仍可使用上一份存档 */ });
     try {
-      return JSON.parse(await fs.promises.readFile(fileOf(id), 'utf8'));
+      const draft = JSON.parse(await fs.promises.readFile(fileOf(id), 'utf8'));
+      return draft && draft.id != null && String(draft.id) === String(id) ? draft : null;
     } catch (error) {
-      if (error.code === 'ENOENT') return null;
+      if (error.code === 'ENOENT' || error instanceof SyntaxError) return null;
       throw error;
     }
   }
@@ -59,8 +62,12 @@ function createComposerStore(sessionDir) {
     const drafts = [];
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
-      const draft = await load(name.slice(0, -5));
-      if (draft) drafts.push(draft);
+      try {
+        const draft = await load(name.slice(0, -5));
+        if (draft) drafts.push(draft);
+      } catch {
+        // 单个草稿无法访问也不能阻止整个历史列表加载。
+      }
     }
     return drafts;
   }

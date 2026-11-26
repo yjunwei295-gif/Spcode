@@ -36,7 +36,7 @@ function check(value, message) {
 
 /** 构造可运行完整页面的最小配置；模型引用保持与真实下拉框格式一致。 */
 function settings(configured) {
-  const s = { locale: 'zh', theme: 'dark', resolvedTheme: 'dark', autoSave: true,
+  const s = { locale: 'zh', theme: 'dark', resolvedTheme: 'dark', autoSave: true, videoProviderModels: [],
     workspace: '', models: [{ id: 'fixture', name: '测试模型', type: 'api', model: 'fixture' }],
     currentModelId: 'fixture', providers: [], recents: [], localFiles: [], assemblies: {},
     capabilityDefaults: {}, retained: { value: '保留已有配置' } };
@@ -55,8 +55,14 @@ async function waitFor(win, expression) {
   return win.webContents.executeJavaScript(script);
 }
 
-/** 用真实 HTML/CSS/ES 模块启动，只有非引导业务替换成已有本地夹具。 */
-async function openPage(s, legacy) {
+/**
+ * 用真实 HTML/CSS/ES 模块启动，只有非引导业务替换成已有本地夹具。
+ * @param {object} s 本轮设置夹具，直接作为 simple.getState 的返回值。
+ * @param {boolean} legacy 是否写入旧版浏览器完成标记，用于迁移用例。
+ * @param {string} extraScript 追加到页面注入脚本里的桩代码，用于提供厂商预设与远程模型清单。
+ * @returns {Promise<BrowserWindow>} 已等到引导或主界面就绪的窗口。
+ */
+async function openPage(s, legacy, extraScript) {
   const win = new BrowserWindow({ show: false, webPreferences: { nodeIntegration: true, contextIsolation: false, backgroundThrottling: false } });
   await win.loadURL('about:blank');
   win.webContents.debugger.attach('1.3');
@@ -68,9 +74,12 @@ async function openPage(s, legacy) {
     + 'simple.getState = async function getState() { return fixtureSettings; };\n'
     + 'simple.completeOnboarding = function completeOnboarding() { return require("electron").ipcRenderer.invoke("app:completeOnboarding"); };\n'
     + 'simple.listProviderPresets = async function listProviderPresets() { return []; };\n'
-    + 'simple.saveCapabilityDefaults = async function saveCapabilityDefaults(value) { return value; };\n'
+    // 一键配置用例要核对实际保存的能力槽位与当前模型，这里把两次保存的入参记在页面里
+    + 'simple.saveCapabilityDefaults = async function saveCapabilityDefaults(value) { window.fullPageRecord.savedCaps = value; return value; };\n'
+    + 'simple.saveModels = async function saveModels(models, currentId) { window.fullPageRecord.savedModels = { models: models, currentId: currentId }; return { videoProviderModels: [] }; };\n'
     + 'simple.getProviderQuota = async function getProviderQuota() { return {}; };\n'
     + 'window.alert = function recordAlert(message) { fullPageRecord.errors.push({alert: message}); };\n'
+    + (extraScript || '')
     + 'window.fixtureSettings = fixtureSettings;\n';
   await win.webContents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: setup });
   await win.loadFile(path.join(root, 'renderer/index.html'));
@@ -108,6 +117,93 @@ async function testDecisions() {
   check(true, '持久化失败明确报告，不伪装完成');
 }
 
+/** 一键引导用到的厂商预设与远程模型清单桩；不连外部接口，模型名覆盖「文本」和「看图」两类。 */
+const ONE_CLICK_STUBS = 'simple.listProviderPresets = async function listProviderPresets() {'
+  + ' return [{ id: "fw", name: "FixtureAI", protocol: "openai", baseUrl: "http://fixture", modelsPath: "" }]; };\n'
+  + 'simple.listRemoteModels = async function listRemoteModels() {'
+  + ' return { models: ["text-basic", "qwen2.5-vl"], catalog: { "text-basic": { name: "Text Basic" }, "qwen2.5-vl": { name: "Qwen VL" } } }; };\n';
+
+/**
+ * 走完一键引导：选厂商、填密钥、拉模型、勾选两个模型，最后点完成并等界面回到对话。
+ * @param {BrowserWindow} win 已完成注入的隐藏窗口。
+ * @returns {Promise<void>} 对话界面出现才兑现；超时由 waitFor 抛出。
+ */
+async function driveOneClick(win) {
+  await win.webContents.executeJavaScript('document.querySelector("[data-onboarding-provider=\\"0\\"]").click()');
+  await win.webContents.executeJavaScript('document.getElementById("onboarding-next").click()');
+  await waitFor(win, '!!document.getElementById("onboarding-key")');
+  await win.webContents.executeJavaScript('document.getElementById("onboarding-key").value = "sk-fixture";'
+    + 'document.getElementById("onboarding-next").click()');
+  await waitFor(win, '!!document.getElementById("onboarding-fetch")');
+  await win.webContents.executeJavaScript('document.getElementById("onboarding-fetch").click()');
+  await waitFor(win, '!!document.querySelector("[data-onboarding-model]")');
+  await win.webContents.executeJavaScript('document.querySelector("[data-onboarding-model=\\"text-basic\\"]").click();'
+    + 'document.querySelector("[data-onboarding-model=\\"qwen2.5-vl\\"]").click()');
+  await win.webContents.executeJavaScript('document.getElementById("onboarding-next").click()');
+  await waitFor(win, 'document.getElementById("modal").classList.contains("hidden") && !!document.getElementById("input")');
+}
+
+/**
+ * 验证「只配 API + 拉模型」的一键引导：勾选模型后点完成，程序自动定大脑、看图与各能力槽位并直接进对话。
+ * 全程走真实引导页面与主进程保存处理器，厂商预设和远程模型清单用本地桩，不连外部模型。
+ * @returns {Promise<void>} 断言失败时抛出，由 run 统一转成非零退出。
+ */
+async function testOneClickConfig() {
+  const fresh = settings(false);
+  fresh.models = [];
+  fresh.currentModelId = '';
+  store.save(fresh);
+  const win = await openPage(fresh, false, ONE_CLICK_STUBS);
+  check(await guideVisible(win), '全新用户进入引导');
+  await driveOneClick(win);
+  const saved = store.load();
+  const savedModels = await win.webContents.executeJavaScript('window.fullPageRecord.savedModels');
+  // 能力槽位由主进程归一化后才会入库；这里用同一个归一化函数核对引导实际发出的配置
+  const assembly = require('../electron/lib/assembly');
+  const payload = await win.webContents.executeJavaScript('window.fullPageRecord.savedCaps');
+  const caps = assembly.normalizeCapabilityDefaults(payload || {});
+  const resolveBase = { models: savedModels?.models || [], providers: [], capabilityDefaults: caps };
+  const brainId = savedModels?.currentId;
+  check(saved.onboardingCompleted === true, '一键配置后直接完成引导并进入对话');
+  check(!!brainId, '保存的当前模型就是自动选定的大脑');
+  check(caps.summary?.primary?.apiId === brainId && caps.planning?.primary?.apiId === brainId, '总结与规划自动跟随大脑');
+  const visionHit = assembly.resolveRole(resolveBase, 'vision');
+  check(!!visionHit?.slot, '看图槽位已被自动填上且能被解析');
+  check(visionHit?.slot?.apiId === caps.vision?.primary?.apiId, '看图槽位指向同一个自动选定的模型');
+  const visionModel = (savedModels?.models || []).find(function findVision(m) { return m.id === visionHit?.slot?.apiId; });
+  check(visionModel?.model === 'qwen2.5-vl' && visionModel?.vision === true, '看图槽位选中具备视觉能力的模型');
+  check((caps.code?.models || []).length === 2 && (caps.aesthetic?.models || []).length === 2, '代码与审美使用全部模型做平等池');
+  const pageModels = savedModels?.models || [];
+  const plainModel = pageModels.find(function findPlain(m) { return m.model === 'text-basic'; });
+  check(pageModels.length === 2 && plainModel?.vision === false, '文本模型的看图标记保持关闭');
+  const pageErrors = await win.webContents.executeJavaScript('fullPageRecord.errors');
+  check(pageErrors.length === 0, '一键配置过程无页面异常 ' + JSON.stringify(pageErrors));
+  win.destroy();
+}
+
+/**
+ * 验证一键配置不覆盖用户已有的选择：重开引导时，已配好的总结槽位保持原值，只补没配过的看图槽位。
+ * @returns {Promise<void>} 断言失败时抛出。
+ */
+async function testOneClickKeepsExisting() {
+  const again = settings(false);
+  again.models = [];
+  again.currentModelId = '';
+  // 用户此前手选过总结模块，一键配置必须让位给这个选择
+  again.capabilityDefaults = { summary: { primary: { type: 'api', apiId: 'mine' }, fallbacks: [] } };
+  store.save(again);
+  const win = await openPage(again, false, ONE_CLICK_STUBS);
+  check(await guideVisible(win), '重开引导的用户仍进入引导');
+  await driveOneClick(win);
+  const payload = await win.webContents.executeJavaScript('window.fullPageRecord.savedCaps');
+  check(payload?.summary?.primary?.apiId === 'mine', '已配置的总结槽位不被一键配置覆盖');
+  check(!!payload?.vision?.primary?.apiId, '未配置的看图槽位仍然自动补上');
+  check((payload?.code?.models || []).length === 2, '未配置的代码池按本次模型自动填好');
+  const pageErrors = await win.webContents.executeJavaScript('fullPageRecord.errors');
+  check(pageErrors.length === 0, '保留已有配置时也没有页面异常 ' + JSON.stringify(pageErrors));
+  win.destroy();
+}
+
 /** 验证首次启动、迁移、清空浏览器状态后的重开，以及手动引导与完成按钮。 */
 async function run() {
   await app.whenReady();
@@ -116,6 +212,8 @@ async function run() {
   assert.ok(begin >= 0 && end > begin);
   vm.runInNewContext(main.substring(begin, end), { ipcMain, store });
   await testDecisions();
+  await testOneClickConfig();
+  await testOneClickKeepsExisting();
 
   const fresh = settings(false);
   store.save(fresh);

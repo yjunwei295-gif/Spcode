@@ -24,21 +24,62 @@ const CODEX_TOOL_RESTRICTIONS = {
   tools: { web_search: false }
 };
 
+// 一次请求最多把几张附件图片落成本地临时文件（与 codex-direct 的上限保持一致）
+const IMAGE_FILE_LIMIT = 8;
+
+/**
+ * 把消息里的 base64 图片落成本地临时文件，供 Codex SDK 以 local_image 读取。
+ * @param {Array} messages 原始消息列表；图片按消息原有顺序收集，不改动入参内容
+ * @returns {string[]} 本次真正创建成功的临时文件路径，保持原消息顺序，最多 8 张
+ * 只落盘最后 8 张：旧写法先写全部再 slice(-8)，前面的文件无人删除，会一直堆在临时目录。
+ * 写入中途失败会先删掉本函数已创建的文件再抛出，调用方不会拿到半成品路径，也不会遗留垃圾。
+ */
 function imagesOf(messages) {
-  const files = [];
+  const matches = [];
   for (const message of messages || []) {
     if (!Array.isArray(message?.content)) continue;
     for (const part of message.content) {
       const url = part?.type === 'image_url' ? (part.image_url?.url || part.image_url) : '';
       const m = /^data:([^;]+);base64,(.+)$/s.exec(String(url || ''));
       if (!m) continue;
-      const ext = m[1].split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'bin';
-      const file = path.join(os.tmpdir(), `spcode-codex-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`);
-      fs.writeFileSync(file, Buffer.from(m[2], 'base64'));
-      files.push(file);
+      matches.push(m);
     }
   }
-  return files.slice(-8);
+  const files = [];
+  const picked = matches.slice(-IMAGE_FILE_LIMIT);
+  try {
+    for (const m of picked) {
+      const ext = m[1].split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'bin';
+      const file = path.join(os.tmpdir(), `spcode-codex-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`);
+      // 独占创建后才登记路径：同名文件归原请求所有，半写的文件归本请求清理。
+      const fd = fs.openSync(file, 'wx');
+      files.push(file);
+      try {
+        fs.writeFileSync(fd, Buffer.from(m[2], 'base64'));
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+  } catch (e) {
+    cleanupFiles(files);
+    throw e;
+  }
+  return files;
+}
+
+/**
+ * 删除本次请求创建的临时图片文件。
+ * @param {string[]} files imagesOf 返回的路径列表，可为空
+ * @returns {void} 所有路径都处理完才返回；实际删除失败时一并报告涉及的文件。
+ */
+function cleanupFiles(files) {
+  const errors = [];
+  for (const file of files) {
+    try { fs.unlinkSync(file); } catch (error) {
+      if (error.code !== 'ENOENT') errors.push(error);
+    }
+  }
+  if (errors.length) throw new AggregateError(errors, '清理临时图片失败：' + errors.join('、'));
 }
 
 function promptOf(messages) {
@@ -53,6 +94,26 @@ function promptOf(messages) {
     if (message.role === 'tool') return `[工具结果 ${message.name || ''}]\n${content}`;
     return `[用户]\n${content}`;
   }).filter(Boolean).join('\n\n');
+}
+
+/**
+ * 为同一主进程的普通调用、连接测试和直通会话取得共用的 SDK 工作目录。
+ * 首次实际创建时登记退出清理，只移除本进程创建且届时仍为空的目录。
+ * @returns {string} 可作为 SDK workingDirectory 的本机绝对路径。
+ */
+function sandboxDirectory() {
+  const dir = path.join(os.tmpdir(), `spcode-codex-sandbox-${process.pid}`);
+  if (fs.mkdirSync(dir, { recursive: true })) {
+    process.once('exit', function removeEmptySandbox() {
+      try {
+        fs.rmdirSync(dir);
+      } catch (error) {
+        // 已移除或仍有产物的目录无需处理；其他文件系统错误保留诊断。
+        if (error.code !== 'ENOENT' && error.code !== 'ENOTEMPTY') console.error(error);
+      }
+    });
+  }
+  return dir;
 }
 
 async function makeCodex(modelCfg) {
@@ -307,8 +368,7 @@ async function fetchRateLimitBalance(modelCfg) {
 
 async function testConnection(modelCfg) {
   const codex = await makeCodex(modelCfg);
-  const cwd = path.join(os.tmpdir(), `spcode-codex-sandbox-${process.pid}`);
-  fs.mkdirSync(cwd, { recursive: true });
+  const cwd = sandboxDirectory();
   const thread = codex.startThread({
     model: modelCfg?.model && !['ping', 'default'].includes(String(modelCfg.model)) ? String(modelCfg.model) : undefined,
     modelReasoningEffort: modelCfg?.reasoningEffort || undefined,
@@ -333,8 +393,7 @@ async function testConnection(modelCfg) {
 
 async function complete({ modelCfg, messages, onDelta, onReason, signal }) {
   const codex = await makeCodex(modelCfg);
-  const cwd = path.join(os.tmpdir(), `spcode-codex-sandbox-${process.pid}`);
-  fs.mkdirSync(cwd, { recursive: true });
+  const cwd = sandboxDirectory();
   const thread = codex.startThread({
     model: modelCfg?.model && modelCfg.model !== 'default' ? String(modelCfg.model) : undefined,
     modelReasoningEffort: modelCfg?.reasoningEffort || undefined,
@@ -344,16 +403,18 @@ async function complete({ modelCfg, messages, onDelta, onReason, signal }) {
     approvalPolicy: 'never',
     webSearchMode: 'disabled'
   });
-  const files = imagesOf(messages);
+  // files 声明在 try 外，让异常、取消和 SDK 失败路径共用同一处清理
+  let files = [];
   try {
+    files = imagesOf(messages);
     const input = [{ type: 'text', text: promptOf(messages) }, ...files.map((file) => ({ type: 'local_image', path: file }))];
     const result = await thread.run(input, { signal });
     const text = String(result.finalResponse || '');
     onDelta?.(text);
     return { role: 'assistant', content: text };
   } finally {
-    for (const file of files) { try { fs.unlinkSync(file); } catch { /* 已清理 */ } }
+    cleanupFiles(files);
   }
 }
 
-module.exports = { CODEX_PROTOCOL, CODEX_BASE_URL, DEFAULT_MODEL, listModels, fetchRateLimitBalance, readRateLimitsFromAppServer, fiveHourQuotaExhausted, testConnection, complete };
+module.exports = { sandboxDirectory, CODEX_PROTOCOL, CODEX_BASE_URL, DEFAULT_MODEL, listModels, fetchRateLimitBalance, readRateLimitsFromAppServer, fiveHourQuotaExhausted, testConnection, complete };

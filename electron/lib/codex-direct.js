@@ -174,8 +174,7 @@ async function createSession(key, sig, modelCfg, tools, onEvent, agiMode) {
         }
       }
     });
-    const cwd = path.join(os.tmpdir(), `spcode-codex-sandbox-${process.pid}`);
-    fs.mkdirSync(cwd, { recursive: true });
+    const cwd = codexModel.sandboxDirectory();
     session.codex = codex;
     session.thread = codex.startThread({
       model: modelCfg.model && modelCfg.model !== 'default' ? String(modelCfg.model) : undefined,
@@ -338,16 +337,17 @@ async function consumeWithHandoff(handoff, consume) {
 /**
  * 执行已取得会话写入权的一轮请求，配额路由、SDK 上下文与工具回传均沿用原语义。
  * @param {object} args 由 runTurn 按 key 排队后的调用参数。
- * @param {Function} [args.onInterjectionDelivered] 模型活动或成功完成时确认插话；切换官方聊天时交给该适配器调用。
+ * @param {Function} [args.onInterjectionSent] SDK 开始传输或官方客户端确认发送时显示处理进度，已看另等模型回执。
+ * @param {Function} [args.onInterjectionDelivered] 模型活动或成功完成时确认 AI 已看，切换官方聊天时沿用。
  * @returns {Promise<object>} 模型正文或交接结果；SDK 真实失败仍在事件流收尾后抛出。
  */
-async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false, shouldYield, watchInterjections, onInterjectionDelivered, sdkOnly = false }) {
+async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames = [], agiMode = false, shouldYield, watchInterjections, onInterjectionSent, onInterjectionDelivered, sdkOnly = false }) {
   // 额度触顶的判定与 UI 切换由本地代码完成，无需等待已耗尽的模型作决定。
   if (await isWorkQuotaExhausted(modelCfg)) {
     // 并发分支的父请求可能正占用官方聊天队列，不能再次入队等父请求退出。
     if (sdkOnly) throw new Error('Codex 工作额度已耗尽，官方聊天模式使用单一前台，无法启动并发分支。');
     closeSdkSession(key);
-    return codexChatDirect.runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode, shouldYield, onInterjectionDelivered });
+    return codexChatDirect.runTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode, shouldYield, onInterjectionSent, onInterjectionDelivered });
   }
   const chatSig = sig;
   // 模式改变必须重建 SDK 会话，不能复用旧的只读权限。
@@ -394,6 +394,8 @@ async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContex
       /** 消费 SDK 事件，保留工具结果确认和进程退出的顺序。 */
       async function consumeSdkEvents() {
         const { events } = await session.thread.runStreamed(nextInput, { signal: streamSignal });
+        // 请求已交给 SDK，等待首个模型事件期间就展示处理中。
+        onInterjectionSent?.();
         for await (const event of events) {
           // 原样留存 SDK 实际返回的事件，包含公开推理摘要、消息及调用状态。
           require('./training-recorder').note('sdk-event', { provider: 'codex', event });
@@ -465,7 +467,7 @@ async function runSdkTurn({ key, sig, fresh, modelCfg, firstPrefix, systemContex
     // 只有尚未执行任何工具、且服务端确认五小时刚好耗尽时，才安全地重投当前任务。
     if (!sdkOnly && !stats.calls.length && !signal?.aborted && await isWorkQuotaExhausted(modelCfg)) {
       onEvent({ type: 'status', text: 'Codex 工作额度在本轮耗尽，自动转入官方聊天模式…' });
-      return codexChatDirect.runTurn({ key, sig: chatSig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode, shouldYield, onInterjectionDelivered });
+      return codexChatDirect.runTurn({ key, sig: chatSig, fresh, modelCfg, firstPrefix, systemContext, turnText, userContent, tools, runTool, onEvent, signal, requiredToolNames, agiMode, shouldYield, onInterjectionSent, onInterjectionDelivered });
     }
     throw e;
   } finally {

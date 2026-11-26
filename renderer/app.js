@@ -10,6 +10,8 @@ import { renderAgiWorkbench } from './agi-workbench.js';
 import { mediaCardsHtml, existingMediaPlayers, loadMediaPreviews, releaseMediaPlayers } from './media-preview.js';
 import { createHotReloadController, takeHotReloadSnapshot } from './hot-reload.js';
 import { COMPOSER_PREDICTION_OPTIONS, createComposerPrediction, rankComposerRequirements } from './composer-prediction.js';
+// 重启只读核对的界面侧合并规则：已看只增不减、已处理是终态，旧快照不能覆盖新状态。
+import { mergeInterjectionItems, applyRestartReceipt, collectPendingReview, submittedQueue } from './interjection-state.mjs';
 
 const api = window.simple || window.sinpo;
 
@@ -229,6 +231,13 @@ function hotReloadBusy() {
  * @returns {object} 刚采集的完整快照；界面刷新写 sessionStorage，主进程重启时由 IPC 交接，均保留关闭自动保存时的状态。
  */
 function saveHotReloadSnapshot(revision) {
+  const snapshot = collectWindowSnapshot(revision);
+  window.sessionStorage.setItem('spcode:hot-reload', JSON.stringify(snapshot));
+  return snapshot;
+}
+
+/** 采集窗口当前状态。代码重载或同一主窗意外刷新都复用此结构，由调用方决定如何交接。 */
+function collectWindowSnapshot(revision) {
   const tab = activeSession();
   if (tab) {
     rememberComposer(tab);
@@ -246,7 +255,6 @@ function saveHotReloadSnapshot(revision) {
     previewPath: state.previewPath, previewMdRaw: state.previewMdRaw,
     downloads: state.downloads, downloadPanelFolded: state.downloadPanelFolded
   };
-  window.sessionStorage.setItem('spcode:hot-reload', JSON.stringify(snapshot));
   return snapshot;
 }
 
@@ -317,6 +325,8 @@ function receiveHotReload(update) {
  */
 async function restoreHotReloadSnapshot(snapshot) {
   state.tabs = snapshot.tabs;
+  // 定时器编号只属于旧文档；新页面应重新安排活轮次的保存和检测。
+  for (const tab of state.tabs) { tab._streamSaveTimer = null; tab.stallTimer = null; }
   state.activeTab = snapshot.activeTab;
   state.currentModelId = snapshot.currentModelId;
   state.sidebar = snapshot.sidebar;
@@ -433,6 +443,20 @@ function providerNameOf(m) {
   if (!m) return '';
   if (m.providerId) return providerById(m.providerId)?.name || m.providerId;
   return m.name || m.baseUrl || '';
+}
+
+/**
+ * 判断模型名是否属于常见的多模态（能看图）模型，供引导一键配置和模型列表初值使用。
+ * 关键词表与主进程 electron/lib/agent.js 里 modelSupportsVision 的判定保持一致，避免两端结论不同；
+ * 这里只给默认值，用户在设置里仍可改，因此不把猜测当成事实对外宣告。
+ * @param {string} modelId 拉取到的模型 ID，例如 gpt-4o、glm-4v、gemini-2.5-pro。
+ * @returns {boolean} true 表示默认标记为支持看图。
+ */
+function looksLikeVisionModel(modelId) {
+  // 与主进程 modelSupportsVision 的兜底判断逐项一致：vl / vision / llava / pixtral / moondream /
+  // minicpm-v / gpt-4o / gpt-4.1 / gpt-5 / gpt-6 / claude / gemini / qwen2.5-vl / qwen3-vl
+  const id = String(modelId || '').toLowerCase();
+  return /vl|vision|llava|pixtral|moondream|minicpm-v|gpt-4o|gpt-4\.1|gpt-5|gpt-6|claude|gemini|qwen2\.5-vl|qwen3-vl/.test(id);
 }
 
 async function persistModels(currentId) {
@@ -879,7 +903,7 @@ async function startOnboarding() {
         const catalog = remote?.catalog?.[id] || {};
         const selected = wizard.choices.get(provider.id) || [];
         if (e.target.checked) {
-          if (!selected.some((m) => m.model === id)) selected.push({ id: uid(), name: catalog.name || id, model: id, type: 'api', providerId: provider.id, vision: false, enabled: true, pricing: catalog.priceText ? { text: catalog.priceText, input: catalog.input, output: catalog.output } : null });
+          if (!selected.some((m) => m.model === id)) selected.push({ id: uid(), name: catalog.name || id, model: id, type: 'api', providerId: provider.id, vision: looksLikeVisionModel(id), enabled: true, pricing: catalog.priceText ? { text: catalog.priceText, input: catalog.input, output: catalog.output } : null });
         } else {
           const index = selected.findIndex((m) => m.model === id);
           if (index >= 0) selected.splice(index, 1);
@@ -903,7 +927,7 @@ async function startOnboarding() {
     }
   };
 
-  const enterConfig = () => {
+  const enterConfig = async () => {
     const previousPosition = loggedStep;
     wizard.step = 'config';
     loggedStep = 'config::0';
@@ -911,9 +935,71 @@ async function startOnboarding() {
       previousPosition,
       currentPosition: { step: wizard.step, keyIndex: null, modelIndex: wizard.modelIndex }
     });
+    // 一键配置：API 密钥填好、模型拉到并勾选后，程序自动定大脑与各能力槽位（含看图）并直接进对话；
+    // 模型清单为空或保存失败时回落到原来的手动配置页，不把用户卡在中间态。
+    const configured = await autoConfigureAfterModels();
+    if (configured) {
+      logOnboarding('step-change', { previousPosition: loggedStep, currentPosition: { step: 'chat', keyIndex: null, modelIndex: wizard.modelIndex } });
+      return;
+    }
     openOnboardingModules();
   };
   render();
+}
+
+/**
+ * 引导一键配置：用户只填 API 密钥并勾选拉到的模型，这里把大脑与各项能力槽位一次配好，直接进对话。
+ * 依据只有本轮模型清单，规则如下：
+ *   1) 大脑：沿用当前模型；全新引导取第一个勾选的 API 模型，并保存为当前模型；
+ *   2) 看图：取第一个标记支持看图的模型，没有就让大脑兼任，保证看图槽不为空；
+ *   3) 总结、规划：跟大脑一致，避免首次对话缺模块；
+ *   4) 代码、审美：全部 API 模型做平等候选池，不带主备顺序。
+ * 生成类（画图、视频、3D、文档）不在这次自动范围，保持用户原有设置。
+ * @returns {Promise<boolean>} true 表示能力已保存且引导已完成；false 表示没有可用模型或保存失败，调用方回落到手动配置页。
+ */
+async function autoConfigureAfterModels() {
+  // 只看本轮引导里勾选的 API 模型；本地 GGUF 不参与自动分配
+  const apiModels = [];
+  for (const item of state.models || []) {
+    if (!item || item.type === 'local') continue;
+    if (!item.providerId) continue;
+    apiModels.push(item);
+  }
+  if (!apiModels.length) return false;
+  let brain = apiModels[0];
+  for (const item of apiModels) {
+    if (item.id === state.currentModelId) brain = item;
+  }
+  // 看图槽优先挑默认标记为能看图的模型，一个都没有就让大脑兼任
+  let visionModel = null;
+  for (const item of apiModels) {
+    if (item.vision === true) { visionModel = item; break; }
+  }
+  if (!visionModel) visionModel = brain;
+  const brainRef = parseCapRef('api:' + brain.id);
+  const visionRef = parseCapRef('api:' + visionModel.id);
+  const poolRefs = [];
+  for (const item of apiModels) poolRefs.push(parseCapRef('api:' + item.id));
+  const caps = { ...(state.capabilityDefaults || {}) };
+  // 只在槽位还没配过时填充：重开引导的用户已有选择原样保留，一键配置不覆盖用户手选的模型
+  if (!capValOf(caps.vision && caps.vision.primary)) caps.vision = { primary: visionRef, fallbacks: [] };
+  if (!capValOf(caps.summary && caps.summary.primary)) caps.summary = { primary: brainRef, fallbacks: [] };
+  if (!capValOf(caps.planning && caps.planning.primary)) caps.planning = { primary: brainRef, fallbacks: [] };
+  if (!codePoolRefs(caps.code).length) caps.code = { models: poolRefs };
+  if (!codePoolRefs(caps.aesthetic).length) caps.aesthetic = { models: poolRefs };
+  try {
+    state.capabilityDefaults = await api.saveCapabilityDefaults(caps);
+    await persistModels(brain.id);
+    await completeOnboarding();
+  } catch (err) {
+    // 保存失败时不吞错：交给调用方回落到手动配置页，用户还能用原来的流程补齐
+    console.warn('引导一键配置未完成，改用手动配置', err);
+    return false;
+  }
+  renderModelMenu();
+  closeModal();
+  showChat();
+  return true;
 }
 
 // 引导第三步：代码选择平等模型池，其余能力使用原有默认/备用配置；总结、代码、规划三项必选
@@ -1543,12 +1629,20 @@ function syncSendBtn() {
   });
 })();
 
+/**
+ * 停止指定标签页的当前轮次，并立即撤下尚未交付的插话处理标记。
+ * @param {object} tab 要停止的会话标签，未提供时直接返回。
+ * @returns {void} 仅向该标签的活轮次发送停止请求，当前页同步刷新。
+ */
 function abortTab(tab) {
   if (!tab) return;
   tab.aborting = true;
   // [铆钉优化] 只停本标签页这一轮；没有本轮编号就不发停止，免得把同窗口其他标签页一起停掉。其他 AI 请勿改回无参 chatAbort()
   if (tab.liveTurnId) api.chatAbort(tab.liveTurnId);
-  if (isActiveTab(tab)) scrollMessagesToBottom();
+  if (isActiveTab(tab)) {
+    if (tab.liveAssistant?.processingInterjectionIds?.length) renderMessages();
+    scrollMessagesToBottom();
+  }
 }
 
 // 采集当前输入框的未发送状态（草稿），用于误关界面后恢复
@@ -1779,8 +1873,13 @@ function persistTab(tab, force = false) {
   if ((!state.autoSave && !force) || !tab) return Promise.resolve();
   rememberComposer(tab);
   // 发送历史包含尚未开始的排队和插话；即使还没有消息，也须保存已经提交的正文。
-  if (!tab.messages?.length && !tab.composer && !submittedTextHistory(tab).length && !force) return Promise.resolve();
-  return api.saveSession({
+  if (!tab.messages?.length && !tab.composer && !submittedTextHistory(tab).length && !tab.queue?.length && !force) return Promise.resolve();
+  return api.saveSession(sessionData(tab));
+}
+
+/** 取得可序列化的会话正文和配置，供自动保存或进程内重连共用。 */
+function sessionData(tab) {
+  return {
     id: tab.id,
     title: tab.title,
     workspace: tab.workspace || state.workspace,
@@ -1793,16 +1892,16 @@ function persistTab(tab, force = false) {
     context: tab.context || emptyContext(),
     workingMemory: tab.workingMemory || emptyWorkingMemory(),
     contextSummary: tab.contextSummary || '',
+    queue: submittedQueue(tab.queue),
     modelId: tab.modelId || state.currentModelId,
     maxAgentRounds: tab.maxAgentRounds != null ? clampAgentRounds(tab.maxAgentRounds) : null,
     unlimitedRounds: !!tab.unlimitedRounds,
     composer: tab.composer || null,
     updatedAt: new Date().toISOString()
-  });
+  };
 }
 
-// [铆钉优化] 从磁盘恢复的会话里不可能还有正在跑的轮次：残留的「进行中」一律收成「已停止」，
-// 否则关掉界面再进来会一直显示「正在调用」。其他 AI 请勿删除
+/** 清理单纯磁盘存档中的过期运行标记；活轮次在启动时按主进程登记重新绑定。 */
 function settleDeadTurns(messages) {
   for (const m of messages || []) {
     if (!m || m.role !== 'assistant') continue;
@@ -1818,6 +1917,155 @@ function settleDeadTurns(messages) {
     m.revealLen = String(m.text || '').length;
   }
   return messages || [];
+}
+
+/**
+ * 把主进程仍留存的一轮接回当前界面；页面重载后靠它续上还在跑的轮次。
+ * @param {Array<object>} records 启动时按当前主窗身份取得的轮次记录。
+ * @returns {Promise<void>} 全部记录处理完（或没有可接回的记录）后返回。
+ * 不重发 chat:send、不重跑工具：事件从主进程留存的日志补齐，收工结果直接用原轮次回执。
+ */
+async function reattachRunningTurns(records) {
+  for (const record of records) await adoptRestoredTurn(record);
+}
+
+/**
+ * 接回单条轮次记录：把答复气泡重新挂成实时答复，再按序号补齐没处理过的事件。
+ * @param {object} record 主进程快照，含 turnId、tabId、events（带 seq）、是否收工与最终结果。
+ * @returns {Promise<boolean|void>} 按原标签和轮次绑定回复；本页已接管的轮次只处理一次。
+ * 从原对话快照恢复所属气泡与标签的发送状态；已完成时收尾并通知主进程释放。
+ */
+async function adoptRestoredTurn(record) {
+  if (documentTurns.has(record.turnId)) return;
+  let tab = state.tabs.find(function belongsToTurn(item) { return item.id === record.tabId; });
+  if (!tab && record.seed) {
+    // 渲染进程崩溃没有卸载事件，且关闭自动保存时，仍能从内存里取得发送时的原标签。
+    tab = hydrateTab({ ...record.seed, messages: [] }, record.seed.workspace);
+    tab.messages = record.seed.messages;
+    tab.queue = record.seed.queue;
+    tab.parallelTasks = record.seed.parallelTasks;
+    const current = activeSession();
+    state.tabs.push(tab);
+    if (!current || !current.messages.length) {
+      showChat();
+      await switchToTab(tab.id);
+    }
+  }
+  if (!tab) return false;
+  // 这个标签已经有一轮本页发起的活轮次时不动它，免得两轮抢同一份状态。
+  if (tab.sending && tab.liveTurnId && tab.liveTurnId !== record.turnId) return false;
+  if (!Array.isArray(tab.messages)) tab.messages = [];
+  let assistant = null;
+  for (const message of tab.messages) {
+    if (message && message.role === 'assistant' && message.turnId === record.turnId) {
+      assistant = message;
+      break;
+    }
+  }
+  if (!assistant && record.seed) {
+    // 磁盘会话可能早于这次发送，整条用户输入和回复一起从本轮起始状态补回。
+    tab.messages = record.seed.messages;
+    assistant = tab.messages.find(function ownReply(item) { return item.turnId === record.turnId && item.role === 'assistant'; });
+  }
+  if (!assistant) return false;
+  // 磁盘恢复会把残留的「进行中」收成「已停止」，这一轮其实还活着或刚结束：
+  // 先撤掉收停标记，状态由随后重放的事件和最终结果重新定性。
+  const savedReply = record.seed?.messages.find(function ownReply(item) { return item.role === 'assistant' && item.turnId === record.turnId; });
+  if (savedReply && (assistant.stopped || (savedReply.turnSeq || 0) > (assistant.turnSeq || 0))) {
+    // 磁盘恢复清过提问/停止状态；从发送时的气泡重放，才能恢复仍待用户回答的问题。
+    const index = tab.messages.indexOf(assistant);
+    tab.messages[index] = assistant = savedReply;
+    tab.parallelTasks = record.seed.parallelTasks;
+    tab.workingMemory = record.seed.workingMemory;
+  }
+  assistant.stopped = false;
+  if (assistant.status === t('stopped')) assistant.status = t('preparing');
+  documentTurns.add(record.turnId);
+  tab.liveTurnId = record.turnId;
+  tab.liveAssistant = assistant;
+  tab.sending = true;
+  tab.draining = true;
+  tab.lastChatEventAt = Date.now();
+  armStallWatch(tab);
+  if (isActiveTab(tab)) syncSendBtn();
+  // 重放主进程留存的日志：只补答复上 turnSeq 之后的事件。
+  // 游标每次现读（实时事件也可能在重放途中到达），已经处理过的绝不重复追加正文。
+  const events = Array.isArray(record.events) ? record.events : [];
+  for (const ev of events) {
+    if (typeof ev.seq !== 'number') continue;
+    if (ev.seq <= (Number(assistant.turnSeq) || 0)) continue;
+    onChatEvent(ev);
+  }
+  if (!record.finished) {
+    // 主进程还在跑：界面回到「正在调用」，后续实时事件继续走 onChatEvent。
+    renderTabs();
+    if (isActiveTab(tab)) {
+      renderMessages();
+      scrollMessagesToBottom();
+    }
+    // 新文档没有旧 chatSend 的 Promise，等待同一次执行的真实终态。
+    async function receiveOutcome() {
+      const terminal = await api.chatWaitTurn(record.turnId);
+      // 先补齐初始化间隙的增量，再用完整结果收尾，避免迟到片段重复追加在正文末尾。
+      await startupTurnDelivery.promise;
+      if (terminal.dropped || !state.tabs.includes(tab)) return;
+      await finishRestoredTurn(tab, assistant, { ...record, ...terminal });
+    }
+    receiveOutcome().catch(function report(error) { api.reportError('轮次收尾失败', String(error)); });
+    return true;
+  }
+  await finishRestoredTurn(tab, assistant, record);
+  return true;
+}
+
+/**
+ * 主进程已经收工（正常结束、停止或失败）的接回轮次按原轮次回执收尾。
+ * @param {object} tab 轮次所属标签。
+ * @param {object} assistant 这一轮的答复气泡。
+ * @param {object} record 主进程快照，outcome 为 success / stopped / error。
+ * @returns {Promise<void>} 按自动保存设置处理结果并确认消费；已有排队输入沿用原来的调度。
+ * 收尾步骤与 sendOne 的 finally 保持一致：解绑实时答复、恢复按钮、落盘，
+ * 最后通知主进程释放这份恢复数据，避免下次重载又把同一轮接回来。
+ */
+async function finishRestoredTurn(tab, assistant, record) {
+  const modelId = assistant.modelId || tab.modelId || state.currentModelId;
+  const outcome = record.outcome || 'success';
+  if (outcome === 'success') {
+    applyFinalResultToAssistant(tab, assistant, record.result, modelId, { skipMemory: record.resident });
+  } else if (outcome === 'stopped') {
+    // 停止的那一轮和原流程一样保留半截正文；输入框不由这里回填，避免盖掉重载后恢复的草稿。
+    finalizeStoppedTurn(assistant);
+  } else {
+    markTurnFailed(assistant, record.error || t('unknown'));
+  }
+  clearStallWatch(tab);
+  if (isActiveTab(tab)) {
+    flushLivePaint();
+    stopTypewriter();
+  }
+  if (outcome === 'success') finishTypewriter(assistant);
+  tab.sending = false;
+  tab.aborting = false;
+  tab.liveAssistant = null;
+  tab.liveTurnId = null;
+  delete tab.parallelTasks;
+  renderTabs();
+  if (isActiveTab(tab)) {
+    syncSendBtn();
+    renderMessages();
+    tab.scrollPos = null;
+    scrollMessagesToBottom();
+  }
+  if (record.resident) {
+    await api.longAliveFinish({ runId: record.runId, text: assistant.text, outcome, error: record.error,
+      messages: slimMessagesForSave(tab.messages.filter(isLongAliveMessage)) });
+  }
+  await persistTab(tab);
+  await api.chatRestoreConsumed(record.turnId);
+  documentTurns.delete(record.turnId);
+  tab.draining = false;
+  if (outcome === 'success' && !tab.waitingForTask && tabQueue(tab).length) await processQueue(tab);
+  retryHotReload();
 }
 
 function hydrateTab(data, fallbackWs) {
@@ -1843,7 +2091,8 @@ function hydrateTab(data, fallbackWs) {
 composer: data.composer || null,
     sending: false,
     aborting: false,
-    queue: [],
+    // 恢复用户手动排队的需求；旧存档没有队列时从空队列开始。
+    queue: data.queue || [],
     liveAssistant: null,
     liveTurnId: null,
     scrollPos: null,
@@ -1981,7 +2230,7 @@ async function switchToTab(id) {
 async function restoreLastSession(ws) {
   const items = await loadComposerSessions();
   const mine = items.filter((s) => sameWorkspace(s.workspace, ws));
-  const last = mine.find((s) => (s.messageCount || 0) > 0 || s.hasComposer) || mine[0];
+  const last = mine.find((s) => (s.messageCount || 0) > 0 || s.hasComposer || s.hasQueuedRequests) || mine[0];
   if (!last) {
     if (!state.tabs.some((t) => sameWorkspace(t.workspace, ws))) newTab();
     else {
@@ -2001,7 +2250,7 @@ async function restoreLastSession(ws) {
   }
   try {
     const data = await api.loadSession(last.id);
-    if (!data.messages?.length && !data.composer) {
+    if (!data.messages?.length && !data.composer && !data.queue?.length) {
       if (!state.tabs.some((t) => sameWorkspace(t.workspace, ws))) newTab();
       return;
     }
@@ -2110,7 +2359,7 @@ function persistOpenTabs() {
       modelId: tab.modelId, extraFolders: tab.extraFolders, context: tab.context,
       maxAgentRounds: tab.maxAgentRounds, unlimitedRounds: tab.unlimitedRounds,
       // 非空会话必须从会话存档恢复；存档已被其他窗口删除时不能复活成空白会话。
-      saved: !!(tab.messages?.length || tab.composer || submittedTextHistory(tab).length)
+      saved: !!(tab.messages?.length || tab.composer || submittedTextHistory(tab).length || tab.queue?.length)
     });
   }
   window.localStorage.setItem(state.sessionLayoutKey, JSON.stringify({ tabs, activeTab: state.activeTab }));
@@ -2120,20 +2369,28 @@ function persistOpenTabs() {
  * 冷启动时恢复本窗口上次打开的标签，不依赖只在热重载中存在的临时快照。
  * 无参数；按持久化顺序读取仍存在的会话，空白标签使用清单里的配置重建。
  * @returns {Promise<boolean>} 恢复并切换到原选中标签后返回 true；没有清单或可恢复标签时返回 false。
- * 已删除的非空会话不再打开；原选中会话已删除时选择剩余首项，读取失败继续交给现有错误通道。
+ * 跳过损坏或已删除的记录，仍恢复其他标签，必要时让项目入口创建新对话。
  */
 async function restoreOpenTabs() {
   const raw = window.localStorage.getItem(state.sessionLayoutKey);
   if (raw === null) return false;
-  const layout = JSON.parse(raw);
+  let layout;
+  try { layout = JSON.parse(raw); }
+  catch { return false; }
+  if (!Array.isArray(layout?.tabs)) return false;
   const items = await loadComposerSessions();
   const available = new Set();
   for (const item of items) available.add(item.id);
   const tabs = [];
   for (const entry of layout.tabs) {
+    if (!entry?.id) continue;
     if (entry.saved && !available.has(entry.id)) continue;
-    const data = available.has(entry.id) ? await api.loadSession(entry.id) : entry;
-    tabs.push(hydrateTab(data, entry.workspace));
+    try {
+      const data = available.has(entry.id) ? await api.loadSession(entry.id) : entry;
+      tabs.push(hydrateTab(data, entry.workspace));
+    } catch {
+      // 恢复单个标签失败时继续处理其余对话。
+    }
   }
   if (!tabs.length) return false;
   let selected = tabs[0];
@@ -2902,12 +3159,158 @@ function renderTodoCard(m) {
   return `<div class="todo-card"><div class="todo-head">To-dos ${list.length}</div><ul class="todo-list">${rows.join('')}</ul></div>`;
 }
 
+/**
+ * 展示本条回复的插话待办。
+ * 活轮次按请求进度显示「处理中」，已看回执与办理进度并列，停止或重开后仍按存档展示。
+ * @param {object} tab 保存工作记忆及当前回复的会话标签。
+ * @param {object} message 要展示的助手回复，按其轮次编号筛选插话。
+ * @returns {string} 插话卡片的 HTML，该回复没有插话时返回空字符串。
+ */
+function renderInterjectionCard(tab, message) {
+  const rows = [];
+  const processing = new Set();
+  if (message === tab.liveAssistant && message.thinkingOpen && !tab.aborting) {
+    for (const id of message.processingInterjectionIds || []) processing.add(id);
+    // 收到新插话只打断主会话，之前已经派出的子代理仍在办理各自的插话。
+    for (const task of tab.parallelTasks || []) {
+      if (task.status !== 'running') continue;
+      for (const id of task.interjectionIds || []) processing.add(id);
+    }
+  }
+  for (const item of tab.workingMemory?.interjectionTodos || []) {
+    if (item.turnId !== message.turnId) continue;
+    let style = 'todo-pending';
+    let label = t('interjectionPending');
+    if (item.status === 'completed') {
+      style = 'todo-completed';
+      label = t('interjectionDone');
+    } else if (processing.has(item.id)) {
+      style = 'todo-in_progress todo-running';
+      label = t('interjectionProcessing');
+    }
+    if (item.seen) label = t('interjectionSeen') + ' · ' + label;
+    // 每个独立分支交付时，将原文、结果和办理状态保存在同一行；工作台收起后仍可核对。
+    const receipt = item.result ? '<br><span class="interjection-result">' + escapeHtml(item.result) + '</span>' : '';
+    rows.push(`<li class="todo-item ${style}" data-interjection-id="${escapeHtml(item.id)}"><span class="todo-mark"></span><span><span class="todo-text"><strong>${escapeHtml(label)}</strong>　${escapeHtml(item.text)}</span>${receipt}</span></li>`);
+  }
+  if (!rows.length) return '';
+  return `<div class="todo-card interjection-todo-card"><div class="todo-head">${t('interjectionTodoTitle')} · ${rows.length}</div><ul class="todo-list">${rows.join('')}</ul></div>`;
+}
+
+/**
+ * 将插话同步到所属标签的工作记忆，重复回执按唯一编号更新。
+ * @param {object} tab 接收回执的会话标签。
+ * @param {Array<object>} items 按编号同步的完整插话记录，含轮次、办理状态和已确认的已看回执。
+ * @returns {void} 安排保存并刷新当前页；同轮新插话会清除上一批的临时处理标记。
+ * 合并时保留内存里已有的已看和终态，后台回复带来的旧清单不能把状态改回去。
+ */
+function applyInterjectionTodos(tab, items) {
+  const memory = tab.workingMemory || emptyWorkingMemory();
+  const current = Array.isArray(memory.interjectionTodos) ? memory.interjectionTodos : [];
+  const byId = new Map();
+  for (const item of current) byId.set(item.id, item);
+  for (const item of items) {
+    if (!item || !item.id) continue;
+    // 新收件打断上一批未交付的处理，待模型确认下一批编号时再显示。
+    if (!byId.has(item.id) && item.status === 'pending' && tab.liveAssistant?.turnId === item.turnId) {
+      delete tab.liveAssistant.processingInterjectionIds;
+    }
+  }
+  tab.workingMemory = {
+    ...memory,
+    interjectionTodos: mergeInterjectionItems(current, items)
+  };
+  scheduleStreamSave(tab);
+  if (isActiveTab(tab)) renderMessages();
+}
+
+/**
+ * 把重启只读核对的回执按编号合进标签，并立刻落盘。
+ * @param {object} tab 核对结果所属标签。
+ * @param {{seenIds: string[], acknowledgedIds: string[]}} receipt 模型实际看到的编号，以及已满足知悉要求的编号。
+ * @returns {Promise<void>} 按当前自动保存设置写回原标签，保留等待期间的消息与草稿。
+ */
+function applyRestartReviewReceipt(tab, receipt) {
+  const memory = tab.workingMemory || emptyWorkingMemory();
+  const items = applyRestartReceipt(memory.interjectionTodos || [], receipt);
+  tab.workingMemory = { ...memory, interjectionTodos: items };
+  return persistTab(tab);
+}
+
+/**
+ * 生成重启只读核对的状态卡片，不属于任何一条对话消息。
+ * @param {object} tab 会话标签。
+ * @returns {string} 状态卡片的 HTML；该标签没有重启核对状态时返回空字符串。
+ * 卡片只展示核对进度、统计和失败原因，不改写消息列表，也不伪造用户对话。
+ */
+function restartReviewCardHtml(tab) {
+  const review = tab && tab.restartReview;
+  if (!review) return '';
+  const counts = review.counts || {};
+  const rows = [];
+  if (review.state === 'running') {
+    rows.push(`<div class="restart-review-line">${escapeHtml(t('restartReviewRunning'))}</div>`);
+  } else if (review.state === 'failed') {
+    rows.push(`<div class="restart-review-line restart-review-error">${escapeHtml(t('restartReviewFailed'))}：${escapeHtml(review.detail || '')}</div>`);
+  } else if (review.state === 'done') {
+    rows.push(`<div class="restart-review-line">${escapeHtml(t('restartReviewCounts', {
+      todos: Number(counts.todos) || 0,
+      interjections: Number(counts.interjections) || 0,
+      questions: Number(counts.openQuestions) || 0,
+      interrupted: Number(counts.interrupted) || 0
+    }))}</div>`);
+    if (review.summary) rows.push(`<div class="restart-review-line">${escapeHtml(review.summary)}</div>`);
+    // 查看回执只更新已看；卡片统计沿用模型实际收到的清单。
+  }
+  if (!rows.length) return '';
+  return `<div class="todo-card restart-review-card restart-review-${escapeHtml(review.state || '')}">`
+    + `<div class="todo-head">${escapeHtml(t('restartReviewTitle'))}</div>${rows.join('')}</div>`;
+}
+
+/**
+ * 为本次启动捕获各标签的未办事项。文档刷新时接回主进程里的同一批查看回执。
+ * @param {Array<object>} openTurns 已有在跑或待接回的轮次；这些标签继续走原发送流程。
+ * @returns {Promise<void>} 等待各标签各自的查看结果，期间仍可切标签、输入和聊天。
+ */
+async function startRestartPendingReview(openTurns) {
+  const attached = new Set();
+  for (const turn of openTurns) attached.add(turn.tabId);
+  const requests = [];
+  for (const tab of state.tabs) {
+    if (attached.has(tab.id) || tab.sending) continue;
+    const view = collectPendingReview(tab);
+    if (view) requests.push({ tabId: tab.id, modelId: tab.modelId || state.currentModelId,
+      lang: getLocale(), workspace: tab.workspace, view });
+  }
+  const ids = await api.beginRestartReview(requests);
+  await Promise.all(ids.map(receive));
+
+  /** 将本标签的回执写回当下仍打开的会话，关闭或删除的标签不重建。 */
+  async function receive(id) {
+    const tab = state.tabs.find(function match(item) { return item.id === id; });
+    if (!tab) return;
+    tab.restartReview = { state: 'running' };
+    if (isActiveTab(tab)) renderMessages();
+    const result = await api.restartReview(id);
+    if (!state.tabs.includes(tab)) return;
+    if (result.ok) {
+      if (result.seenIds.length) await applyRestartReviewReceipt(tab, result);
+      tab.restartReview = { state: 'done', counts: result.counts, summary: result.summary };
+    } else {
+      tab.restartReview = { state: 'failed', detail: result.detail };
+      api.reportError('重启只读核对失败', JSON.stringify({ tabId: id, detail: result.detail }));
+    }
+    if (isActiveTab(tab)) renderMessages();
+  }
+}
+
+/** 原位更新普通任务清单，保留同一条回复上的插话待办。 */
 function paintTodoCard(tab, m) {
   const idx = tab.messages.indexOf(m);
   const el = idx >= 0 && document.querySelector(`.msg.assistant[data-msg-i="${idx}"]`);
   if (!el) return;
   const html = renderTodoCard(m);
-  const old = el.querySelector(':scope > .todo-card');
+  const old = el.querySelector(':scope > .todo-card:not(.interjection-todo-card)');
   if (old) {
     if (html) old.outerHTML = html; else old.remove();
     return;
@@ -3357,7 +3760,8 @@ function renderMessages(switching = false) {
   paintImageCanvas();
   box.classList.toggle('empty-center', msgs.length === 0);
   if (!msgs.length) {
-    box.innerHTML = '';
+    // 空会话也能看到重启核对进度/失败原因，提示卡片独立于消息列表。
+    box.innerHTML = restartReviewCardHtml(tab);
     // 空会话也必须清除上个会话的媒体缓存和播放器引用。
     loadMediaPreviews(box, api, state.workspace, mediaPlayers);
     reportStartReady(tab, false, []);
@@ -3387,7 +3791,7 @@ function renderMessages(switching = false) {
     group.push(index);
     interjections.set(index, group);
   }
-  box.innerHTML = earlier + msgs.slice(start).map((m, offset) => {
+  box.innerHTML = earlier + restartReviewCardHtml(tab) + msgs.slice(start).map((m, offset) => {
     const i = start + offset;
     if (m.role === 'tool-note') return '';
     const entries = interjections.get(i);
@@ -3489,7 +3893,7 @@ function renderMessages(switching = false) {
           ${entries ? '' : `<button class="msg-fork" data-fork="${i}" title="${t('forkTitle')}">${t('fork')}</button>`}
         </span>
       </div>
-      ${m.role === 'assistant' ? renderThink(m, i) : ''}${m.role === 'assistant' ? renderTodoCard(m) : ''}${priorReplies}${bubble}${mediaCardsHtml(m, escapeHtml)}${artifactCardsHtml(m)}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, planIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
+      ${m.role === 'assistant' ? renderThink(m, i) : ''}${m.role === 'assistant' ? renderTodoCard(m) + renderInterjectionCard(tab, m) : ''}${priorReplies}${bubble}${mediaCardsHtml(m, escapeHtml)}${artifactCardsHtml(m)}${renderUsageLine(m)}${zb}${m.role === 'assistant' ? renderAskCard(m) : ''}${m.role === 'assistant' ? renderStartGo(m, i, lastIdx, planIdx, tab) : ''}${m.stopped ? `<div class="stopped-note">${escapeHtml(t('stoppedHint'))}</div>` : ''}${extra}
     </div>`;
   }).join('');
   loadMediaPreviews(box, api, state.workspace, mediaPlayers);
@@ -3824,6 +4228,12 @@ function addSkillToStack(id) {
   setSkillStack([...skillStack(), id]);
 }
 
+/** 返回当前聊天模式的技能简介，用于列表显示和斜杠菜单搜索。 */
+function currentSkillDescription(skill) {
+  return (state.desktopAlive ? skill.agiDesc : skill.desc) || '';
+}
+
+/** 构建技能管理和侧栏共用的条目，两个编辑按钮分别打开对应版本。 */
 function skillListHtml(skills) {
   if (!skills.length) return `<div class="hint">${t('noSkills')}</div>`;
   return skills.map((s, i) => {
@@ -3839,9 +4249,10 @@ function skillListHtml(skills) {
       <span class="pri">${pri}</span>
       <button type="button" class="skill-li-name" data-skill="${s.id}" title="/${escapeHtml(rawName)}">/${escapeHtml(label)}</button>
       <span class="scope-tag">${scope}</span>
-      <span class="desc">${escapeHtml(clipText(String(s.desc || ''), 80))}</span>
+      <span class="desc">${escapeHtml(clipText(currentSkillDescription(s), 80))}</span>
       ${covered ? `<span class="covered-tag">${t('covered')}</span>` : ''}
-      <button type="button" class="skill-edit" data-edit-skill="${s.id}" data-edit-scope="${s.scope || 'app'}" data-open-skill="${s.id}" data-open-scope="${s.scope || 'app'}">${t('edit')}</button>
+      <button type="button" class="skill-edit" data-edit-skill="${escapeHtml(s.id)}" data-skill-mode="normal" data-edit-scope="${s.scope || 'app'}" data-open-skill="${escapeHtml(s.id)}" data-open-scope="${s.scope || 'app'}">${t('skillNormalVersion')}</button>
+      <button type="button" class="skill-edit" data-edit-skill="${escapeHtml(s.id)}" data-skill-mode="agi" data-edit-scope="${s.scope || 'app'}" data-open-skill="${escapeHtml(s.id)}" data-open-scope="${s.scope || 'app'}">${t('skillAgiVersion')}</button>
     </div>`;
   }).join('');
 }
@@ -4775,6 +5186,45 @@ function restoreStoppedDraft(tab, assistant) {
 }
 
 /**
+ * 把主进程这一轮的最终回执写回答复气泡。
+ * @param {object} tab 结果所属标签。
+ * @param {object} assistant 本轮答复气泡。
+ * @param {object} result 主进程 chat:send 的返回值，含正文、改动、快照、记忆与总结。
+ * @param {string} modelId 本轮使用的模型，用于补对话序号。
+ * @param {object} options skipMemory 为真表示后台常驻轮次不写会话记忆与总结。
+ * @returns {void} 只改内存状态，落盘时机由调用方决定。
+ * 普通发送和页面重载后的接回收尾共用这一份，避免两处写法漂移。
+ */
+function applyFinalResultToAssistant(tab, assistant, result, modelId, options) {
+  const skipMemory = !!(options && options.skipMemory);
+  if (typeof result.taskPending === 'boolean') {
+    tab.waitingForTask = result.taskPending;
+    assistant.taskPending = result.taskPending;
+  }
+  assistant.text = result.text || assistant.text;
+  if (result.zbaingMeta) assistant.zbaing = result.zbaingMeta;
+  assistant.changes = result.changes || [];
+  assistant.snapshotId = result.snapshotId;
+  assistant.milestoneHits = localMilestoneHits(assistant.changes);
+  assistant.status = '';
+  assistant.thinkingOpen = false;
+  assistant.askPending = false;
+  assistant.ask = null;
+  revealRest(assistant);
+  if (skipMemory) return;
+  if (result.workingMemory) {
+    // 后台答复常驻轮次带来的记忆快照可能比重启核对旧，插话按编号合并保住已看和终态。
+    const incoming = result.workingMemory.interjectionTodos;
+    const merged = Array.isArray(incoming)
+      ? mergeInterjectionItems(tab.workingMemory?.interjectionTodos, incoming)
+      : tab.workingMemory?.interjectionTodos;
+    tab.workingMemory = { ...result.workingMemory, interjectionTodos: merged || [] };
+  }
+  if (result.contextSummary != null) tab.contextSummary = result.contextSummary;
+  fillDialogIndex(tab, assistant, modelId);
+}
+
+/**
  * 发送指定会话队列中的一条任务并维护回复状态。
  * @param {object} tab 本条任务所属的标签；所有消息、编辑状态与持久化结果只写入该标签。
  * @param {string} text 入队时固定的任务正文。
@@ -4887,7 +5337,7 @@ async function sendOne(tab, text, draft) {
     contextPaths: [...(draft.contextPaths || [])],
     attachments: [...atts],
     modelId,
-    workingMemory: resident ? emptyWorkingMemory() : (tab.workingMemory || emptyWorkingMemory()),
+    workingMemory: resident ? { ...emptyWorkingMemory(), interjectionTodos: tab.workingMemory?.interjectionTodos || [] } : (tab.workingMemory || emptyWorkingMemory()),
     contextSummary: resident ? '' : (tab.contextSummary || ''),
     longAliveRunId: resident ? draft.runId : undefined,
     workspace: tab.workspace || state.workspace,
@@ -4929,8 +5379,10 @@ async function sendOne(tab, text, draft) {
   let aborted = false;
   let residentError = '';
   try {
-    // 覆盖值随本条队列载荷进入请求，不消费其他标签或后续输入的提示词。
-    const result = await api.chatSend(payload);
+    // 开工时将已出队的需求与其回复一起存档，重启只查看尚未交付的部分。
+    if (!background) persistTab(tab);
+    documentTurns.add(turnId);
+    const result = await api.chatSend(payload, { ...sessionData(tab), queue: tab.queue });
     if (isStopError(null, tab)) {
       if (isActiveTab(tab)) {
         flushLivePaint();
@@ -4941,22 +5393,8 @@ async function sendOne(tab, text, draft) {
       aborted = true;
     } else {
       logSummaryTrace('收到总结最终结果', tab, assistant, { finalTextLength: String(result.text || '').length });
-      if (typeof result.taskPending === 'boolean') tab.waitingForTask = result.taskPending;
-      assistant.text = result.text || assistant.text;
-      if (result.zbaingMeta) assistant.zbaing = result.zbaingMeta;
-      assistant.changes = result.changes || [];
-      assistant.snapshotId = result.snapshotId;
-      assistant.milestoneHits = localMilestoneHits(assistant.changes);
-      assistant.status = '';
-      assistant.thinkingOpen = false;
-      assistant.askPending = false;
-      assistant.ask = null;
-      revealRest(assistant);
-      if (!resident) {
-        if (result.workingMemory) tab.workingMemory = result.workingMemory;
-        if (result.contextSummary != null) tab.contextSummary = result.contextSummary;
-        fillDialogIndex(tab, assistant, modelId);
-      }
+      // 常驻后台轮次不写会话记忆与总结，其余与普通发送完全一致
+      applyFinalResultToAssistant(tab, assistant, result, modelId, { skipMemory: resident });
     }
   } catch (e) {
     if (isStopError(e, tab)) {
@@ -5007,7 +5445,10 @@ async function sendOne(tab, text, draft) {
         error: residentError, messages: slimMessagesForSave(tab.messages.filter(isLongAliveMessage))
       });
     }
-    persistTab(tab);
+    await persistTab(tab);
+    // 本页按自动保存设置处理最终回执后，主进程才释放记录。
+    await api.chatRestoreConsumed(turnId);
+    documentTurns.delete(turnId);
   }
   return !aborted && !assistant.errorShown && !tab.waitingForTask;
 }
@@ -5774,6 +6215,7 @@ async function openPromptPreview() {
     const sysOverrides = {
       persona: $('ov-persona').value,
       rules,
+      skillMode: editable.skill?.mode,
       skill: editable.skill ? $('ov-skill').value : ''
     };
     closeModal();
@@ -5809,33 +6251,34 @@ function scheduleStreamSave(tab) {
   // [铆钉优化] 流式存盘间隔拉长到 5 秒，减少大对话反复序列化。其他 AI 请勿改回 1.5 秒
   tab._streamSaveTimer = setTimeout(() => {
     tab._streamSaveTimer = null;
+    if (tab.sending && tab.liveAssistant?.turnSeq) {
+      const index = tab.messages.indexOf(tab.liveAssistant);
+      api.checkpointTurn(tab.liveTurnId, { messages: tab.messages.slice(index), queue: tab.queue,
+        parallelTasks: tab.parallelTasks, workingMemory: tab.workingMemory });
+    }
     persistMessages(tab);
   }, 5000);
 }
 
+/** 流式保存与普通保存使用同一份会话数据，将排队需求和本标签模型一并保存。 */
 async function persistMessages(tab) {
-  if (!state.autoSave || !tab) return;
-  if (!tab.messages?.length) return;
-  rememberComposer(tab);
-  return api.saveSession({
-    id: tab.id,
-    title: tab.title,
-    workspace: tab.workspace || state.workspace,
-    extraFolders: extraFoldersOf(tab),
-    messages: slimMessagesForSave(tab.messages),
-    submittedTextHistory: submittedTextHistory(tab),
-    dialogRoundSeq: tab.dialogRoundSeq || 0,
-    contextRevision: tab.contextRevision || '',
-    undone: tab.undone || [],
-    context: tab.context || emptyContext(),
-    workingMemory: tab.workingMemory || emptyWorkingMemory(),
-    contextSummary: tab.contextSummary || '',
-    composer: tab.composer || null,
-    updatedAt: new Date().toISOString()
-  });
+  if (!state.autoSave || !tab?.messages?.length) return;
+  return persistTab(tab);
 }
 
+/**
+ * 将聊天事件分发到所属轮次，更新回复内容和界面状态。
+ * @param {object} ev 主进程事件，type 指定事件类型，轮次状态可携带正在处理的插话编号。
+ * @returns {void} 更新对应标签及可见界面，重复的有序事件直接跳过。
+ */
 function onChatEvent(ev) {
+  // 对所有有序事件统一去重，包含在普通气泡处理前返回的用量和状态事件。
+  if (typeof ev.seq === 'number' && ev.turnId) {
+    const owner = findTabByTurnId(ev.turnId);
+    const message = owner?.messages.find(function sameReply(item) { return item.role === 'assistant' && item.turnId === ev.turnId; });
+    if (!message || ev.seq <= (message.turnSeq || 0)) return;
+    message.turnSeq = ev.seq;
+  }
   if (ev.type === 'theme') {
     applyTheme(ev.theme);
     return;
@@ -5869,6 +6312,11 @@ function onChatEvent(ev) {
   }
   const tab = (ev.turnId && (findTabByTurnId(ev.turnId) || state.tabs.find((t) => t.liveTurnId === ev.turnId)))
     || (!ev.turnId ? activeSession() : null);
+  // 已收件的条目即使紧接着停止也要写入原会话，并保留未完成状态。
+  if (tab && ev.type === 'interjection_todos') {
+    applyInterjectionTodos(tab, ev.items);
+    return;
+  }
   if (!tab || (tab.aborting && ev.type !== 'image_generation')) return;
   const last = (ev.turnId
     ? tab.messages.find((m) => m.role === 'assistant' && m.turnId === ev.turnId)
@@ -5884,7 +6332,10 @@ function onChatEvent(ev) {
     if (!ev.turnId || ev.turnId !== tab.liveTurnId) return;
     if ((ev.workspace || tab.workspace) && !sameWorkspace(ev.workspace, tab.workspace)) return;
     tab.parallelTasks = ev.tasks;
-    if (touchUi) renderParallelTasks();
+    if (touchUi) {
+      renderParallelTasks();
+      if (ev.tasks.some(function hasFollowup(task) { return task.interjectionIds?.length; })) renderMessages();
+    }
   } else if (ev.type === 'interjection_reply_boundary') {
     // 续接前留存已收到的正文；后续重写、总结和最终结果只更新当前答复。
     if (!last.text) return;
@@ -5921,6 +6372,12 @@ function onChatEvent(ev) {
   } else if (ev.type === 'status') {
     last.thinkingOpen = true;
     last.status = ev.text;
+    if (ev.processingInterjectionIds) {
+      // 活轮次检查点保留本批编号，收尾和冷启动只按插话账本展示。
+      last.processingInterjectionIds = ev.processingInterjectionIds;
+      scheduleStreamSave(tab);
+      if (touchUi) renderMessages();
+    }
     if (ev.activeModel) {
       last.activeModel = ev.activeModel;
       last.activeRole = ev.activeRole || '';
@@ -6023,7 +6480,13 @@ function onChatEvent(ev) {
         last.todos = todos;
         if (touchUi) paintTodoCard(tab, last);
       }
-      tab.workingMemory = ev.workingMemory;
+      // 插话按编号与内存合并：后台回复携带的旧快照不能抹掉重启核对写下的已看/已处理。
+      const currentInterjections = tab.workingMemory?.interjectionTodos;
+      const incomingInterjections = ev.workingMemory.interjectionTodos;
+      const mergedInterjections = Array.isArray(incomingInterjections)
+        ? mergeInterjectionItems(currentInterjections, incomingInterjections)
+        : currentInterjections;
+      tab.workingMemory = { ...ev.workingMemory, interjectionTodos: mergedInterjections || [] };
     }
   } else if (ev.type === 'context_compacted') {
     last.thinkingOpen = true;
@@ -6047,7 +6510,8 @@ function onChatEvent(ev) {
     // 随助手气泡保存已完成标记，重开会话后裸「继续」也不会重启已交付任务。
     if (typeof ev.taskSettled === 'boolean') last.taskSettled = ev.taskSettled;
     if (ev.workingMemory) {
-      tab.workingMemory = ev.workingMemory;
+      tab.workingMemory = { ...ev.workingMemory,
+        interjectionTodos: mergeInterjectionItems(tab.workingMemory?.interjectionTodos, ev.workingMemory.interjectionTodos) };
       // 完成事件携带最终任务状态时，同步本条已有清单；历史快照不改写。
       if (last.todos) last.todos = Array.isArray(ev.workingMemory.todos) ? ev.workingMemory.todos : [];
     }
@@ -6099,13 +6563,13 @@ function onChatEvent(ev) {
 
 function showSlash(filter) {
   const q = (filter || '').toLowerCase();
-  const items = uniqueSkills().filter((s) => !q || s.name.toLowerCase().includes(q) || (s.desc || '').toLowerCase().includes(q));
+  const items = uniqueSkills().filter((s) => !q || s.name.toLowerCase().includes(q) || currentSkillDescription(s).toLowerCase().includes(q));
   const el = $('slash-menu');
   el.classList.remove('hidden');
   el.innerHTML = (items.length
     ? items.map((s) => {
       const on = skillStack().includes(s.id);
-      return `<button data-pick-skill="${s.id}"><span class="on-mark">${on ? '✓' : ''}</span><b>/${escapeHtml(s.name)}</b><div class="desc">${escapeHtml(s.desc || '')}</div></button>`;
+      return `<button data-pick-skill="${s.id}"><span class="on-mark">${on ? '✓' : ''}</span><b>/${escapeHtml(s.name)}</b><div class="desc">${escapeHtml(currentSkillDescription(s))}</div></button>`;
     }).join('')
     : `<button disabled>${t('noSkillMatch')}</button>`)
     + `<div class="sep"></div><button data-new-skill="1">${t('skillNew')}</button>`;
@@ -6208,12 +6672,16 @@ function openSsh() {
   };
 }
 
-function openSkillEditor(skill) {
+/**
+ * 打开一个版本的技能编辑器。已有技能由入口指定版本，新建时使用当前聊天模式。
+ * 同一技能共用名称和作用域。正文与 YAML 简介仅保存到当前版本。
+ */
+function openSkillEditor(skill, mode = state.desktopAlive ? 'agi' : 'normal') {
   const isNew = !skill;
   const scope = skill?.scope || (state.workspace ? 'workspace' : 'app');
-  const body = skill?.body || `# 新技能\n\n什么时候用：\n\n要怎么做：\n1. \n`;
+  const body = mode === 'agi' ? (skill?.agiBody || '') : (skill?.body ?? `# 新技能\n\n什么时候用：\n\n要怎么做：\n1. \n`);
   openModal(`<div class="modal-card-inner">
-    <h3>${isNew ? t('skillNew') : t('skillEdit')}</h3>
+    <h3>${isNew ? t('skillNew') : t('skillEdit')} · ${t(mode === 'agi' ? 'skillAgiVersion' : 'skillNormalVersion')}</h3>
     <label>${t('skillName')}</label>
     <input id="m-sid" value="${escapeHtml(skill?.id || '')}" placeholder="${t('skillIdPh')}" />
     <label>${t('scope')}</label>
@@ -6223,9 +6691,9 @@ function openSkillEditor(skill) {
     </select>
     <label>${t('skillBody')}</label>
     <textarea id="m-body">${escapeHtml(body)}</textarea>
-    <p class="hint">${t('skillHint')}</p>
+    <p class="hint">${t('skillVersionHint')}</p>
     <div class="modal-actions">
-      ${isNew ? '' : `<button class="danger" id="m-del">${t('delete')}</button>`}
+      ${isNew ? '' : `<button class="danger" id="m-del">${t('deleteWholeSkill')}</button>`}
       <button id="m-cancel">${t('cancel')}</button>
       <button class="primary" id="m-save">${t('save')}</button>
     </div>
@@ -6238,6 +6706,7 @@ function openSkillEditor(skill) {
       state.skills = await api.saveSkill({
         id: $('m-sid').value.trim(),
         body: $('m-body').value,
+        mode,
         scope: $('m-scope').value,
         oldId: skill?.id || ''
       });
@@ -6292,7 +6761,7 @@ async function openSkillManager() {
     if (!id) return;
     e.stopPropagation();
     const skill = state.skills.find((s) => s.id === id && (s.scope || 'app') === scope);
-    openSkillEditor(skill || { id, scope, body: '', desc: id });
+    openSkillEditor(skill, e.target.closest('[data-open-skill]').dataset.skillMode);
   };
 }
 
@@ -6331,10 +6800,12 @@ function openPersonaEditor() {
   };
 }
 
+/** 编辑选定规则；全局 AGI 正文可清空，保留用户保存的原文。 */
 function openRuleEditor(rule) {
   const isNew = !rule;
   const scope = rule?.scope || (state.workspace ? 'workspace' : 'app');
-  const body = rule?.body || `# 规则名\n\n（写这条规则的内容）\n`;
+  const manualAgi = rule?.scope === 'app' && rule.id === 'agi';
+  const body = manualAgi ? rule.body : rule?.body || `# 规则名\n\n（写这条规则的内容）\n`;
   openModal(`<div class="modal-card-inner">
     <h3>${isNew ? t('ruleNew') : t('ruleEdit')}</h3>
     <label>${t('ruleName')}</label>
@@ -6346,7 +6817,7 @@ function openRuleEditor(rule) {
     </select>
     <label>${t('ruleBodyLabel')}</label>
     <textarea id="m-rbody">${escapeHtml(body)}</textarea>
-    <p class="hint">${t('ruleHint')}</p>
+    <p class="hint">${t(manualAgi ? 'agiRuleHint' : 'ruleHint')}</p>
     <div class="modal-actions">
       ${isNew ? '' : `<button class="danger" id="m-rdel">${t('delete')}</button>`}
       <button id="m-cancel">${t('cancel')}</button>
@@ -6386,7 +6857,9 @@ function openRuleEditor(rule) {
   }
 }
 
-function openRuleManager() {
+/** 打开前从磁盘刷新清单，使刚手动保存的规则在编辑器中可见。 */
+async function openRuleManager() {
+  state.rules = await api.listRules();
   openModal(`<h3>${t('manageRules')}</h3>
     <div class="side-list" id="m-rule-list">${ruleListHtml()}</div>
     <div class="modal-actions">
@@ -8405,6 +8878,8 @@ function bind() {
     state.contextPaths = [];
     renderChips();
     $('input').focus();
+    persistTab(tab);
+    renderTabs();
     renderQueue();
   };
   $('queue').onclick = (e) => {
@@ -8417,13 +8892,16 @@ function bind() {
       if (qitem != null) {
         qlist.splice(qi, 1);
         refillQueueItem(qitem);
+        persistTab(qtab);
         renderQueue();
       }
       return;
     }
     const idx = e.target.getAttribute('data-rm-queue');
     if (idx == null) return;
-    tabQueue(activeSession()).splice(Number(idx), 1);
+    const tab = activeSession();
+    tabQueue(tab).splice(Number(idx), 1);
+    persistTab(tab);
     renderQueue();
   };
   $('btn-model').onclick = async (e) => {
@@ -8521,7 +8999,7 @@ function bind() {
     const editScope = e.target.closest('[data-edit-skill]')?.getAttribute('data-edit-scope');
     if (editId) {
       const skill = state.skills.find((s) => s.id === editId && (s.scope || 'app') === editScope);
-      openSkillEditor(skill || { id: editId, scope: editScope, body: '' });
+      openSkillEditor(skill, e.target.closest('[data-edit-skill]').dataset.skillMode);
       return;
     }
     const skill = e.target.closest('[data-skill]')?.getAttribute('data-skill');
@@ -8591,6 +9069,7 @@ function bind() {
       btn.classList.toggle('on', !!state.desktopAlive);
       btn.setAttribute('aria-pressed', state.desktopAlive ? 'true' : 'false');
     }
+    renderSidebar();
     syncSendBtn();
   });
 
@@ -9321,7 +9800,26 @@ function bind() {
   });
 }
 
-api.onChatEvent(onChatEvent);
+// 初始化时先恢复主进程快照，再将过渡期间到达的事件去重后接上。
+const documentTurns = new Set();
+const startupTurnDelivery = Promise.withResolvers();
+let startupTurnEvents = [];
+/** 新页面就绪前暂存聊天事件，用于跨越恢复 IPC 和渲染器之间的时间差。 */
+function receiveChatEvent(event) {
+  if (startupTurnEvents && event.turnId) startupTurnEvents.push(event);
+  else onChatEvent(event);
+}
+api.onChatEvent(receiveChatEvent);
+/** 在途主窗卸载时将草稿、队列与已处理的序号交给原主进程，仅存内存。 */
+function stageRunningWindow() {
+  for (const tab of state.tabs) {
+    if (tab.sending || tab.draining) {
+      api.stageTurnWindow(collectWindowSnapshot(0));
+      return;
+    }
+  }
+}
+window.addEventListener('beforeunload', stageRunningWindow);
 const unsubscribeHotReload = api.onHotReload(receiveHotReload);
 /** 页面重载后只保留新文档的更新监听，避免旧页面重复处理通知。 */
 function releaseHotReloadListener() { unsubscribeHotReload(); }
@@ -9428,9 +9926,11 @@ api.onIndexProgress(paintIndexCard);
   state.persona = persona || '';
   state.globalMemory = globalMemory;
   const onboardingCompleted = await restoreOnboardingCompletion(s);
+  // 先取权威清单，无自动存档的窗口也可直接打开原标签，不另建空会话。
+  const openTurns = api.chatRestoreTurn ? await api.chatRestoreTurn() : [];
   let hotReloadSnapshot = null;
   try {
-    hotReloadSnapshot = s.codeReloadSnapshot || takeHotReloadSnapshot(window.sessionStorage);
+    hotReloadSnapshot = s.codeReloadSnapshot || s.turnWindowSnapshot || takeHotReloadSnapshot(window.sessionStorage);
   } catch (error) {
     showHotReloadStatus('热重载状态恢复失败：' + String(error.message || error), true);
     reportHotReloadError('热重载状态恢复失败', { message: String(error.message || error) });
@@ -9441,6 +9941,9 @@ api.onIndexProgress(paintIndexCard);
     if (s.codeReloadSnapshot) await api.hotReloadRestored();
     syncAgentBtn();
   } else if (onboardingCompleted && await restoreOpenTabs()) {
+    syncAgentBtn();
+  } else if (openTurns.length) {
+    showChat();
     syncAgentBtn();
   } else if (s.workspace && onboardingCompleted) {
     await Promise.all([refreshMeta(), showProjectSession(s.workspace)]);
@@ -9456,6 +9959,22 @@ api.onIndexProgress(paintIndexCard);
   if (!composerSessionsLoaded) await loadComposerSessions();
   refreshComposerRequirements();
   syncRoundsInput(activeSession());
+  // 页面重载（热重载或真实刷新）后，把主进程里仍在跑、或刚跑完但界面还没消费的轮次接回来。
+  // 只在本窗口的标签上接，不重发发送请求，也不重跑工具。
+  await reattachRunningTurns(openTurns);
+  if (openTurns.length && !hotReloadSnapshot && s.turnActiveTab !== state.activeTab &&
+      state.tabs.some(function wasSelected(tab) { return tab.id === s.turnActiveTab; })) {
+    await switchToTab(s.turnActiveTab);
+  }
+  const queuedEvents = startupTurnEvents;
+  startupTurnEvents = null;
+  for (const event of queuedEvents) onChatEvent(event);
+  startupTurnDelivery.resolve();
+  if (s.turnWindowSnapshot) api.turnWindowRestored();
+  // 完成原轮次接回后，只查看进程启动时恢复的标签；模型等待不阻塞输入与导航。
+  if (s.reviewOnStartup) startRestartPendingReview(openTurns).catch(function reportRestartReviewError(error) {
+    api.reportError('重启只读核对异常', String(error.message || error));
+  });
   initClipboardPanel();
   refreshQuotaBar();
   setInterval(() => {

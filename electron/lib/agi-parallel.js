@@ -49,22 +49,25 @@ function projectDenial(workspace, toolName, args) {
   return '';
 }
 
-/** 提供给本轮 AGI 主会话的入口。每个目标引用用户原话，桌面目标共享同一个前台。 */
+/**
+ * 提供给本轮 AGI 主会话的入口。每个目标引用用户原话，桌面目标共享同一个前台。
+ * 第一批要一次提交全部独立目标；执行中用户插话带来的新独立目标再单独追加，追加批次只提交新增项。
+ */
 const tool = {
   type: 'function',
   function: {
     name,
-    description: '同一轮只启动一次并发批次，执行用户明确要求的多个独立目标。一次提交全部互不依赖的目标，逐项引用用户原文。桌面任务依次执行，项目任务可与桌面一起推进。工具若先返回运行中，由宿主等结果并自动续接；结束本次生成，不要重复调用。收到实际结果后逐项核对。',
+    description: '把多个互相独立的用户目标交给子代理并发执行。第一批先用一次调用提交全部互不依赖的目标，逐项引用用户原文。执行中用户插话新增了独立目标时，再用本工具只提交这些尚未派出的新目标；已在运行或已完成的目标不要重派。与现有目标操作同一交付物、共用同一份约束，或与前一步有先后依赖的要求不要单独提交，等该批回执后由主会话在原结果上合并处理。桌面任务依次执行，项目任务可与桌面一起推进。工具若先返回运行中，由宿主等结果并自动续接；结束本次生成，不要重复调用。收到实际结果后逐项核对。',
     parameters: {
       type: 'object',
       properties: {
         tasks: {
           type: 'array',
-          minItems: 2,
+          minItems: 1,
           items: {
             type: 'object',
             properties: {
-              goal: { type: 'string', description: '完整引用这一项目标在当前用户原话中的连续文本。' },
+              goal: { type: 'string', description: '完整引用这一项目标在当前用户原话中的连续文本。接手整条独立插话时逐字填写该条完整正文，以便回执直接交付到原卡片。' },
               resource: { type: 'string', enum: ['desktop', 'project'], description: '需要操作或观察前台用 desktop，文件、代码和后台项目命令用 project。各桌面子代理依次独占前台，接手后先核对目标窗口和焦点。' }
             },
             required: ['goal', 'resource']
@@ -111,16 +114,63 @@ async function initialResult(result, waitMs = 15_000) {
   }
 }
 
-/** 按当前回答语言说明何时启动独立任务。存在先后依赖或共用交付物时，主会话按顺序处理。 */
+/**
+ * 按当前回答语言说明何时启动独立任务、何时追加、何时留在原任务。
+ * 存在先后依赖或共用交付物时，主会话按顺序处理，不拆成两个子代理。
+ */
 function instruction(english) {
-  return english
-    ? '\n[AGI PARALLEL TASKS] When one request asks you to execute several independent goals, call run_agi_parallel once with all of them before doing any one of them. Quote each goal from the current user messages. Wait for every result and verify each goal individually. If the tool returns a running status, end this model response so SpCode can deliver the finished batch. Never launch another batch in the same turn or start subagents from a branch. Continue any feasible unfinished work and report any remaining blocker. Keep dependent steps and work on the same deliverable together. A discussion or example does not authorize execution.\n'
-    : '\n【AGI 并发任务】用户同一轮要求执行多个独立交付目标时，先用 run_agi_parallel 一次提交所有独立目标，再逐项核对返回结果。工具若返回运行中，结束本次生成，由宿主等结果后自动续接。本轮只启动这一批，子代理不能再启动子代理。能继续解决的缺口继续处理，受阻的目标如实标明。每项目标引用当前用户原话。存在先后依赖或操作同一交付物的步骤放在一起。讨论、举例和单项任务不启动并发。\n';
+  return '\n' + require('./agi-rules').section('并发任务', english) + '\n';
 }
 
-/** 校验整批目标后才允许开始执行。排除重复、包含另一个目标或来源不在当前授权正文中的输入。 */
-function tasksFrom(args, orders) {
-  if (!Array.isArray(args.tasks) || args.tasks.length < 2) throw new Error('并发执行至少需要两个独立目标。');
+/**
+ * 把多条插话的分派规则送到本次接手它们的模型。仅主会话持有并发工具且执行范围有效时适用。
+ * @param {object} scope 当前用户授权范围。@param {Array<object>} specs 普通或直通协议的工具声明。
+ * @returns {string} 用户可维护的分派规则；暂停、只答复或没有并发入口时为空。
+ */
+function interjectionInstruction(scope, specs) {
+  if (!scope?.active || !specs?.some(exposesParallel)) return '';
+  return require('./agi-rules').section('并发等待');
+}
+
+/** 识别普通函数封装与直通接口传入的并发工具声明。 */
+function exposesParallel(entry) {
+  return (entry.function || entry).name === name;
+}
+
+/**
+ * 找出已派出目标里与新目标覆盖同一交付物的一项。
+ * @param {Map<string,object>} dispatched 已派出目标表，值为该项当前的调度状态。
+ * @param {string} goal 本次提交的目标原文。
+ * @returns {object|null} 覆盖同一交付物时返回 { goal, record }；互不相干时返回 null。
+ */
+function dispatchedOverlap(dispatched, goal) {
+  for (const entry of dispatched.entries()) {
+    const known = entry[0];
+    if (known.includes(goal) || goal.includes(known)) return { goal: known, record: entry[1] || {} };
+  }
+  return null;
+}
+
+/**
+ * 校验本次提交的目标后才允许开始执行。
+ * @param {object} args 模型提交的参数，tasks 每项含 goal 与 resource。
+ * @param {Array<string>} orders 当前生效的用户原话，含执行中插话正文。
+ * @param {object} [options] 追加批次的判定依据。
+ * @param {boolean} [options.appending] 本轮已有批次时允许只提交一个新增目标。
+ * @param {Map<string,object>} [options.dispatched] 已派出目标及状态；运行中和已完成的目标都不再重派。
+ * @returns {Array<object>} 通过校验的目标，保持提交顺序。
+ * 边界：首批仍要求至少两个目标；插话新增可为单个。目标未按原话引用、资源不明、批内互相重叠或同一交付物已被派出时，
+ * 抛出说明原因的错误，由主会话改为追加新增项或等回执后合并。
+ */
+function tasksFrom(args, orders, options = {}) {
+  const appending = !!options.appending;
+  const minimum = appending ? 1 : 2;
+  if (!Array.isArray(args.tasks) || args.tasks.length < minimum) {
+    throw new Error(appending
+      ? '追加并发至少要提交一个尚未派出的新增目标。'
+      : '并发执行至少需要两个独立目标。');
+  }
+  const dispatched = options.dispatched instanceof Map ? options.dispatched : new Map();
   const tasks = [];
   for (const item of args.tasks) {
     const goal = typeof item?.goal === 'string' ? item.goal.trim() : '';
@@ -130,6 +180,14 @@ function tasksFrom(args, orders) {
     if (item.resource !== 'desktop' && item.resource !== 'project') throw new Error('每项都要指定使用桌面或项目资源。');
     if (tasks.some(function overlaps(task) { return task.goal.includes(goal) || goal.includes(task.goal); })) {
       throw new Error('并发目标有重复，请提交相互独立的目标。');
+    }
+    const previous = dispatchedOverlap(dispatched, goal);
+    // 仍在执行的目标等着收回执；已完成的目标复用原结果。受阻或中断的目标允许按用户新要求重派。
+    if (previous && previous.record.status !== 'blocked' && previous.record.status !== 'interrupted') {
+      const done = previous.record.status === 'completed';
+      throw new Error(done
+        ? `目标「${previous.goal}」已经完成，不要重派；如只是补充同一交付物，请在该结果上处理。`
+        : `目标「${previous.goal}」属于同一交付物且仍在执行，请等该批回执后再合并处理。`);
     }
     tasks.push({ goal, resource: item.resource });
   }
@@ -154,6 +212,12 @@ const desktop = serialQueue();
 let desktopRequests = 0;
 
 /**
+ * 全部批次共用一条项目队列，跨批次的写入和命令按登记顺序执行。
+ * 追加批次与旧批次可能同时在跑，共用同一条队列才能保证同一工作区不被两个子代理并发改写。
+ */
+const projectQueue = serialQueue();
+
+/**
  * 请求使用桌面前台。已接收的任务按登记顺序运行，失败后释放前台。
  * @param {Function} execute 真正进入前台时调用的异步工作。
  * @returns {Promise<unknown>} 本次桌面工作的结果。
@@ -171,14 +235,28 @@ function releaseDesktop() { desktopRequests--; }
 
 /**
  * 并发运行任务会话，按输入顺序返回所有回执。桌面会话串行占用前台，项目操作串行占用共享工作区，
- * 项目会话的模型请求和桌面任务可重叠。插话后停发旧工具，已开始的调用仍等到完整回执。
+ * 项目会话的模型请求和桌面任务可重叠。暂停或换范围后停发旧工具，已开始的调用仍等到完整回执。
  * @param {Array<object>} tasks 已校验的用户目标及资源类型。
  * @param {object} options 宿主提供的会话执行、工具调用、工具清单、事件与中断判定；终态事件附实际回执。
+ * @param {Function} [options.onResult] 单项进入终态时的回调，宿主用它立即登记回执；追加批次同时在跑时也不会漏结果。
  * @returns {Promise<Array<object>>} 每个目标的状态、结果和实际已返回的工具名称。
  */
-async function run(tasks, { runBranch, runTool, toolsFor, interrupted, onProgress }) {
-  const projectTools = serialQueue();
+async function run(tasks, { runBranch, runTool, toolsFor, interrupted, onProgress, onResult }) {
   const jobs = [];
+
+  /**
+   * 把单项终态回执交给宿主登记。
+   * @param {object} result 当前目标的最终状态、结果与已用工具。
+   * @returns {void} 没有回调时不做任何事；回调异常不影响其他目标继续执行。
+   */
+  function report(result) {
+    if (typeof onResult !== 'function') return;
+    try {
+      onResult(result);
+    } catch (error) {
+      console.warn('并发目标回执登记失败：', error && error.message || error);
+    }
+  }
 
   // 先登记整批任务，第一条状态到达时即可显示所有子代理。
   for (const task of tasks) onProgress(task, 'queued');
@@ -213,7 +291,7 @@ async function run(tasks, { runBranch, runTool, toolsFor, interrupted, onProgres
         receipts.push(toolName);
         return output;
       }
-      const queue = task.resource === 'desktop' ? desktopTools : projectTools;
+      const queue = task.resource === 'desktop' ? desktopTools : projectQueue;
       const pending = queue(invoke);
       active.add(pending);
       /** 真实工具结束后移除它；中断时仍须等待已启动的工具归还结果。 */
@@ -225,6 +303,7 @@ async function run(tasks, { runBranch, runTool, toolsFor, interrupted, onProgres
     if (interrupted()) {
       const result = '用户已补充或停止。';
       onProgress(task, 'interrupted', result);
+      report({ goal: task.goal, status: 'interrupted', result, tools: receipts });
       return { goal: task.goal, status: 'interrupted', result, tools: receipts };
     }
     onProgress(task, 'running');
@@ -239,6 +318,7 @@ async function run(tasks, { runBranch, runTool, toolsFor, interrupted, onProgres
     if (!result && interrupted()) result = { status: 'interrupted', result: '用户已补充或停止，已执行的操作以工具记录为准。' };
     if (!result) result = { status: 'blocked', result: failure || '分支结束时没有提交实际结果。' };
     onProgress(task, result.status, result.result);
+    report({ goal: task.goal, ...result, tools: receipts });
     return { goal: task.goal, ...result, tools: receipts };
   }
 
@@ -259,9 +339,10 @@ async function run(tasks, { runBranch, runTool, toolsFor, interrupted, onProgres
     const task = tasks[index];
     const result = String(item.reason?.message || item.reason);
     onProgress(task, 'blocked', result);
+    report({ goal: task.goal, status: 'blocked', result, tools: [] });
     results.push({ goal: task.goal, status: 'blocked', result, tools: [] });
   }
   return results;
 }
 
-module.exports = { name, finishName, tool, initialResult, instruction, tasksFrom, run, useDesktop, desktopBusy, projectDenial };
+module.exports = { name, finishName, tool, initialResult, instruction, interjectionInstruction, tasksFrom, run, useDesktop, desktopBusy, projectDenial };

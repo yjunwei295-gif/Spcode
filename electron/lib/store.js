@@ -500,8 +500,9 @@ function applyUsageSpend({ modelCfg, usage, messages }) {
 
 function load() {
   try {
-    const raw = fs.readFileSync(filePath(), 'utf8');
-    const data = JSON.parse(raw);
+    const primary = readDiskSettings();
+    const data = primary || readDiskSettings(filePath() + '.last-good');
+    if (!data) throw new Error('Settings are unavailable');
     const merged = { ...DEFAULTS, ...data };
     const migrated = migrateProvidersAndModels(data);
     merged.providers = migrated.providers;
@@ -534,7 +535,7 @@ function load() {
     }
     const before = JSON.stringify(merged.assemblies || {});
     const out = require('./assembly').migrateAssemblies(merged);
-    if (JSON.stringify(out.assemblies || {}) !== before
+    if (!primary || JSON.stringify(out.assemblies || {}) !== before
       || !Array.isArray(data.providers)
       || data.providers.some(p => p && normalizeProtocol(p.protocol, p.baseUrl) !== p.protocol)
       || (data.models || []).some((m) => m && m.baseUrl && m.type !== 'local')) {
@@ -578,9 +579,9 @@ function isPlainSettingsObject(v) {
  * JSON 解析失败等任何异常都只表示「这次没有可合并的盘上内容」，
  * 一律返回 null，不抛错也不写日志。
  */
-function readDiskSettings() {
+function readDiskSettings(file = filePath()) {
   try {
-    const raw = fs.readFileSync(filePath(), 'utf8');
+    const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
     if (!isPlainSettingsObject(parsed)) return null;
     return parsed;
@@ -622,28 +623,33 @@ function mergeDiskWithMemory(disk, mem) {
   return out;
 }
 
+/** 先刷盘再原子替换。失败时保留旧设置文件。 */
+function writeSettingsFile(file, text) {
+  const tmp = file + '.' + process.pid + SAVE_TMP_SUFFIX;
+  try {
+    fs.writeFileSync(tmp, text, { encoding: 'utf8', flush: true, mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* 没有临时文件可清理 */ }
+    throw error;
+  }
+}
+
 function save(data) {
-  const dir = path.dirname(filePath());
+  const file = filePath();
+  const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
   // 先读盘合并再写：多实例共享同一份 settings.json，直接拿内存整份覆盖会把
   // 别的实例刚写入、本实例内存里没有的设置项抹掉。
-  const disk = readDiskSettings();
+  const disk = readDiskSettings(file) || readDiskSettings(file + '.last-good');
   const out = (disk && typeof disk === 'object') ? mergeDiskWithMemory(disk, data) : data;
   // 即使旧窗口再次提交错误协议，也在持久化边界修复直通占位地址。
   if (Array.isArray(out.providers)) out.providers = out.providers.map(p =>
     p && typeof p === 'object' ? { ...p, protocol: normalizeProtocol(p.protocol, p.baseUrl) } : p);
   const text = JSON.stringify(out, null, 2);
-  // 原子写：临时文件名带进程号，避免多实例踩到同一个临时文件；
-  // 先写临时文件再改名，别的实例读到的永远是完整文件，不会是写了一半的 JSON。
-  const tmp = filePath() + '.' + process.pid + SAVE_TMP_SUFFIX;
-  try {
-    fs.writeFileSync(tmp, text, 'utf8');
-    fs.renameSync(tmp, filePath());
-  } catch {
-    // 改名失败（跨设备、临时文件被占用等）：清掉临时文件后回退成直接写正式文件，保证设置一定落盘
-    try { fs.unlinkSync(tmp); } catch { /* 临时文件不存在或删不掉，忽略 */ }
-    fs.writeFileSync(filePath(), text, 'utf8');
-  }
+  writeSettingsFile(file, text);
+  // 主设置损坏时仍有一份独立的完整配置。
+  try { writeSettingsFile(file + '.last-good', text); } catch { /* 保留上一份备用配置 */ }
 }
 
 /** 解析保存的主题；独立主题原样返回，仅跟随系统时按系统明暗解析。 */

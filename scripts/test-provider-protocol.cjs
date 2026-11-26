@@ -50,6 +50,14 @@ async function main() {
   assert.equal(normalizeProtocol('google'), 'gemini');
   console.log('PASS config migration, stale save, inline model and HTTP compatibility');
 
+  const settingsPath = path.join(temp, 'settings.json');
+  fs.writeFileSync(settingsPath, Buffer.alloc(147));
+  const recovered = store.load();
+  assert.equal(recovered.currentModelId, 'codex');
+  assert.equal(store.resolveModelCfg('codex', recovered).protocol, 'codex');
+  assert.equal(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).providers.length, providers.length);
+  console.log('PASS corrupted settings restored from the independent last-known-good file');
+
   const calls = [];
   const mocks = { './http-fetch': { httpFetch: async () => { throw Error('Unexpected HTTP call'); } } };
   for (const [protocol, file] of [['codex','codex'], ['cursor','cursor'], ['claudecode','claude'], ['grok','grok']]) {

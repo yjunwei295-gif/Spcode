@@ -39,9 +39,14 @@ async function parseImages(list){
  * VM 提供测试用附件解析和直通转发；返回原始工具结果，供桥接回归复用。
  */
 async function queueAndDirect(){
- const context={require:createRequire(agentFile),fs,path,interjectInbox:new Map(),interjectInFlight:new Map(),interjectWakeups:new Map(),interjectArchives:new Map(),trainingArchive:{direct:function forwardDirect(provider,args){return provider.runTurn(args);}},activeInterjectKeys:new Set(['a','b']),desktopOn:function(){return true;},modelSupportsVision:function(){return true;},attachmentsToParts:parseImages,answerImagesForModel:async function(){throw new Error('原生视觉不应调用视觉代理');}};
+  /** 附件会话各用自己的真实收件记录，以便在投递前分配编号。 */
+  function imageInbox(key) {
+    const { InterjectionTodos } = require('../electron/lib/interjection-todos');
+    return new InterjectionTodos({ current: { interjectionTodos: [] } }, key, function record() {});
+  }
+ const context={require:createRequire(agentFile),fs,path,parallelWakeups:new Map(),batchWaiters:new Map(),interjectInbox:new Map(),interjectInFlight:new Map(),interjectWakeups:new Map(),interjectArchives:new Map(),trainingArchive:{direct:function forwardDirect(provider,args){return provider.runTurn(args);}},activeInterjectKeys:new Map([['a', imageInbox('a')], ['b', imageInbox('b')]]),desktopOn:function(){return true;},modelSupportsVision:function(){return true;},attachmentsToParts:parseImages,answerImagesForModel:async function(){throw new Error('原生视觉不应调用视觉代理');}};
  vm.createContext(context);
- vm.runInContext(between(source,'function pushInterjection(','// 桌面工具只在'),context);
+ vm.runInContext(between(source,'function notifyParallelBranches(','// 桌面工具只在'),context);
  ok('纯图插话可入队',context.pushInterjection('a','',[{path:imageFile,name:'参考.png'}])===true);
  context.pushInterjection('b','另一会话');
  const received=context.takeInterjections('a');

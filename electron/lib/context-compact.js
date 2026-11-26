@@ -27,6 +27,8 @@ function normalizeWorking(raw) {
     scratch: Array.isArray(w.scratch)
       ? w.scratch.map(String).filter(Boolean).slice(0, 12)
       : [],
+    // 插话记录由宿主收件与交付时维护，普通任务清单的合并和条数限制不适用于它。
+    interjectionTodos: Array.isArray(w.interjectionTodos) ? w.interjectionTodos.slice() : [],
     todos: Array.isArray(w.todos) ? w.todos.map(normalizeTodo).filter(Boolean).slice(0, TODO_MAX) : []
   };
 }

@@ -65,10 +65,16 @@ async function main() {
   const end = source.indexOf('async function openContextPreview(', begin);
   const sendBegin = source.indexOf('async function sendOne(');
   const sendEnd = source.indexOf('/**\n * 将本地识别', sendBegin);
+  // 本轮结果写回被抽成独立函数供发送与重载接回共用，夹具要一并注入
+  const resultBegin = source.indexOf('function applyFinalResultToAssistant(');
+  const resultEnd = source.indexOf('async function sendOne(', resultBegin);
+  assert.ok(resultBegin > 0 && resultEnd > resultBegin);
   const modalBegin = source.indexOf('function openModal(');
   const modalEnd = source.indexOf('async function openProject(', modalBegin);
   const setup = `
     var api = window.simple;
+    const documentTurns = new Set();
+    function sessionData(item) { return { id: item.id, messages: item.messages }; }
     var tab = { id: 'fixture', workspace: ${JSON.stringify(root)}, title: '长期运营验收',
       messages: [], queue: [], pickedSkillIds: [], workingMemory: {}, contextSummary: '' };
     var state = { tabs: [tab], currentModelId: 'controlled', contextPaths: [], attachments: [], promptOverrides: null };
@@ -103,7 +109,11 @@ async function main() {
   for (const name of noopNames) noops += 'function ' + name + '() {}\n';
   ipcMain.handle('snapshot:list', function snapshots() { return []; });
   ipcMain.handle('milestone:list', function milestones() { return []; });
-  await evaluate(setup + noops + source.slice(modalBegin, modalEnd) + source.slice(sendBegin, sendEnd) +
+  // 真实 preload 已经暴露重载接回入口，夹具补上同名处理器，免得发送收尾时报无人接收。
+  ipcMain.handle('chat:restoreTurn', function restoreTurn() { return []; });
+  ipcMain.handle('chat:restoreConsumed', function restoreConsumed() { return false; });
+  await evaluate(setup + noops + source.slice(modalBegin, modalEnd) + source.slice(resultBegin, resultEnd) +
+    source.slice(sendBegin, sendEnd) +
     source.slice(begin, end) + `
       api.onLongAliveTask(onLongAliveTask);
       api.onLongAliveState(showLongAliveState);

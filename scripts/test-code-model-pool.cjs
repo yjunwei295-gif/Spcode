@@ -57,7 +57,10 @@ function settings() {
   return { locale: 'zh', currentModelId: 'ds', models, providers: [{ id: 'fixture', protocol: 'openai', baseUrl: 'http://unused', apiKey: '' }],
     assemblies: {}, capabilityDefaults: { code: { models: refs } } };
 }
-/** 模拟可用模型返回工具调用，执行仍由真实 Agent 完成。 */
+/**
+ * 验证模型选择、实际写入和验收分流。无参数；使用隔离工作区和模拟的模型传输。
+ * @returns {Promise<object>} 测试结果目录 output 和实际记录的模型调用列表 calls。
+ */
 async function testRouting() {
   const h = harness(), s = settings(), assembly = h.local('./assembly');
   const legacy = assembly.normalizeCapabilityDefaults({ code: { primary: s.capabilityDefaults.code.models[0], fallbacks: s.capabilityDefaults.code.models.slice(1) } });
@@ -112,35 +115,124 @@ async function testRouting() {
   check(failures === 1, '所选模型失败不自动调用其他模型');
   await assert.rejects(h.functions.useCodeModel(common, { task: '没有选模型' }), /未选择有效代码模型/);
   check(failures === 1, '未选模型明确拒绝，不暗选第一项');
-  // 完整 runTurn 走直通大脑，验证动态工具实际注册并能再次选用池内模型。
+  // 完整轮次核对真实工具调用次数，分别覆盖正确交付、两类返工、评审误报和不可解的要求。
   h.local('./store').save(s);
-  let directRequests = 0;
-  async function selectedTransport(args) {
-    if (args.modelCfg.model !== 'glm') return { role: 'assistant', content: '实现符合需求，核对通过。' };
-    directRequests++;
-    if (directRequests === 1) return { role: 'assistant', content: '', tool_calls: [{
-      id: 'direct-write', type: 'function', function: { name: 'write_file',
-        arguments: JSON.stringify({ path: 'direct.txt', content: '直通选模实际执行' }) }
-    }] };
-    return { role: 'assistant', content: '指定文件已写入。' };
+  for (const scenario of ['pass', 'repair', 'severe', 'falseAlarm', 'unverified', 'blocked']) {
+    await testDirectDelivery(h, common.signal, event, scenario);
   }
-  async function directBrain(args) {
-    check(args.tools.some(function pool(t) { return t.name === 'use_code_model'; }), '直通大脑实际注册选模工具');
-    check(args.requiredToolNames.includes('use_code_model'), '直通开工判定接受选模工具完成任务');
-    const result = await args.runTool('use_code_model', { modelId: 'api:glm', task: '创建 direct.txt，写入“直通选模实际执行”，只改这个文件。' });
-    return { content: '指定文件已完成。' + result };
-  }
-  h.setTransport(selectedTransport);
-  h.setDirect(directBrain);
-  await h.agent.runTurn({ workspace: output, appRoot: root,
-    modelCfg: { id: 'brain-direct', protocol: 'codex', model: 'brain-direct', baseUrl: 'codex://sdk' },
-    history: [], userText: '创建指定测试文件', action: 'start-work', attachments: [], contextPaths: [],
-    skill: null, rules: [], allSkills: [], onEvent: event, signal: common.signal,
-    workingMemory: {}, contextSummary: '', extraFolders: [], unlimitedRounds: true, interjectKey: 'fixture:direct', turnId: 'direct-turn' });
-  check(fs.readFileSync(path.join(output, 'direct.txt'), 'utf8') === '直通选模实际执行' && directRequests === 2,
-    '完整直通轮次按明确选择执行GLM工具，无额外重复任务');
   return { output, calls };
 }
+/**
+ * 在直通大脑的真实验收循环中记录谁写初版、谁返工，以及核验所读到的文件内容。
+ * @param {object} h 可控制模型传输的 Agent 夹具，文件工具和验收判定均使用生产实现。
+ * @param {AbortSignal} signal 本轮停止信号。
+ * @param {Function} onEvent 接收工具与状态事件。
+ * @param {string} scenario 分别模拟初版正确、输出错误、启动异常、真实引文误报、引文失实及要求冲突。
+ * @returns {Promise<void>} 核对最终正文、落盘结果和两种模型的写入次数后结束。
+ */
+async function testDirectDelivery(h, signal, onEvent, scenario) {
+  // 让 Electron 用户数据和测试报告位于工作区外，文件指纹只随交付脚本变化。
+  const workspace = fs.mkdtempSync(path.join(output, scenario + '-'));
+  const file = 'direct-' + scenario + '.cjs';
+  const expected = 'console.log("READY");';
+  const needsRepair = scenario === 'repair' || scenario === 'severe';
+  let draft = expected;
+  if (scenario === 'repair' || scenario === 'blocked') draft = 'console.log("WAITING");';
+  if (scenario === 'severe') draft = 'throw new Error("STARTUP_FAILURE");';
+  // 在测试进程中观察脚本启动结果，异常消息和正常输出都来自实际执行。
+  const command = 'node -e "try { require(\'./' + file + '\') } catch (error) { console.log(error.message) }"';
+  let observation = '';
+  let workerRequests = 0;
+  let assignments = 0;
+  let repairs = 0;
+  let reviews = 0;
+  const task = '实现脚本 ' + file + '，运行时只输出 READY。' +
+    (scenario === 'blocked' ? '同一次运行还必须只输出 WAITING。' : '');
+
+  /**
+   * 响应 args 指定的模型请求。实现模型通过工具写入，覆盖核对只返回实际命令输出的编号。
+   * @returns {Promise<object>} 供真实 Agent 循环执行的工具调用或模型正文。
+   */
+  async function apiModel(args) {
+    if (args.modelCfg.model !== 'glm') {
+      const material = String(args.messages.at(-1).content);
+      // 找到模型收到的候选行编号；匹配的内容必须是本次 command 实际输出的整行。
+      let selected;
+      for (const line of material.split('\n')) {
+        if (line.startsWith('[') && line.endsWith('] ' + observation)) selected = line;
+      }
+      assert.ok(selected, '行为覆盖须引用本次真实读回的行：' + observation);
+      return { role: 'assistant', content: '实测：' + selected.slice(1, selected.indexOf(']')) };
+    }
+    workerRequests++;
+    if (workerRequests === 1) return { role: 'assistant', content: '', tool_calls: [{ id: 'write', type: 'function',
+      function: { name: 'write_file', arguments: JSON.stringify({ path: file, content: draft }) } }] };
+    assert.ok(fs.existsSync(path.join(workspace, file)), JSON.stringify(args.messages.filter(function receipt(m) { return m.role === 'tool'; })));
+    return { role: 'assistant', content: '文件已写入。' };
+  }
+
+  /**
+   * 模拟直通模型对 args 中本轮提示的响应。读盘和测试使用真实工具，只在生产返工入口修改文件。
+   * @returns {Promise<object>} 核对结论或大脑本轮答复，断言失败时拒绝。
+   */
+  async function directModel(args) {
+    if (args.key.startsWith('worker:summary:')) {
+      reviews++;
+      const actual = fs.readFileSync(path.join(workspace, file), 'utf8');
+      const quote = scenario === 'unverified' ? '文件中没有这句话' : actual;
+      const evidence = '证据：' + file + ':1「' + quote + '」';
+      const rechecking = args.turnText.includes('【只读复核实现差异】');
+      const label = scenario === 'severe' ? '严重问题' : '不一致';
+      if (rechecking) {
+        assert.ok(args.turnText.includes('当前版本已核实的实测行：\n' + observation));
+        for (const tool of args.tools) assert.ok(['read_file', 'search_text', 'map_lookup', 'list_dir', 'goto_definition'].includes(tool.name));
+        if (scenario === 'blocked') return { content: '方案验收：未通过\n无法与方案一致：预期「READY」；实际「' +
+          observation + '」；约束「同一次运行还必须只输出 WAITING」；阻塞原因：两个互斥的唯一输出无法同时满足。' + evidence };
+        if (observation !== 'READY' || scenario === 'unverified') return { content: '方案验收：未通过\n' +
+          label + '：预期「READY」；实际「' + observation + '」；差异：脚本启动后没有交付所需输出。' + evidence };
+      } else if (actual !== expected || scenario === 'unverified' || scenario === 'falseAlarm') {
+        return { content: '方案验收：未通过\n' + label + '：运行结果应为 READY。' + evidence };
+      }
+      return { content: '核对 1：正文与要求一致。' + evidence + '\n方案验收：通过' };
+    }
+    if (args.turnText.includes('【需求验收未通过】')) {
+      assert.ok(needsRepair, '只有真实错误才应进入大脑返工：' + scenario);
+      await assert.rejects(args.runTool('use_code_model', { modelId: 'api:glm', task }), /当前由大脑核验交付/);
+      await args.runTool('edit_file', { path: file, old_string: draft, new_string: expected });
+      repairs++;
+    } else {
+      assert.equal(assignments++, 0, '同一初版只应派发一次：' + args.turnText.slice(-850));
+      assert.ok(args.tools.some(function pool(t) { return t.name === 'use_code_model'; }));
+      assert.ok(args.requiredToolNames.includes('use_code_model'));
+      const delivery = await args.runTool('use_code_model', { modelId: 'api:glm', task });
+      assert.ok(fs.existsSync(path.join(workspace, file)), '代码模块回执：' + delivery);
+    }
+    const execution = await args.runTool('run_command', { command, activity: 'test' });
+    const stdout = execution.match(/^--- stdout ---\s*\r?\n(READY|WAITING|STARTUP_FAILURE)\s*$/m);
+    assert.ok(stdout, execution);
+    observation = stdout[1];
+    return { content: '已核对文件正文。' };
+  }
+  h.setTransport(apiModel);
+  h.setDirect(directModel);
+  const result = await h.agent.runTurn({ workspace, appRoot: root,
+    modelCfg: { id: 'brain-direct', protocol: 'codex', model: 'brain-direct', baseUrl: 'codex://sdk' },
+    history: [], userText: task, action: 'start-work', attachments: [], contextPaths: [],
+    skill: null, rules: [], allSkills: [], onEvent, signal, workingMemory: {}, contextSummary: '',
+    extraFolders: [], unlimitedRounds: true, interjectKey: 'fixture:' + scenario, turnId: scenario });
+  assert.equal(fs.readFileSync(path.join(workspace, file), 'utf8'), scenario === 'blocked' ? draft : expected);
+  assert.equal(assignments, 1);
+  assert.equal(workerRequests, 2, '代码模型只写一次并返回一次结果');
+  assert.equal(repairs, Number(needsRepair));
+  const reviewCount = { pass: 1, repair: 3, severe: 3, falseAlarm: 2, unverified: 2, blocked: 2 };
+  assert.equal(reviews, reviewCount[scenario], scenario + '：' + result.text);
+  assert.equal(result.text.includes('尚未验收通过'), scenario === 'unverified' || scenario === 'blocked');
+  if (scenario === 'blocked') assert.ok(result.text.includes('两个互斥的唯一输出无法同时满足'));
+  check(true, { pass: '正确初版一次验收通过，大脑未重写', repair: '实际输出错误，大脑修复并重新运行通过',
+    severe: '实际启动抛错，大脑修复后重新运行输出 READY', falseAlarm: '引用真实但输出已正确，只读复核通过',
+    unverified: '依据失实时保留未核实状态，全程未返工', blocked: '要求互斥时报告真实约束并停止写入' }[scenario]);
+}
+
 /** 真正打开完整设置页面，勾选、保存并重新打开检查三个模型。 */
 async function testPage() {
   const fixture = fs.readFileSync(path.join(root, 'scripts/test-ui-performance.cjs'), 'utf8').split('\r\n').join('\n');
@@ -149,11 +241,13 @@ async function testPage() {
   win.webContents.debugger.attach('1.3');
   await win.webContents.debugger.sendCommand('Page.enable');
   const s = { ...settings(), theme: 'dark', resolvedTheme: 'dark', autoSave: true, onboardingCompleted: true,
-    workspace: output, recents: [], localFiles: [], retained: {} };
+    workspace: output, recents: [], localFiles: [], videoProviderModels: [], retained: {} };
   const setup = '(' + extract(fixture, 'function fullPageSetup()') + ')();\n' +
     'window.poolSaved=null;localStorage.setItem("spcode.onboarding.completed","true");\n' +
     'simple.getState=async function(){return ' + JSON.stringify(s) + ';};\n' +
     'simple.saveCapabilityDefaults=async function(value){window.poolSaved=value;return value;};\n' +
+    // 打开设置时会异步读取当前项目的忽略目录；隔离项目没有配置目录。
+    'simple.indexGetIgnoredFolders=async function ignoredFolders(){return [];};\n' +
     'simple.getProviderQuota=async function(){return {};};simple.fetchAccountBalance=async function(){return {available:false};};simple.indexStatus=async function(){return {running:false,files:0};};simple.saveSearchSites=async function(v){return v;};simple.saveProxy=async function(v){return v;};simple.saveCommandSandbox=async function(v){return v;};simple.saveLocalImageGeneration=async function(v){return v;};simple.saveMaxAgentRounds=async function(v){return v;};simple.setTheme=async function(){return {theme:"dark",resolvedTheme:"dark"};};window.alert=function(v){fullPageRecord.errors.push({alert:v});};\n';
   await win.webContents.debugger.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: setup });
   await win.loadFile(path.join(root, 'renderer/index.html'));

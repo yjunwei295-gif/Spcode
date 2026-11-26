@@ -95,14 +95,19 @@ function pause(ms) {
  * @param {string} marker 当前专用聊天的唯一标识，防止从其他聊天读出结果。
  * @param {number} previousCount 发送前已有的回复数量。
  * @param {AbortSignal} signal SpCode 本轮停止信号。
+ * @param {Function} [onSeen] 本次发送后首次观察到模型生成或新回复时，确认这批插话已看。
  * @returns {Promise<string>} 完整的最新模型正文。
  */
-async function waitReply(marker, previousCount, signal) {
+async function waitReply(marker, previousCount, signal, onSeen) {
   const deadline = Date.now() + REPLY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     checkAbort(signal);
     const observation = await runUi({ action: 'read', sessionMarker: marker });
     if (!observation.markerFound) throw new Error('官方客户端切离了 SpCode 专用聊天，停止读取以免串会话');
+    if (onSeen && !signal?.aborted && (observation.generating || observation.assistantCount > previousCount)) {
+      onSeen();
+      onSeen = null;
+    }
     if (observation.assistantCount > previousCount && observation.complete) {
       return String(observation.lastAssistant || '');
     }
@@ -116,9 +121,11 @@ async function waitReply(marker, previousCount, signal) {
  * @param {object} session 专用聊天的标记与规则签名。
  * @param {string} message 用户任务、工具定义或上一次工具结果。
  * @param {AbortSignal} signal 停止信号。
- * @returns {Promise<string>} 最新一条助手消息。
+ * @param {Function} [onSent] 客户端确认本条消息出现在专用聊天后调用一次，等待回复期间即可显示处理进度。
+ * @param {Function} [onSeen] 专用聊天开始生成本次回复时确认已看。
+ * @returns {Promise<string>} 最新一条完整助手消息。发送、读取失败或停止时拒绝。
  */
-async function exchange(session, message, signal) {
+async function exchange(session, message, signal, onSent, onSeen) {
   checkAbort(signal);
   const messageMarker = `SPCODE-MSG:${crypto.randomUUID()}`;
   const sent = await runUi({
@@ -128,7 +135,10 @@ async function exchange(session, message, signal) {
     messageMarker
   });
   session.started = true;
-  return waitReply(session.marker, Number(sent.assistantCount), signal);
+  checkAbort(signal);
+  // send 已核对本条消息的唯一标记，此时可以确认送达，完整正文仍由 waitReply 等待。
+  onSent?.();
+  return waitReply(session.marker, Number(sent.assistantCount), signal, onSeen);
 }
 
 /** 列出本轮授权的工具名称及用途，具体参数由聊天模型按需查询。 */
@@ -193,7 +203,8 @@ async function getSession(key, sig, fresh) {
 /**
  * 执行一轮聊天模式的本地工具编排。
  * @param {object} args 与 Codex SDK 直通相同的上下文、授权工具、执行器和事件回调。
- * @param {Function} [args.onInterjectionDelivered] 当前用户消息收到非空模型回复后确认该批插话；取消时不确认。
+ * @param {Function} [args.onInterjectionSent] 首条消息经客户端确认发送时展示处理中。
+ * @param {Function} [args.onInterjectionDelivered] 专用聊天出现本次模型活动时确认已看。
  * @param {Function} [args.shouldYield] 查询是否有新插话，交接时跳过当前回复申请的后续动作。
  * @returns {Promise<{content: string, reasoning: string}>} 工具往返后的最终回答，或交还控制权时的空结果。
  */
@@ -234,18 +245,12 @@ async function performTurn(args) {
   activeRuns += 1;
   try {
     onEvent({ type: 'status', text: 'Codex 五小时额度已耗尽，官方聊天模式继续执行…' });
-    let reply = await exchange(session, first ? firstMessage : `【用户新一轮任务】\n${turnText || ''}`, signal);
-    let confirmDelivery = args.onInterjectionDelivered;
+    let reply = await exchange(session, first ? firstMessage : `【用户新一轮任务】\n${turnText || ''}`, signal, args.onInterjectionSent, args.onInterjectionDelivered);
     const called = new Set();
     let malformed = 0;
     let missedRequired = 0;
     while (true) {
       checkAbort(signal);
-      // 先确认这一批已收到模型回复，再把晚到的插话交回宿主续接。
-      if (confirmDelivery && reply.trim()) {
-        confirmDelivery();
-        confirmDelivery = null;
-      }
       // 调整范围后由宿主送入新指令，当前申请单和缺工具催办到此结束。
       if (args.shouldYield?.()) return { content: '', reasoning: '' };
       let action;

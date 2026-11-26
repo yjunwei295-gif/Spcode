@@ -142,7 +142,7 @@ async function host() {
 /** 抽取生产发送与接收函数，连续执行自动轮次，检查草稿和消息对象数量。 */
 async function renderer() {
   const source = fs.readFileSync(path.join(__dirname, '../renderer/app.js'), 'utf8').split('\r\n').join('\n');
-  const send = source.slice(source.indexOf('async function sendOne('), source.indexOf('/**\n * 将本地识别'));
+  const send = source.slice(source.indexOf('function applyFinalResultToAssistant('), source.indexOf('/**\n * 将本地识别'));
   const resident = source.slice(source.indexOf('function isLongAliveMessage('), source.indexOf('/** 主进程投递回调'));
   const selected = [{ n: 9, userText: '已选历史', asstText: '已选结果' }];
   const tab = { id: 'task', workspace: 'project', title: '测试会话', messages: [
@@ -152,7 +152,8 @@ async function renderer() {
     promptOverrides: { persona: '保留' } };
   let calls = 0;
   let finished = 0;
-  const sandbox = { state, console, Set, Map, Date,
+  const sandbox = { state, console, Set, Map, Date, documentTurns: new Set(),
+    sessionData: function sessionData(item) { return { id: item.id, messages: item.messages }; },
     api: {
       longAliveAccept: async function accept() { return true; },
       /** 归档前先核对生产渲染函数提交的结果，失败时保留实际报错。 */
@@ -161,6 +162,7 @@ async function renderer() {
         finished++;
         check(result.messages.length === 2, '归档只包含当前自动轮');
       },
+      chatRestoreConsumed: function consumed() {},
       chatSend: async function chat(payload) {
         calls++;
         assert.equal(payload.history.length, 2);

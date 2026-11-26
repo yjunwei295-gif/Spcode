@@ -99,16 +99,22 @@ function noteUser(workspace, text) {
   return applyMark(workspace, markFromUserText(text, read(workspace))).pressure;
 }
 
-/** 按会话模式生成执行提示；自主模式使用任务相关观察，不为普通问答强制截图。 */
+/**
+ * 为本轮会话生成执行提示。普通交流优先返回交流说明，AGI 的代码分工由共用系统提示提供。
+ * @param {string} workspace 工作区路径，普通实施轮次按它读取派工严格程度。
+ * @param {boolean} english 是否使用英文提示。
+ * @param {boolean} selfOperate 是否处于直接执行并按需观察的 AGI 模式。
+ * @param {boolean} [conversational] 是否在交流或排查问题，优先于实施模式。
+ * @returns {string} 可拼接到当前系统提示的对应语言说明。
+ */
 function promptBlock(workspace, english, selfOperate, conversational = false) {
   // 交流与问题排查不受实施流程约束，也不使用压力文案催促用户确认开工。
   if (conversational) return english
     ? '\nAnswer the current message naturally. Investigate with read-only tools when needed; do not require a plan or start confirmation for discussion.\n'
     : '\n自然回应当前消息，需要时用只读工具排查；普通交流、补充日志与复现步骤不要求方案或开工确认。\n';
   if (selfOperate) {
-    return english
-      ? '\nAGI is on. The user only accepts the result. You finish everything else yourself and do not wait for start. This turn is unlimited. Prefer runtime_state for software state and waits; use screen_read/screen_look when visual evidence is needed. Ordinary questions need no desktop observation. Do not call call_worker.\n'
-      : '\nAGI 已打开。用户只管验收，其他所有事情你自己做完，不要等「开始」。这一轮全解放。状态和等待优先用 runtime_state，需要视觉证据再读屏；普通问答不启动桌面观察。禁止 call_worker，禁止派单。\n';
+    // 代码分工由共用 AGI 系统提示说明，这里只提醒自主执行和按需观察。
+    return '\n' + require('./agi-rules').section('自主执行提醒', english) + '\n';
   }
   const band = strictness(read(workspace));
   if (english) {

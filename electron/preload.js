@@ -213,13 +213,30 @@ const api = {
   loadSessions: () => ipcRenderer.invoke('sessions:list'),
   loadSession: (id) => ipcRenderer.invoke('sessions:load', id),
   saveSession: (session) => ipcRenderer.invoke('sessions:save', session),
+  /** 登记冷启动标签的未办清单，返回本窗口可以接回的标签编号。 */
+  beginRestartReview: function beginRestartReview(requests) { return ipcRenderer.invoke('restartReview:begin', requests); },
+  /** 获取指定标签的只读回执，不触发新一轮模型调用。 */
+  restartReview: function restartReview(id) { return ipcRenderer.invoke('restartReview:result', id); },
   // 输入草稿只传少量状态，避免携带整份聊天历史。
   saveComposer: function saveComposer(draft) { return ipcRenderer.invoke('sessions:saveComposer', draft); },
   renameSession: (id, title) => ipcRenderer.invoke('sessions:rename', { id, title }),
   deleteSession: (id) => ipcRenderer.invoke('sessions:delete', id),
 
-  chatSend: (payload) => ipcRenderer.invoke('chat:send', payload),
+  /** 提交模型请求；seed 是只保存在主进程内存中的原标签起始状态。 */
+  chatSend: function chatSend(payload, seed) { return ipcRenderer.invoke('chat:send', payload, seed); },
+  /** 文档卸载前同步交接最新草稿和队列，保证刷新开始前主进程已接管。 */
+  stageTurnWindow: function stageTurnWindow(snapshot) { return ipcRenderer.sendSync('chat:stageWindow', snapshot); },
+  /** 将已显示的回复和队列交给原主进程，允许释放已经消费的事件。 */
+  checkpointTurn: function checkpointTurn(id, update) { ipcRenderer.send('chat:checkpoint', id, update); },
+  /** 新文档已恢复，可以释放上一次卸载时的窗口快照。 */
+  turnWindowRestored: function turnWindowRestored() { ipcRenderer.send('chat:windowRestored'); },
+  /** 接回端等待原 IPC 任务收尾，不会发起另一轮模型调用。 */
+  chatWaitTurn: function chatWaitTurn(id) { return ipcRenderer.invoke('chat:waitTurn', id); },
   chatAbort: (turnId) => ipcRenderer.invoke('chat:abort', turnId),
+  // 页面重载后接回本窗口仍在跑/刚跑完、界面还没消费的轮次；只取数据，不重发发送请求
+  chatRestoreTurn: () => ipcRenderer.invoke('chat:restoreTurn'),
+  // 界面已经按恢复数据收尾，通知主进程释放这一轮的留存
+  chatRestoreConsumed: (turnId) => ipcRenderer.invoke('chat:restoreConsumed', turnId),
   // 主窗运行中把这条消息插话给当前轮，下一个 round 边界生效
   chatInterject: (payload) => ipcRenderer.invoke('chat:interject', payload),
   contextPreview: (turnId) => ipcRenderer.invoke('chat:contextPreview', turnId),

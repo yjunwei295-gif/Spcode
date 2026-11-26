@@ -7,6 +7,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'app.js'), 'utf8');
 const passed = [];
+// VM 中的生产会话函数依赖这两个界面模块导出，由测试入口实际加载。
+let interjectionState;
 
 /**
  * 从生产文件读取完整顶层函数，用实际实现而非重新实现的副本接受测试。
@@ -59,7 +61,8 @@ function harness() {
     refillFromIndex: null, refillRevertFiles: false, typewriterRaf: null
   };
   const context = {
-    state, console, Date, Map, Set, composerTimer: null, revealingMsgs: new Set(),
+    submittedQueue: interjectionState.submittedQueue, mergeInterjectionItems: interjectionState.mergeInterjectionItems,
+    state, console, Date, Map, Set, documentTurns: new Set(), composerTimer: null, revealingMsgs: new Set(),
     // 本夹具不创建预测界面，仍执行真实刷新入口的未挂载生命周期分支。
     composerPrediction: null,
     $: function element(id) { return id === 'input' ? input : messages; },
@@ -97,6 +100,7 @@ function harness() {
       floatBind: function bind(id) { events.push(['bind', id]); },
       chatSend: async function chat(payload) { requests.push(payload); return { text: '完成', changes: [] }; },
       chatInterject: async function interject(payload) { events.push(['interject', payload.tabId]); return { ok: true }; },
+      chatRestoreConsumed: noop,
       chatAbort: function abort(id) { events.push(['abort', id]); },
       restoreSnapshot: async function forbiddenRestore(id) { events.push(['restore', id]); },
       listSnapshots: async function snapshots() { return []; },
@@ -105,9 +109,9 @@ function harness() {
   };
   vm.createContext(context);
   const names = ['activeSession', 'isActiveTab', 'isTabSending', 'tabQueue', 'findTabByTurnId',
-    'collectComposer', 'refreshComposerPrediction', 'refreshComposerRequirements', 'rememberComposer', 'clearComposer', 'persistTab', 'persistSession',
+    'collectComposer', 'refreshComposerPrediction', 'refreshComposerRequirements', 'rememberComposer', 'clearComposer', 'sessionData', 'persistTab', 'persistSession',
     'hydrateTab', 'switchToTab', 'openHistorySession', 'stopTypewriter', 'finishTypewriter',
-    'abortTab', 'beginRefillResend', 'isStopError', 'sendOne', 'takeQueuedTask', 'processQueue', 'send'];
+    'abortTab', 'beginRefillResend', 'isStopError', 'applyFinalResultToAssistant', 'sendOne', 'takeQueuedTask', 'processQueue', 'send'];
   for (const name of names) vm.runInContext(production(name), context);
   return { context, state, input, writes, requests, events, cancellations, loads };
 }
@@ -571,6 +575,7 @@ async function snapshotWorkspaceOwnership() {
 
 /** 顺序执行并汇总行为回归；任一断言失败向进程返回非零退出码。 */
 async function run() {
+  interjectionState = await import('../renderer/interjection-state.mjs');
   await historyRace();
   await backgroundQueue();
   await overrideOwnership();

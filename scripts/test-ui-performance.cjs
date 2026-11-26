@@ -39,9 +39,9 @@ async function testSessions() {
     return require('../electron/lib/session-composer');
   }
   const start = mainSource.indexOf('const sessionMetaCache = new Map();');
-  const end = mainSource.indexOf("ipcMain.handle('sessions:rename'", start);
+  const end = mainSource.indexOf('const restartReview =', start);
   assert.ok(start >= 0 && end > start);
-  vm.runInNewContext(mainSource.substring(start, end), { fs, path, ipcMain: { handle }, sessionDir, require: dependency, console,
+  vm.runInNewContext(mainSource.substring(start, end), { fs, path, process, ipcMain: { handle }, sessionDir, require: dependency, console,
     distillSubmittedRequirements: require('../electron/lib/composer-requirements').distillSubmittedRequirements });
   const full = { id: 'history', title: '测试对话', workspace: 'fixture', messages: [
     { role: 'user', text: '原始消息' }, { role: 'assistant', text: '历史正文'.repeat(400000) }
@@ -72,6 +72,17 @@ async function testSessions() {
   check(!(await handlers['sessions:list']({})).find(function find(x) { return x.id === 'history'; }).hasComposer, '列表同步草稿清空状态');
   await fs.promises.writeFile(path.join(dir, 'legacy.json'), JSON.stringify({ id: 'legacy', messages: [], composer: { text: '旧版草稿' } }));
   check((await handlers['sessions:load']({}, 'legacy')).composer.text === '旧版草稿', '旧存档保留原有草稿');
+  const broken = Buffer.alloc(147);
+  await fs.promises.writeFile(path.join(dir, 'drafts/history.json'), broken);
+  await fs.promises.writeFile(path.join(dir, 'drafts/zeroed.json'), broken);
+  await fs.promises.writeFile(path.join(dir, 'zeroed.json'), broken);
+  const afterCrash = await handlers['sessions:list']({});
+  check(afterCrash.some(item => item.id === 'history') && !afterCrash.some(item => item.id === 'zeroed'),
+    '掉电清零的草稿或正文不阻塞会话列表');
+  const reopened = await handlers['sessions:load']({}, 'history');
+  check(reopened.messages[0].text === full.messages[0].text && reopened.composer === null &&
+    fs.readFileSync(path.join(dir, 'drafts/history.json')).equals(broken),
+    '对话仍能打开，坏草稿留在磁盘供恢复');
   const writing = handlers['sessions:saveComposer']({}, draft);
   await handlers['sessions:delete']({}, 'history');
   await writing;
@@ -211,6 +222,10 @@ function fullPageSetup() {
     onHotReload: function onHotReload() { return noOp; }, hotReloadStatus: nullValue,
     // 余额同步是新增的主窗桥接口，完整页面夹具同步提供入口。
     reportAccountQuota: noOp,
+    // 设置页会读忽略索引目录，夹具补上空列表，避免打开设置时抛未处理拒绝。
+    indexGetIgnoredFolders: emptyList,
+    // 保存模型后界面会刷新厂商余额条，夹具明确返回「不可用」，不连真实接口。
+    fetchAccountBalance: async function fetchAccountBalance() { return { available: false }; },
     floatBind: noOp, floatForget: noOp, floatCanStart: noOp, logSummaryTrace: noOp,
     reportError: function reportError(stage, details) {
       if (stage === '界面脚本报错' || stage === '界面未处理的 Promise 拒绝') record.errors.push({ stage, details });
@@ -222,6 +237,7 @@ function fullPageSetup() {
       return true;
     },
     saveComposer: async function saveComposer(draft) { record.drafts.push(draft); return true; },
+    chatRestoreConsumed: noOp, stageTurnWindow: noOp,
     chatSend: function chatSend(payload) {
       record.requests.push(payload);
       record.turnId = payload.turnId;

@@ -387,9 +387,11 @@ function status(workspace, files, snap, stateKey, requireVisual) {
 /**
  * 生成已授权实施的小步执行、自测、返工和收尾说明。
  * @param {object} lang 当前回复语言配置，沿用项目语言选择。
+ * @param {boolean} agi 开启时读取用户手工保存的 AGI 自测段落；普通模式继续使用原有说明。
  * @returns {string} 供普通模型和直通使用的对应语言提示，无状态变化。
  */
-function guide(lang) {
+function guide(lang, agi = false) {
+  if (agi) return require('./agi-rules').section('自测', require('./reply-lang').promptInEnglish(lang));
   if (require('./reply-lang').promptInEnglish(lang)) {
     return 'Choose the smallest step that can be checked against the user goal. Once the next action is clear, do it and test the changed behavior immediately (run_command activity=test, a matching runtime condition, or a visual check; capture an observable outcome tied to the requested behavior). On failure, fix the demonstrated gap and retest. Compare the latest evidence with the user request. Report verified delivery only after the self-test passes. If an approach yields no new evidence, change approach. If the self-test still cannot pass, use “Please note” and name the affected behavior and the observed reason.' +
       ' In the final summary, report the outcome and observed reason. Keep command lines and full output in the tool records.' +

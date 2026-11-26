@@ -41,6 +41,145 @@ async function emit(win,turnId,event){
 async function finish(win){
   await win.webContents.executeJavaScript('fullPageRecord.resolveTurn({text:"本地测试完成",changes:[]});new Promise(function settle(resolve){setTimeout(resolve,80);})');
 }
+/**
+ * 读取当前回复中实际可见的插话状态文字。
+ * @param {BrowserWindow} win 已载入聊天页面的 Electron 测试窗口。
+ * @returns {Promise<string[]>} 按页面顺序排列的状态标签。
+ */
+async function followupLabels(win) {
+  return win.webContents.executeJavaScript(`Array.from(document.querySelectorAll('.msg[data-live] .interjection-todo-card li strong'))
+    .filter(function visible(node) { return node.getClientRects().length && getComputedStyle(node).visibility === 'visible'; })
+    .map(function label(node) { return node.textContent; })`);
+}
+
+/**
+ * 将收件、已看、处理中和交付事件送入正式页面，检查每条插话的可见状态。
+ * @param {BrowserWindow} win 已连接本地聊天夹具的 Electron 测试窗口。
+ * @returns {Promise<void>} 交付与中断断言通过时结束，状态不符时拒绝。
+ */
+async function testFollowups(win) {
+  const turn = await start(win, '核对插话状态');
+  const first = { id: 'first-followup', turnId: turn, text: '同一原文', status: 'pending' };
+  const next = { ...first, id: 'next-followup' };
+  await emit(win, turn, { type: 'interjection_todos', items: [first] });
+  assert.deepEqual(await followupLabels(win), ['待处理']);
+  await emit(win, turn, { type: 'status', text: '插话已送达 AI，正在继续处理…', processingInterjectionIds: [first.id] });
+  assert.deepEqual(await followupLabels(win), ['处理中']);
+  const seenFirst = { ...first, seen: true };
+  await emit(win, turn, { type: 'interjection_todos', items: [seenFirst] });
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 处理中']);
+  await emit(win, turn, { type: 'interjection_todos', items: [next] });
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 待处理', '待处理']);
+  await emit(win, turn, { type: 'status', text: '插话已送达 AI，正在继续处理…', processingInterjectionIds: [next.id] });
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 待处理', '处理中']);
+  const seenNext = { ...next, seen: true };
+  await emit(win, turn, { type: 'interjection_todos', items: [seenNext] });
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 待处理', 'AI 已看 · 处理中']);
+  check(true, '插话卡片在交付前显示处理中，新插话打断后只更新本批编号');
+  const tasks = [
+    { goal: '核对第一份资料', resource: 'project', status: 'running', interjectionIds: [first.id] },
+    { goal: '核对第二份资料', resource: 'project', status: 'running', interjectionIds: [next.id] }
+  ];
+  const workspace = await win.webContents.executeJavaScript('window.simple.getState().then(function current(state){return state.workspace;})');
+  await emit(win, turn, { type: 'agi_parallel', workspace, tasks });
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 处理中', 'AI 已看 · 处理中']);
+  check(true, '新插话切换主会话的处理编号后，两个在跑的子代理各自保持原插话卡片处理中');
+  // 保存同一时刻两条插话并行处理的真实绘制结果。
+  const bounds = await win.webContents.executeJavaScript(`(async function cardBounds() {
+    const card = document.querySelector('.msg[data-live] .interjection-todo-card');
+    card.scrollIntoView({ block: 'center', behavior: 'instant' });
+    // 等实际滚动和布局提交，再取截图区域，避免截到上一轮的卡片。
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    const rect = document.querySelector('.msg[data-live] .interjection-todo-card').getBoundingClientRect();
+    const target = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+    if (!target?.closest('.interjection-todo-card')) {
+      throw new Error('插话卡片未显示在截图区域 ' + JSON.stringify({ rect, target: target?.outerHTML.slice(0, 240) }));
+    }
+    return { x: rect.x + scrollX, y: rect.y + scrollY, width: rect.width, height: rect.height, scale: 1 };
+  })()`);
+  const screenshot = await win.webContents.debugger.sendCommand('Page.captureScreenshot', { format: 'png', clip: bounds });
+  fs.writeFileSync(path.join(output, 'interjections.png'), Buffer.from(screenshot.data, 'base64'));
+  await emit(win, turn, { type: 'agi_parallel', workspace, tasks: [{ ...tasks[0], status: 'completed' }, tasks[1]] });
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 待处理', 'AI 已看 · 处理中']);
+  const delivered = [seenFirst, { ...seenNext, status: 'completed', result: '核对得到 <两笔> 结果' }];
+  await emit(win, turn, { type: 'done', text: '处理结果已交付', workingMemory: { todos: [], interjectionTodos: delivered } });
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 待处理', 'AI 已看 · 已处理']);
+  // 交付正文属于原插话行，保留尖括号并且不能继承已完成待办的删除线。
+  const readable = await win.webContents.executeJavaScript(`(function delivery() {
+    const receipt = document.querySelector('.interjection-todo-card .interjection-result');
+    const id = receipt.closest('li').dataset.interjectionId;
+    for (let el = receipt; el; el = el.parentElement) {
+      if (getComputedStyle(el).textDecorationLine.includes('line-through')) return null;
+    }
+    return { id, text: receipt.innerText };
+  })()`);
+  assert.deepEqual(readable, { id: next.id, text: delivered[1].result });
+  check(true, '已处理卡片按原插话编号显示完整结果，文字无删除线且特殊字符按原文显示');
+  await finish(win);
+
+  const stoppedTurn = await start(win, '处理插话时点停止');
+  const stopped = { ...first, id: 'stopped-followup', turnId: stoppedTurn };
+  await emit(win, stoppedTurn, { type: 'interjection_todos', items: [stopped] });
+  await emit(win, stoppedTurn, { type: 'status', text: '插话已送达 AI，正在继续处理…', processingInterjectionIds: [stopped.id] });
+  assert.deepEqual(await followupLabels(win), ['处理中']);
+  await emit(win, stoppedTurn, { type: 'interjection_todos', items: [{ ...stopped, seen: true }] });
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 处理中']);
+  await win.webContents.executeJavaScript("window.simple.chatAbort = function holdStop() {}; document.getElementById('btn-send').click()");
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 待处理']);
+  check(true, '正常交付只完成已确认的插话，点击停止立即恢复待处理并保留 AI 已看');
+  await finish(win);
+}
+
+/**
+ * 验证主会话在整轮结束前把实际结果发布到原卡片。
+ * 同文插话按编号分别交付；从正式页面读取状态、正文并保留第一项交付时的截图。
+ * @param {BrowserWindow} win 使用本地聊天夹具的完整 SpCode 窗口。
+ */
+async function testIndividualDelivery(win) {
+  const { InterjectionTodos } = require('../electron/lib/interjection-todos');
+  const turn = await start(win, '核对同文插话的逐项交付');
+  const events = [];
+  /** 保存宿主实际发布的事件，按原顺序送给正式页面。 */
+  function record(event) { events.push(event); }
+  /** 按产生次序把本阶段的卡片事件发给页面，渲染完成后再读取状态。 */
+  async function flush() {
+    for (const event of events.splice(0)) await emit(win, turn, event);
+  }
+  const ledger = new InterjectionTodos({ current: { interjectionTodos: [] } }, turn, record);
+  const first = ledger.receive('核对这份账单');
+  const second = ledger.receive('核对这份账单');
+  ledger.markSeen([first, second]);
+  await flush();
+  await emit(win, turn, { type: 'status', text: '正在处理插话', processingInterjectionIds: [first, second] });
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 处理中', 'AI 已看 · 处理中']);
+
+  ledger.mark(first, false, '第一份账单合计 83 元');
+  await flush();
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 已处理', 'AI 已看 · 处理中']);
+  const rowSelector = '.msg[data-live] .interjection-todo-card li[data-interjection-id="';
+  const receipt = await win.webContents.executeJavaScript('document.querySelector('+JSON.stringify(rowSelector+first+'"] .interjection-result')+').innerText');
+  assert.equal(receipt, '第一份账单合计 83 元');
+  const clip = await win.webContents.executeJavaScript(`(async function locate() {
+    const selector = '.msg[data-live] .interjection-todo-card';
+    document.querySelector(selector).scrollIntoView({ block: 'center', behavior: 'instant' });
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    const r = document.querySelector(selector).getBoundingClientRect();
+    return { x: r.x + scrollX, y: r.y + scrollY, width: r.width, height: r.height, scale: 1 };
+  })()`);
+  const shot = await win.webContents.debugger.sendCommand('Page.captureScreenshot', { format: 'png', clip });
+  fs.writeFileSync(path.join(output, 'individual-delivery.png'), Buffer.from(shot.data, 'base64'));
+  ledger.mark(second, false, '第二份账单合计 19 元');
+  await flush();
+  assert.deepEqual(await followupLabels(win), ['AI 已看 · 已处理', 'AI 已看 · 已处理']);
+  const nextReceipt = await win.webContents.executeJavaScript('document.querySelector('+JSON.stringify(rowSelector+second+'"] .interjection-result')+').innerText');
+  assert.equal(nextReceipt, '第二份账单合计 19 元');
+  check(true, '整轮仍在运行时，同文插话逐项显示原编号的交付结果，先交付时另一项保持处理中');
+  await emit(win, turn, { type: 'done', text: '两项结果均已交付', workingMemory: ledger.memory.current });
+  await finish(win);
+}
+
 /** 运行当前任务、旧快照、等待答复、失败和最终状态同步用例。 */
 async function run(){
   await app.whenReady();
@@ -87,6 +226,9 @@ async function run(){
   list=await marks(win);
   check(list[3].animation==='none'&&list[3].animations===0,'错误事件结束任务执行动画');
   await finish(win);
+
+  await testFollowups(win);
+  await testIndividualDelivery(win);
 
   // 使用实际卡片函数和实际恢复函数，核对重开历史、停止和减少动态效果。
   const cardSource=extract(source,'function renderTodoCard(m)');

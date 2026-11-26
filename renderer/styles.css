@@ -3559,6 +3559,25 @@ html[data-theme="dark"] .start-go-submit:disabled {
   .todo-in_progress.todo-running .todo-mark { animation: none; }
 }
 
+/* 重启只读核对卡片：只展示核对进度、统计和失败原因，不冒充任何一条对话消息。 */
+.restart-review-card { border-style: dashed; }
+.restart-review-line { margin: 2px 0; line-height: 1.55; word-break: break-word; }
+.restart-review-error { color: var(--danger); }
+.restart-review-running .todo-head::after {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: restart-review-pulse 1.1s ease-in-out infinite;
+}
+@keyframes restart-review-pulse { 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) {
+  .restart-review-running .todo-head::after { animation: none; }
+}
+
 
 /* 锐线赛璐璐：独立的浅底主题，以墨线、平涂色块和无模糊投影表现层次。
    所有规则只在 cel 下生效；电路板与黑金幻彩保留各自原有外观。 */

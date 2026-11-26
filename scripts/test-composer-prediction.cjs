@@ -85,6 +85,7 @@ function fixtureSetup() {
       return true;
     },
     saveComposer: async function saveComposer(draft) { record.drafts.push(structuredClone(draft)); return true; },
+    chatRestoreConsumed: noOp, stageTurnWindow: noOp,
     chatSend: async function chatSend(payload) {
       record.sent.push(structuredClone(payload));
       // 等实际收到发送事件后保持会话在运行，面板测试显式结束该轮。
@@ -458,13 +459,15 @@ async function testParallelPanel() {
   await setInput('同时检查页面并验证游戏');
   await nativeKey('Return');
   await waitFor('predictionFixture.finishChat');
-  await page(`(function prepareParallel() {
+  await page(`/** 创建仍在发送的会话夹具，发布两个运行和两个排队的任务，并记录跨项目事件是否被隔离。 */
+  (function prepareParallel() {
     const state = __composerPredictionTest.state;
     const tab = state.tabs.find(function current(item) { return item.id === state.activeTab; });
     window.testParallelTurn = { tab: tab.id, turnId: tab.liveTurnId, workspace: tab.workspace, tasks: [
       { goal: '核对浏览器 <b>标题</b>', resource: 'desktop', status: 'running' },
       { goal: '写小游戏并运行', resource: 'project', status: 'running' },
-      { goal: '查看另一个窗口', resource: 'desktop', status: 'queued' }
+      { goal: '查看另一个窗口', resource: 'desktop', status: 'queued' },
+      { goal: '检查设置页', resource: 'desktop', status: 'queued' }
     ] };
     document.getElementById('input').focus();
     emitFixtureChat({ type: 'agi_parallel', ...testParallelTurn, workspace: 'other-fixture' });
@@ -482,9 +485,9 @@ async function testParallelPanel() {
       waiting: panel.querySelector('[data-workbench-waiting]').textContent,
       belowChat: panel.previousElementSibling.classList.contains('chat-stage') };
   })()`);
-  check(snapshot.visible && snapshot.count === '2 项运行中 · 共 3 项', '真实界面同时显示两项运行和第三项排队');
-  assert.deepEqual(snapshot.labels, ['使用桌面', '执行中', '等待桌面']);
-  check(snapshot.belowChat && snapshot.owner.includes('浏览器') && snapshot.waiting === '1 项等待',
+  check(snapshot.visible && snapshot.count === '2 项运行中 · 共 4 项', '真实界面同时显示两项运行和两项排队');
+  assert.deepEqual(snapshot.labels, ['使用桌面', '执行中', '等待桌面', '等待桌面']);
+  check(snapshot.belowChat && snapshot.owner.includes('浏览器') && snapshot.waiting === '2 项等待',
     '独立工作台位于聊天区底部并显示前台拥有者与等待数');
   check(await page('crossProjectEventHidden'), '同轮编号携带其他项目时工作台拒绝显示');
   check(snapshot.focus === 'input' && !snapshot.containsMarkup, '面板标明桌面占用且保留输入焦点，目标文字按原文显示');
@@ -505,17 +508,21 @@ async function testParallelPanel() {
   fs.writeFileSync(path.join(output, 'agi-workbench.png'), (await win.webContents.capturePage()).toPNG());
   await page('__composerPredictionTest.state.workspace = "other-fixture"; __composerPredictionTest.newTab()');
   check(await page('document.getElementById("agi-workbench").hidden'), '切到另一项目不显示原项目的子代理');
-  await page(`(function backgroundProgress() {
+  await page(`/** 在发起会话处于后台时发布任务进展，覆盖完成、受阻、接手桌面和停止四种状态。 */
+  (function backgroundProgress() {
     testParallelTurn.tasks[0].status = 'completed';
     testParallelTurn.tasks[0].result = '已核对浏览器标题。';
     testParallelTurn.tasks[1].status = 'blocked';
     testParallelTurn.tasks[1].result = '缺少关卡 <b>入口</b>。';
     testParallelTurn.tasks[2].status = 'running';
+    testParallelTurn.tasks[3].status = 'interrupted';
+    testParallelTurn.tasks[3].result = '用户已补充或停止。';
     emitFixtureChat({ type: 'agi_parallel', ...testParallelTurn });
   })()`);
   assert.equal(await page('document.getElementById("agi-workbench").hidden'), true);
   await page('__composerPredictionTest.switchToTab(testParallelTurn.tab)');
-  const handoff = await page(`(function inspectHandoff() {
+  const handoff = await page(`/** 读取切回后可见的活动卡片、桌面占用和回执，并统计停止条目供断言。 */
+  (function inspectHandoff() {
     const panel = document.getElementById('agi-workbench');
     const cards = panel.querySelectorAll('.agi-workbench-card');
     const blocked = panel.querySelector('.agi-workbench-receipt[data-status="blocked"]');
@@ -524,6 +531,7 @@ async function testParallelPanel() {
       owner: panel.querySelector('[data-workbench-desktop] strong').textContent,
       completed: panel.querySelector('.agi-workbench-receipt[data-status="completed"] .agi-workbench-result').textContent,
       blocked: blocked.querySelector('.agi-workbench-result').textContent,
+      stoppedItems: panel.querySelectorAll('[data-status="interrupted"]').length,
       blockedMarkup: !!blocked.querySelector('b'),
       receiptVisible: blocked.getBoundingClientRect().height > 0 };
   })()`);
@@ -531,23 +539,37 @@ async function testParallelPanel() {
     handoff.count === '1 项运行中 · 共 1 项', '关闭的子代理逐个退出活动区，剩余代理接手前台并单独计数');
   check(handoff.completed === '已核对浏览器标题。' && handoff.blocked === '缺少关卡 <b>入口</b>。' &&
     !handoff.blockedMarkup && handoff.receiptVisible, '完成回执和受阻原因在发起项目中可见，回执按纯文本显示');
-  await page(`(function closeLastBranch() {
-    testParallelTurn.tasks[2].status = 'interrupted';
-    testParallelTurn.tasks[2].result = '用户已补充或停止。';
-    emitFixtureChat({ type: 'agi_parallel', ...testParallelTurn });
-  })()`);
-  check(await page(`(function onlyReceiptsRemain() {
-    const panel = document.getElementById('agi-workbench');
-    return !panel.hidden && panel.querySelector('[data-workbench-tasks]').hidden &&
-      panel.querySelector('[data-workbench-count]').hidden && panel.querySelector('[data-workbench-desktop]').hidden &&
-      panel.querySelectorAll('[data-workbench-receipts] > li').length === 3 &&
-      panel.querySelector('.agi-workbench-receipt[data-status="interrupted"] .agi-workbench-result').textContent === '用户已补充或停止。';
-  })()`), '全部子代理关闭后只留下本轮回执，活动区及桌面占用提示消失');
+  check(handoff.stoppedItems === 0, '已暂停的子代理立即退出工作台，剩余子代理继续显示');
   // 等待合成器绘制后记录有受阻原因的工作台实景。
   await page('new Promise(function repaint(resolve) { requestAnimationFrame(function first() { requestAnimationFrame(resolve); }); })');
   const receiptImage = await win.webContents.capturePage();
   assert.ok(!receiptImage.isEmpty());
   fs.writeFileSync(path.join(output, 'agi-workbench-receipts.png'), receiptImage.toPNG());
+  await page(`(function closeLastBranch() {
+    testParallelTurn.tasks[2].status = 'interrupted';
+    testParallelTurn.tasks[2].result = '用户已补充或停止。';
+    emitFixtureChat({ type: 'agi_parallel', ...testParallelTurn });
+  })()`);
+  check(await page(`/** 检查主会话仍在发送时，工作台是否隐藏、退出布局并清空卡片与回执。 */
+  (function inspectClosedPanel() {
+    const panel = document.getElementById('agi-workbench');
+    /**
+     * 按会话 ID 识别发起本轮并行任务的会话。
+     * @param {object} item 当前参与查找的候选会话。
+     * @returns {boolean} 候选会话是本轮发起会话时返回 true，否则返回 false。
+     */
+    function source(item) {
+      return item.id === testParallelTurn.tab;
+    }
+    const tab = __composerPredictionTest.state.tabs.find(source);
+    return tab.sending && panel.hidden && getComputedStyle(panel).display === 'none' &&
+      panel.getBoundingClientRect().height === 0 && !panel.querySelector('.agi-workbench-card, .agi-workbench-receipt');
+  })()`), '最后一个子代理停止后立即收起工作台，主会话仍在运行');
+  // 等待实际绘制后保存工作台收起的聊天界面。
+  await page('new Promise(function repaint(resolve) { requestAnimationFrame(function first() { requestAnimationFrame(resolve); }); })');
+  const closedImage = await win.webContents.capturePage();
+  assert.ok(!closedImage.isEmpty());
+  fs.writeFileSync(path.join(output, 'agi-workbench-closed.png'), closedImage.toPNG());
 
   await page('predictionFixture.holdChat = false; predictionFixture.finishChat()');
   await waitFor('document.getElementById("agi-workbench").hidden');

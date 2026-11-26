@@ -44,6 +44,10 @@ const codeEmbed = require('./lib/code-embed');
 const desktopHand = require('./lib/desktop-hand');
 const contextPreview = require('./lib/context-preview');
 const { distillSubmittedRequirements } = require('./lib/composer-requirements');
+// 进程重启后的只读核对：只读真实存档、不授工具，模型回执才把本批插话标为已看。
+const { createRestartReview } = require('./lib/restart-pending-review');
+// 仅软件启动时恢复的主窗登记未办清单，手动新建窗口沿用通常的会话流程。
+const startupReviewWindows = new WeakSet();
 const trainingArchive = require('./lib/training-recorder');
 // 发送前预览：只读拼一遍本轮 system 文本给预览面板，模块内不发模型请求、不写盘
 const promptPreview = require('./lib/prompt-preview');
@@ -107,6 +111,11 @@ let mySlot = 1;
 let shortcutOk = false;
 /** turnId -> { win, tabId }：这一轮属于哪个窗口的哪个标签页 */
 const turnOwner = new Map();
+// 页面重载接回：按窗口留存本轮已发事件（带序号）与最终结果，界面消费或窗口关闭才释放。
+// 只给同一窗口的同一标签接回，不重发 chat:send、不重跑工具。
+const turnRecovery = require('./lib/turn-recovery').createTurnRecovery();
+// 仅在有轮次的主窗卸载时暂存 UI，供同一窗口的新文档消费。
+const reloadingPages = new WeakMap();
 /** winId -> Set<turnId>：哪些窗口还有轮次在跑（原全局 runningTurns 的按窗口版本） */
 const runningByWin = new Map();
 /** sessionKey -> 显示名，小窗的会话清单用 */
@@ -231,7 +240,10 @@ function ensureAppRoot() {
   fs.mkdirSync(dest, { recursive: true });
   if (!fs.existsSync(marker)) {
     try {
-      if (fs.existsSync(src)) fs.cpSync(src, dest, { recursive: true });
+      // AGI 文件单独以“不覆盖用户修改”的方式安装，新旧安装共用同一份静态资源。
+      const agiSource = path.join(src, 'rules', 'agi.md');
+      function commonResource(file) { return file !== agiSource; }
+      if (fs.existsSync(src)) fs.cpSync(src, dest, { recursive: true, filter: commonResource });
     } catch (e) {
       diag.log('app', '种子 app-root 失败', { message: e && e.message });
     }
@@ -239,6 +251,7 @@ function ensureAppRoot() {
     fs.mkdirSync(path.join(dest, 'rules'), { recursive: true });
     try { fs.writeFileSync(marker, new Date().toISOString(), 'utf8'); } catch { /* ignore */ }
   }
+  require('./lib/agi-rules').install(src, dest);
   APP_ROOT = dest;
   return APP_ROOT;
 }
@@ -261,7 +274,7 @@ const longAliveHost = require('./lib/long-alive-host').registerLongAlive({
 });
 
 function sendTo(win, channel, data) {
-  if (win && !win.isDestroyed()) win.webContents.send(channel, data);
+  if (win && !win.isDestroyed() && !win.webContents.isCrashed()) win.webContents.send(channel, data);
 }
 
 /** 业务更新等所有窗口轮次和桌面动作空闲，保留仍在运行的任务及会话。 */
@@ -685,6 +698,8 @@ function createWindow(layoutId) {
     winIdByWin.delete(win);
     winById.delete(winId);
     runningByWin.delete(winId);
+    // 窗口没了，它留存的重载接回数据也一起释放
+    turnRecovery.dropWindow(win);
     lastTabIdByWin.delete(win);
     const prefix = winId + ':';
     for (const k of [...sessionsByKey.keys()]) {
@@ -701,16 +716,21 @@ function createWindow(layoutId) {
   win.on('unresponsive', () => diag.log('window', '窗口无响应'));
   win.on('responsive', () => diag.log('window', '窗口恢复响应'));
   win.webContents.on('render-process-gone', function rendererGone(_e, details) {
-    longAliveHost.release(win);
+    releaseIdleScheduler();
     diag.log('crash', '渲染进程退出', details);
   });
-  // 真实页面重载前释放旧调度；恢复页面后由绑定入口重新加载配置。
-  win.webContents.on('did-start-loading', function releaseLongAlive() { longAliveHost.release(win); });
+  /** 正在执行的常驻轮次由原调度器继续管理；空闲页面仍沿用原先的释放流程。 */
+  function releaseIdleScheduler() {
+    if (!turnRecovery.hasResident(win)) longAliveHost.release(win);
+  }
+  win.webContents.on('did-start-loading', releaseIdleScheduler);
   win.webContents.on('preload-error', (_e, preloadPath, error) => {
     diag.log('crash', 'preload 出错', { preloadPath, message: error && error.message });
   });
   win.webContents.on('before-input-event', (event, input) => {
-    if (input.type === 'keyDown' && input.key === 'F5') {
+    // Electron 的默认重载快捷键也需经过非破坏性刷新，避免运行中绕过页面交接。
+    const reloadKey = (input.control || input.meta) && input.key.toLowerCase() === 'r' && turnIsRunning(win);
+    if (input.type === 'keyDown' && (input.key === 'F5' || reloadKey)) {
       event.preventDefault();
       sendTo(win, 'ui:refresh', {});
     }
@@ -728,14 +748,15 @@ ipcMain.handle('app:hotReloadRestored', function hotReloadRestored(event) {
 
 /**
  * 冷启动或重新激活时按稳定身份恢复原窗口组。
- * 无参数；首次启动没有登记时创建新主窗，有登记时按原顺序创建对应窗口。
+ * @param {boolean} atStartup 软件进程首次启动时登记恢复窗口，供界面核对各标签的未办事项。
  * @returns {void} 各主窗自行加载其标签清单；登记读取失败直接报告，不用另一窗口的数据代替。
  */
-function restoreWindows() {
+function restoreWindows(atStartup = false) {
   const layouts = windowLayouts.restore(codeRestart.layouts());
-  if (!layouts.length) createWindow();
-  else {
-    for (const layout of layouts) createWindow(layout);
+  const restored = layouts.length ? layouts : [undefined];
+  for (const layout of restored) {
+    const win = createWindow(layout);
+    if (atStartup) startupReviewWindows.add(win);
   }
 }
 
@@ -1056,6 +1077,7 @@ function registerFloatBarIpc() {
     const win = getWin(event);
     const key = makeSessionKey(win, String(tabId));
     sessionsByKey.delete(key);
+    turnRecovery.forgetTab(win, String(tabId));
     canStartByKey.delete(key);
     if (boundKey === key) boundKey = '';
     if (lastActiveKey === key) lastActiveKey = '';
@@ -1313,7 +1335,7 @@ app.whenReady().then(async () => {
   // 小窗 IPC 必须赶在建主窗之前登记：主窗一开工就会回报绑定/开工状态，晚登记会漏掉首批消息。
   // 这些通道只用到模块级的表（floatBars / sessionsByKey / winIdByWin 等），不依赖 mySlot、floatBar、shortcutOk
   registerFloatBarIpc();
-  restoreWindows();
+  restoreWindows(true);
   warmUpCursor();
   // 全局快捷键直接控制屏幕上的独立输入框，不依赖宠物可见。
   try {
@@ -1523,7 +1545,10 @@ ipcMain.handle('app:state', async function appState(e) {
     workspace: workspaceByWin.get(win) || '',
     // 清单绑定跨重启保留的窗口身份，运行编号和多开进程槽位变化不会读到其他窗口的清单。
     sessionLayoutKey: `spcode:open-tabs:${layoutByWin.get(win)}`,
+    reviewOnStartup: startupReviewWindows.has(win),
     codeReloadSnapshot: codeRestart.snapshot(layoutByWin.get(win)),
+    turnWindowSnapshot: reloadingPages.get(win),
+    turnActiveTab: lastTabIdByWin.get(win),
     appRoot: APP_ROOT,
     localFiles: listLocalFilesEnriched(modelsDir),
     assemblyKey: assembly.assemblyKey(s)
@@ -2369,19 +2394,19 @@ ipcMain.handle('skills:setEnabled', (e, keys) => {
 
 ipcMain.handle('rules:list', (e) => {
   const ws = workspaceByWin.get(getWin(e)) || '';
-  return agent.listRules(APP_ROOT, ws);
+  return agent.listRules(APP_ROOT, ws, true);
 });
 
 ipcMain.handle('rules:save', (e, payload) => {
   const ws = workspaceByWin.get(getWin(e)) || '';
   skillsLib.saveRule(APP_ROOT, ws, payload);
-  return agent.listRules(APP_ROOT, ws);
+  return agent.listRules(APP_ROOT, ws, true);
 });
 
 ipcMain.handle('rules:delete', (e, payload) => {
   const ws = workspaceByWin.get(getWin(e)) || '';
   skillsLib.deleteRule(APP_ROOT, ws, payload);
-  return agent.listRules(APP_ROOT, ws);
+  return agent.listRules(APP_ROOT, ws, true);
 });
 
 ipcMain.handle('persona:load', () => skillsLib.loadPersona(APP_ROOT).body);
@@ -2750,6 +2775,7 @@ function sessionMetaOf(data) {
     workspace: data.workspace,
     updatedAt: data.updatedAt,
     messageCount: Array.isArray(data.messages) ? data.messages.length : 0,
+    hasQueuedRequests: Boolean(data.queue?.length),
     hasComposer: !!(data.composer && (data.composer.text || (data.composer.attachments && data.composer.attachments.length) || data.composer.refillFromIndex != null)),
     requirements: distillSubmittedRequirements(data)
   };
@@ -2812,9 +2838,10 @@ function flushSessionSave(id) {
         const data = job.next;
         job.next = null;
         const file = path.join(sessionDir(), `${id}.json`);
-        const tmp = `${file}.tmp`;
+        const tmp = `${file}.${process.pid}.tmp`;
         await fs.promises.mkdir(sessionDir(), { recursive: true });
-        await fs.promises.writeFile(tmp, JSON.stringify(data), 'utf8');
+        // 先刷盘再替换，缩小突然关机时新文件只有文件名、内容尚未落盘的窗口。
+        await fs.promises.writeFile(tmp, JSON.stringify(data), { encoding: 'utf8', flush: true });
         if (job.dead) {
           await fs.promises.unlink(tmp).catch(() => {});
           break;
@@ -2833,7 +2860,13 @@ function flushSessionSave(id) {
   return job.pending;
 }
 
-ipcMain.handle('sessions:save', async (_e, session) => {
+/**
+ * 把一份完整会话存档排进写盘队列，同一会话只写最新一份。
+ * @param {object} session 会话数据，必须含 id。
+ * @returns {Promise<boolean>} 最新存档落盘后返回 true。
+ * 各份会话数据来自拥有该标签的界面，排队期间以最新快照为准。
+ */
+async function saveSessionRecord(session) {
   if (!session || !session.id) throw new Error('会话无效');
   const id = String(session.id);
   const data = { ...session, updatedAt: new Date().toISOString() };
@@ -2846,6 +2879,10 @@ ipcMain.handle('sessions:save', async (_e, session) => {
   // 在完整保存入口立即登记草稿顺序，较晚到达的输入保存不得被旧正文覆盖。
   await Promise.all([flushSessionSave(id), sessionComposers.save(data)]);
   return true;
+}
+
+ipcMain.handle('sessions:save', async (_e, session) => {
+  return saveSessionRecord(session);
 });
 
 /** 高频输入仅保存草稿；会话正文仍由原有完整保存和流式保存负责。 */
@@ -2867,18 +2904,50 @@ ipcMain.handle('sessions:delete', async (_e, id) => {
   return true;
 });
 
-// [铆钉优化] 异步读对话文件，打开大对话时主进程不卡。其他 AI 请勿改回 readFileSync
-ipcMain.handle('sessions:load', async (_e, id) => {
-  if (!id) throw new Error('会话无效');
+/**
+ * 读取一份完整会话存档，并合并独立的草稿文件。
+ * @param {string} id 会话编号。
+ * @returns {Promise<object|null>} 存档数据；会话文件不存在且没有草稿时返回 null。
+ * 冷启动和打开历史都读取相同的正文及草稿。
+ */
+async function loadSessionRecord(id) {
   const p = path.join(sessionDir(), `${id}.json`);
-  const draft = await sessionComposers.load(id);
+  // 草稿独立于正文，权限错误或损坏时仍然打开已保存的对话。
+  const draft = await sessionComposers.load(id).catch(() => null);
   if (!fs.existsSync(p)) {
     if (draft) return { ...draft, messages: [] };
-    throw new Error('会话不存在');
+    return null;
   }
   const data = JSON.parse(await fs.promises.readFile(p, 'utf8'));
   if (draft) data.composer = draft.composer;
   return data;
+}
+
+// [铆钉优化] 异步读对话文件，打开大对话时主进程不卡。其他 AI 请勿改回 readFileSync
+ipcMain.handle('sessions:load', async (_e, id) => {
+  if (!id) throw new Error('会话无效');
+  const data = await loadSessionRecord(id);
+  if (!data) throw new Error('会话不存在');
+  return data;
+});
+
+/** 按原标签的模型配置只读查看重启清单及原图，回执交给该标签保存。 */
+const restartReview = createRestartReview(function readSessionBacklog(request) {
+  const settings = store.load();
+  const modelCfg = store.resolveModelCfg(request.modelId, settings);
+  if (!modelCfg) throw new Error('该会话的模型不可用');
+  return agent.reviewWithoutTools({ ...request, modelCfg });
+});
+
+/** 冷启动窗口登记首份清单，随后的文档重载只接回同一批请求。 */
+ipcMain.handle('restartReview:begin', function beginReview(event, requests) {
+  const win = getWin(event);
+  return startupReviewWindows.has(win) ? restartReview.begin(win, requests) : [];
+});
+
+/** 返回这个窗口中原标签的模型回执，避免刷新或切标签时重复发送。 */
+ipcMain.handle('restartReview:result', function reviewResult(event, id) {
+  return restartReview.result(getWin(event), id);
 });
 
 ipcMain.handle('sessions:rename', (_e, { id, title }) => {
@@ -2888,7 +2957,9 @@ ipcMain.handle('sessions:rename', (_e, { id, title }) => {
   const data = JSON.parse(fs.readFileSync(p, 'utf8'));
   data.title = String(title || '').trim().slice(0, 80) || '未命名';
   data.updatedAt = new Date().toISOString();
-  fs.writeFileSync(p, JSON.stringify(data), 'utf8');
+  const tmp = `${p}.${process.pid}.rename.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data), { encoding: 'utf8', flush: true });
+  fs.renameSync(tmp, p);
   return { id: data.id, title: data.title };
 });
 
@@ -2916,6 +2987,27 @@ function handleChatAbort(win, turnId) {
 }
 
 ipcMain.handle('chat:abort', (e, turnId) => handleChatAbort(getWin(e), turnId));
+
+// 页面重载后取本窗口未消费的轮次恢复数据。只读，不触发发送，也不碰其他窗口。
+ipcMain.handle('chat:restoreTurn', (e) => turnRecovery.snapshot(getWin(e)));
+/** 收到真实卸载通知时暂存该主窗的最新草稿、标签与已消费的事件序号。 */
+ipcMain.on('chat:stageWindow', function stageWindow(event, snapshot) {
+  const win = getWin(event);
+  if (windows.has(win)) reloadingPages.set(win, snapshot);
+  event.returnValue = true;
+});
+/** 按发送窗口更新已处理的回复进度，不触发会话落盘。 */
+ipcMain.on('chat:checkpoint', function checkpointTurn(event, turnId, update) {
+  turnRecovery.checkpoint(getWin(event), turnId, update);
+});
+/** 页面已经安装自己的事件监听，旧页面快照可以释放。 */
+ipcMain.on('chat:windowRestored', function windowRestored(event) { reloadingPages.delete(getWin(event)); });
+/** 等待原轮最终结果，恢复页面不再调用发送入口。 */
+ipcMain.handle('chat:waitTurn', function waitTurn(event, turnId) { return turnRecovery.wait(getWin(event), turnId); });
+// 界面已按这份数据收尾，主进程立刻释放，避免同一轮被反复接回。
+ipcMain.handle('chat:restoreConsumed', (e, turnId) => {
+  return turnRecovery.release(getWin(e), turnId);
+});
 
 // 主窗与悬浮栏共用同一份回答交付逻辑，不复制两份，免得改一处漏一处
 function handleChatAnswer(win, payload) {
@@ -2969,13 +3061,7 @@ ipcMain.handle('chat:promptPreview', (e, payload) => {
     if (sid && !payloadIds.includes(sid)) payloadIds.push(sid);
   }
   const chosen = payloadIds.map((id) => skills.find((x) => x.id === id)).filter(Boolean);
-  const skill = chosen.length
-    ? {
-      id: chosen.map((x) => x.id).join('+'),
-      name: chosen.map((x) => x.name).join(' + '),
-      body: chosen.map((x) => x.body).join('\n\n---\n\n')
-    }
-    : null;
+  const skill = skillsLib.combineSkillsForMode(chosen, desktopHand.isAlive());
   // build 原样返回：system 给面板展示，editable 给面板先改，notes 标出哪些内容要到发送时才现场生成。
   // skills / skill / rules / allSkills 一并透传，面板要按这些渲染勾选项；build 内部仍按 skillIds 自己重算同一份，结果一致。
   return promptPreview.build({
@@ -2990,7 +3076,25 @@ ipcMain.handle('chat:promptPreview', (e, payload) => {
   });
 });
 
-ipcMain.handle('chat:send', async (e, payload) => {
+/** 将轮次登记与原始发送绑定；成功、失败和取消都在完整收尾后通知新页面。 */
+ipcMain.handle('chat:send', async function sendChat(e, payload, seed) {
+  const win = getWin(e);
+  const recovery = turnRecovery.open(win, {
+    turnId: payload.turnId, tabId: resolveTurnTabId(win, payload), modelId: payload.modelId,
+    runId: payload.longAliveRunId, resident: !!payload.longAliveRunId, seed
+  });
+  try {
+    const result = await executeChat(e, payload, recovery);
+    turnRecovery.finish(recovery, recovery?.stopped ? 'stopped' : 'success', { result });
+    return result;
+  } catch (error) {
+    turnRecovery.finish(recovery, recovery?.stopped || error.name === 'AbortError' ? 'stopped' : 'error', { error: error.message });
+    throw error;
+  }
+});
+
+/** 执行原窗口授权的这一次模型调用，事件和最终回执由外层登记供重载接回。 */
+async function executeChat(e, payload, recovery) {
   const win = getWin(e);
   // 只接受调度器对当前投递保存的授权目标，渲染层的轮次正文仅提供模型上下文。
   const longAliveGoal = payload.longAliveRunId
@@ -3036,7 +3140,11 @@ ipcMain.handle('chat:send', async (e, payload) => {
   function onEvent(ev) {
     if (ev.type === 'error') turnOutcome = 'error';
     if (archive) archive.record('event', ev);
-    if (!ev.activityOnly) sendTo(win, 'chat:event', turnId ? { ...ev, turnId } : ev);
+    if (!ev.activityOnly) {
+      // 先登记再发送：真的发到界面的那条才编序号，重载期间丢了也能按序号补回。
+      const outgoing = turnId ? { ...ev, turnId } : ev;
+      sendTo(win, 'chat:event', turnRecovery.append(recovery, outgoing));
+    }
     forwardTurnEventToFloatBar(ev, turnId);
   }
   // 用当前对话勾着的那一组，可多个一起用。没带上来时才默认 zabingsk。
@@ -3049,30 +3157,24 @@ ipcMain.handle('chat:send', async (e, payload) => {
     if (s && !payloadIds.includes(s)) payloadIds.push(s);
   }
   const chosen = payloadIds.map((id) => skills.find((x) => x.id === id)).filter(Boolean);
-  const skill = chosen.length
-    ? {
-      id: chosen.map((x) => x.id).join('+'),
-      name: chosen.map((x) => x.name).join(' + '),
-      body: chosen.map((x) => x.body).join('\n\n---\n\n')
-    }
-    : null;
+  const agiForSkill = desktopHand.isAlive();
+  const skill = skillsLib.combineSkillsForMode(chosen, agiForSkill);
   const rules = agent.listRules(APP_ROOT, ws);
   // 预览面板里这一轮改过的内容，只作用于本次发送：用户可能在「上下文」预览里改了规则、技能和人设。
   // 三项各自「有值才顶替」——缺失或为 null 时仍用上面从磁盘读到的原值，保证不带 sysOverrides 的常规发送完全不变；
   // 这里只改本轮内存里的取值，不写回磁盘，下一轮仍从文件重新读取。
   const overrides = (payload && payload.sysOverrides && typeof payload.sysOverrides === 'object') ? payload.sysOverrides : {};
   const rulesForTurn = Array.isArray(overrides.rules) ? overrides.rules : rules;
-  // 预览面板里改过的技能正文是纯字符串（渲染层只传正文），这里补回 id 与 name，拼成 runTurn 需要的 { id, name, body }；
-  // 传对象时按原样采用；没有覆盖值（undefined / null / 空串）时沿用上面从磁盘读到的技能
+  // 预览编辑仅覆盖打开面板时的模式；排队期间切换模式后由当前模式重新选取技能。
   let skillForTurn = skill;
-  if (overrides.skill && typeof overrides.skill === 'object') {
-    skillForTurn = overrides.skill;
-  } else if (typeof overrides.skill === 'string' && overrides.skill) {
-    skillForTurn = {
-      id: skill ? skill.id : '',
-      name: skill ? skill.name : '',
-      body: overrides.skill
-    };
+  const modeMatches = !overrides.skillMode || overrides.skillMode === (agiForSkill ? 'agi' : 'normal');
+  if (modeMatches && overrides.skill != null && (overrides.skillMode || overrides.skill)) {
+    const override = overrides.skill;
+    const edited = typeof override === 'object' ? override.body : override;
+    if (typeof edited === 'string') {
+      const origin = typeof override === 'object' ? override : skill;
+      skillForTurn = { id: origin?.id || '', name: origin?.name || '', [agiForSkill ? 'agiBody' : 'body']: edited };
+    }
   }
   // 较早摘要可以改成空串（表示本轮不带摘要），所以判 null 和 undefined，不用真假值判断
   const summaryForTurn = overrides.summary != null ? overrides.summary : payload.contextSummary;
@@ -3140,6 +3242,7 @@ ipcMain.handle('chat:send', async (e, payload) => {
     throw err;
   } finally {
     if (ctl.signal.aborted) turnOutcome = 'stopped';
+    if (recovery) recovery.stopped = ctl.signal.aborted;
     broadcastToFloatBars({ kind: 'turn-end', turnId, sessionKey: makeSessionKey(win, tabId), outcome: turnOutcome });
     setTurnRunning(win, turnId, false);
     turnOwner.delete(turnId);
@@ -3152,7 +3255,7 @@ ipcMain.handle('chat:send', async (e, payload) => {
     // 返回界面前确认全部事件落盘；写入失败明确报错，不冒充采集成功。
     if (archive) await archive.finish(turnOutcome);
   }
-});
+}
 
 /**
  * 将主窗提交的补充放进绑定会话当前轮的收件箱。

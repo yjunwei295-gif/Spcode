@@ -146,7 +146,8 @@ async function testPipeline() {
   const agent = agentHarness();
   const rendererFile = fs.readFileSync(path.join(root, 'renderer/app.js'), 'utf8').split('\r\n').join('\n');
   const begin = rendererFile.indexOf('async function receiveScreenRequest(');
-  const end = rendererFile.indexOf('/** 提交当前输入', begin);
+  const end = rendererFile.indexOf('function showScreenRequestStatus(', begin);
+  assert.ok(begin >= 0 && end > begin, '找不到屏幕请求处理方法的完整范围');
   const processBegin = rendererFile.indexOf('async function processQueue(');
   const processEnd = rendererFile.indexOf('/**\n * 将本地识别', processBegin);
   const tab = { id: 'tab-1', workspace, modelId: 'controlled-test', pickedSkillIds: ['zabingsk'], queue: [], messages: [],
@@ -177,10 +178,13 @@ async function testPipeline() {
     }
   };
   // 使用真实 sendOne，确保其原有清理逻辑不会误消费后台任务之外的草稿。
-  const sendBegin = rendererFile.indexOf('async function sendOne(');
+  const sendBegin = rendererFile.indexOf('function applyFinalResultToAssistant(');
+  renderer.documentTurns = new Set();
+  renderer.sessionData = function sessionData(item) { return { id: item.id, messages: item.messages }; };
+  renderer.api.chatRestoreConsumed = function consumed() {};
   const uiNoops = ['renderChips','renderTabs','renderMessages','scrollMessagesToBottom','armStallWatch',
     'logSummaryTrace','revealRest','fillDialogIndex','clearStallWatch','finishTypewriter','renderSidebar','persistTab',
-    'flushLivePaint','stopTypewriter'];
+    'flushLivePaint','stopTypewriter','retryHotReload'];
   for (const name of uiNoops) renderer[name] = function noop() {};
   renderer.beginRefillResend = async function noEdit() {};
   renderer.prefersReducedMotion = function reduced() { return true; };

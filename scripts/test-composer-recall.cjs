@@ -31,9 +31,9 @@ function installSessionHandlers() {
     return require('../electron/lib/session-composer');
   }
   const start = mainSource.indexOf('const sessionMetaCache = new Map();');
-  const end = mainSource.indexOf("ipcMain.handle('sessions:rename'", start);
+  const end = mainSource.indexOf('const restartReview =', start);
   assert.ok(start >= 0 && end > start);
-  vm.runInNewContext(mainSource.substring(start, end), { fs, path, ipcMain: { handle }, sessionDir, require: dependency, console,
+  vm.runInNewContext(mainSource.substring(start, end), { fs, path, process, ipcMain: { handle }, sessionDir, require: dependency, console,
     distillSubmittedRequirements: require('../electron/lib/composer-requirements').distillSubmittedRequirements });
   ipcMain.handle('history-test-save', handlers['sessions:save']);
   ipcMain.handle('history-test-load', handlers['sessions:load']);
@@ -97,10 +97,12 @@ async function main() {
         },
         onFloatUserMessage: function onFloatUserMessage(callback) { floatMessage = callback; }
       };
+      ${require('../renderer/interjection-state.mjs').submittedQueue.toString()}
       ${functionSource('function collectComposer()')}
       ${functionSource('function hasComposerContent(c)')}
       ${functionSource('function rememberComposer(tab)')}
       ${functionSource('function slimMessagesForSave(messages)')}
+      ${functionSource('function sessionData(tab)')}
       ${functionSource('function persistTab(tab, force = false)')}
       ${functionSource('async function persistMessages(tab)')}
       ${functionSource('function settleDeadTurns(messages)')}
